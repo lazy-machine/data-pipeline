@@ -1,0 +1,62 @@
+# Iris classification: data prep -> exploratory analysis -> model -> evaluation.
+# Run from the repo root with:  uv run data-pipeline examples/iris/pipeline.toml
+
+[pipeline]
+name = "iris"
+python_path = ["steps"]   # step modules live here
+state_dir = ".pipeline"   # checkpoints (relative to workdir)
+
+[[steps]]
+name = "clean"
+description = "Validate schema, drop duplicates and missing rows"
+function = "prep:clean"
+inputs = { raw = "data/iris.csv" }
+outputs = { table = "build/clean.csv" }
+params = { label = "species" }
+requires = ["pandas>=2"]
+
+[[steps]]
+name = "split"
+description = "Stratified train/test split"
+function = "prep:split"
+inputs = { table = "build/clean.csv" }
+outputs = { train = "build/train.csv", test = "build/test.csv" }
+params = { label = "species", test_size = 0.25, seed = 42 }
+requires = ["pandas>=2", "scikit-learn"]
+
+[[steps]]
+name = "eda"
+description = "Summary statistics and feature plots"
+function = "analysis:explore"
+inputs = { table = "build/clean.csv" }
+outputs = { stats = "build/eda/stats.json", plot = "build/eda/features.png" }
+params = { label = "species" }
+requires = ["pandas>=2", "matplotlib"]
+critical = false          # nice to have: a failure here only warns
+
+[[steps]]
+name = "train"
+description = "Fit a classifier"
+function = "model:train"
+inputs = { train = "build/train.csv" }
+outputs = { model = "build/model.pkl" }
+params = { label = "species", estimator = "random_forest", n_estimators = 200, seed = 42 }
+requires = ["scikit-learn>=1.3", "joblib"]
+timeout = 600
+
+[[steps]]
+name = "evaluate"
+description = "Score the model on the held-out set"
+function = "model:evaluate"
+inputs = { model = "build/model.pkl", test = "build/test.csv" }
+outputs = { metrics = "build/metrics.json" }
+params = { label = "species" }
+requires = ["scikit-learn>=1.3", "pandas>=2"]
+
+[[steps]]
+name = "report"
+description = "Markdown report combining EDA and metrics"
+function = "analysis:report"
+inputs = { stats = "build/eda/stats.json", metrics = "build/metrics.json" }
+outputs = { report = "build/report.md" }
+critical = false
