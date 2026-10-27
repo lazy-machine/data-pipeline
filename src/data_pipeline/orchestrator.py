@@ -12,7 +12,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import metadata, util
 from pathlib import Path
@@ -33,6 +35,7 @@ class Outcome:
     duration: float = 0.0
     output: str = ""
     reason: str = ""  # why the step ran
+    log: Path | None = None  # where the step's output was written, if it ran
 
 
 @dataclass
@@ -93,10 +96,23 @@ def _missing_inputs(pipeline: Pipeline, step: Step) -> list[str]:
 
 # -- execution ----------------------------------------------------------------------------
 
-def _run_worker(pipeline: Pipeline, step: Step) -> tuple[bool, str, str]:
-    """Run one step in a fresh interpreter. Returns (ok, summary-or-error, captured output)."""
+def _stop(proc: subprocess.Popen, reader: threading.Thread, forwarding: threading.Event) -> None:
+    proc.kill()
+    proc.wait()
+    reader.join(timeout=5)
+    forwarding.clear()
+
+
+def _run_worker(pipeline: Pipeline, step: Step, log_path: Path,
+                on_line: Callable[[str], None] | None = None) -> tuple[bool, str, str]:
+    """Run one step in a fresh interpreter. Returns (ok, summary-or-error, captured output).
+
+    Output is copied line by line to ``log_path`` as it arrives, so a long or stuck step
+    can be followed, and nothing is lost on a timeout or Ctrl-C.
+    """
     for rel in step.outputs.values():
         pipeline.resolve(rel).parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_root = pipeline.state_dir / "tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
@@ -112,19 +128,47 @@ def _run_worker(pipeline: Pipeline, step: Step) -> tuple[bool, str, str]:
             "workdir": str(pipeline.workdir),
             "python_path": [str(p) for p in pipeline.python_path],
         }))
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        env = dict(os.environ, PYTHONUNBUFFERED="1")  # what makes lines arrive live
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [_PKG_ROOT, env.get("PYTHONPATH")]))
         cmd = [sys.executable, "-m", "data_pipeline.worker", str(spec_path), str(result_path)]
+        chunks: list[bytes] = []
+        forwarding = threading.Event()  # cleared once we stop waiting for the pipe
+        forwarding.set()
+        fh = log_path.open("wb")  # opened here so a failure surfaces before the worker starts
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, cwd=pipeline.workdir, env=env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=step.timeout,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
-        except subprocess.TimeoutExpired as exc:
-            out = exc.output.decode(errors="replace") if exc.output else ""
-            return False, f"timed out after {step.timeout:g}s", out
+        except BaseException:
+            fh.close()
+            raise
 
-        output = proc.stdout.decode(errors="replace")
+        def pump() -> None:
+            with fh, proc.stdout:
+                for raw in proc.stdout:
+                    fh.write(raw)
+                    fh.flush()
+                    if forwarding.is_set():
+                        chunks.append(raw)
+                        if on_line:
+                            on_line(raw.decode(errors="replace").rstrip("\r\n"))
+
+        reader = threading.Thread(target=pump, daemon=True)
+        try:
+            reader.start()
+            proc.wait(timeout=step.timeout)
+            # bounded: a grandchild that inherited stdout could keep the pipe open
+            reader.join(timeout=5)
+        except subprocess.TimeoutExpired:
+            _stop(proc, reader, forwarding)
+            return False, f"timed out after {step.timeout:g}s", b"".join(chunks).decode(errors="replace")
+        except KeyboardInterrupt:
+            _stop(proc, reader, forwarding)
+            raise
+        forwarding.clear()  # late lines still reach the log, but not this step's outcome
+
+        output = b"".join(chunks).decode(errors="replace")
         if proc.returncode != 0:
             how = (f"killed by signal {-proc.returncode}" if proc.returncode < 0
                    else f"exit code {proc.returncode}")
@@ -141,6 +185,7 @@ class Orchestrator:
         self.pipeline = pipeline
         self.report = reporter or Reporter()
         self.state = checkpoint.State(pipeline.state_dir)
+        self.running_log: Path | None = None  # log of the step in progress, for Ctrl-C
 
     def run(self, only: list[str] | None = None, force: bool = False,
             rerun: list[str] | None = None, dry_run: bool = False) -> RunResult:
@@ -164,6 +209,7 @@ class Orchestrator:
             self.report.begin(idx, len(steps), step)
             outcome = self._step(step, issues.get(step.name, []), result,
                                  force or step.name in forced, dry_run)
+            self.running_log = None
             result.outcomes[step.name] = outcome
             self.report.end(idx, len(steps), step, outcome)
             if outcome.status == "failed":
@@ -205,19 +251,22 @@ class Orchestrator:
         # 3. execute in an isolated worker
         self.state.forget(step.name)
         t0 = time.perf_counter()
-        ok, info, output = _run_worker(p, step)
+        log = p.state_dir / "logs" / f"{step.name}.log"
+        self.running_log = log
+        ok, info, output = _run_worker(p, step, log, self.report.line if self.report.follow else None)
         took = time.perf_counter() - t0
         if not ok:
-            return Outcome(bad, info, took, output)
+            return Outcome(bad, info, took, output, log=log)
 
         # 4. verify and record outputs
         hashes = {k: self.state.hash_path(p.resolve(rel)) for k, rel in step.outputs.items()}
         missing = [f"{k} ({step.outputs[k]})" for k, h in hashes.items() if h is None]
         if missing:
-            return Outcome(bad, f"step did not write output(s): {', '.join(missing)}", took, output)
+            return Outcome(bad, f"step did not write output(s): {', '.join(missing)}", took, output,
+                           log=log)
         # inputs may have been read lazily; re-fingerprint so a mid-run edit is not masked
         fp_after = checkpoint.fingerprint(p, step, self.state)
         if fp_after == fp:
             self.state.record(step.name, fp, hashes, summary=info, duration=round(took, 3),
                               finished=time.time())
-        return Outcome("ran", info, took, output, reason)
+        return Outcome("ran", info, took, output, reason, log)

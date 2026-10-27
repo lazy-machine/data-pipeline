@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 if TYPE_CHECKING:
@@ -20,11 +21,23 @@ _STYLE = {
 }
 
 
+def display_path(path: Path) -> str:
+    """``path`` relative to the cwd when it is below it, else absolute."""
+    try:
+        rel = os.path.relpath(path)
+    except ValueError:  # different drive on Windows
+        return str(path)
+    return str(path) if rel.startswith("..") else rel
+
+
 class Reporter:
     def __init__(self, stream: TextIO | None = None, verbose: bool = False,
-                 color: bool | None = None):
+                 color: bool | None = None, follow: bool = False):
         self.out = stream or sys.stdout
         self.verbose = verbose
+        self.follow = follow  # stream step output live instead of printing it at the end
+        self._current = ""  # prefix of the running step, printed before its first line
+        self._streamed = False
         tty = hasattr(self.out, "isatty") and self.out.isatty()
         self.live = tty
         self.color = (tty and "NO_COLOR" not in os.environ) if color is None else color
@@ -44,12 +57,7 @@ class Reporter:
 
     def header(self, pipeline: Pipeline, count: int, dry_run: bool) -> None:
         self.width = max(len(s.name) for s in pipeline.steps)
-        try:
-            where = os.path.relpath(pipeline.path)
-        except ValueError:  # different drive on Windows
-            where = str(pipeline.path)
-        if where.startswith(".."):
-            where = str(pipeline.path)
+        where = display_path(pipeline.path)
         mode = " · dry run" if dry_run else ""
         self._print(self._c(f"▶ {pipeline.name}", "1") + f" · {count} steps · {where}{mode}")
 
@@ -60,9 +68,20 @@ class Reporter:
                 self._print(f"  {name}: {e}")
 
     def begin(self, idx: int, total: int, step: Step) -> None:
+        self._current = self._prefix(idx, total, step)
+        self._streamed = False
         if self.live:
-            print(self._prefix(idx, total, step) + self._c("  … running", "2"),
+            print(self._current + self._c("  … running", "2"),
                   end="", file=self.out, flush=True)
+
+    def line(self, text: str) -> None:
+        """One line of a running step's output (follow mode; called from a reader thread)."""
+        if not self._streamed:
+            self._streamed = True
+            if self.live:
+                self.out.write("\r\033[K")
+            self._print(self._current.rstrip())
+        self._print(self._c("    │ ", "2") + text)
 
     def end(self, idx: int, total: int, step: Step, o: Outcome) -> None:
         sym, label, code = _STYLE[o.status]
@@ -80,14 +99,16 @@ class Reporter:
 
         if o.status in ("warned", "failed") and o.output:
             self._dump(step, o, "33" if o.status == "warned" else "31")
-        elif self.verbose and o.output:
+        elif self.verbose and o.output and not self._streamed:
             for ln in o.output.rstrip().splitlines():
                 self._print(self._c("    │ ", "2") + ln)
 
     def _dump(self, step: Step, o: Outcome, code: str) -> None:
         bar = "─" * 60
         self._print(self._c(f"┌─ {step.name}: {o.detail} ─ {step.function}", code))
-        self._print(o.output.rstrip())
+        self._print(self._c("(output above)", "2") if self._streamed else o.output.rstrip())
+        if o.log:
+            self._print(f"log: {display_path(o.log)}")
         self._print(self._c(f"└{bar}", code))
 
     def footer(self, result: RunResult, dry_run: bool) -> None:

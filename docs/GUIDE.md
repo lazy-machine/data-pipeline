@@ -191,10 +191,14 @@ files.
 
 ### About `print`
 
-Output is captured, not streamed. You see it **only if the step fails**, or with `-v`, and
-only once the step has finished. That makes `print` fine for debugging, but useless as a
-live progress bar for a long step. If you need a progress log while the step runs, write it
-to a file yourself.
+Everything a step prints (stdout and stderr) is written, line by line as it arrives, to
+`.pipeline/logs/<step>.log`. The file is replaced each time the step runs and left alone
+when the step is cached. On the console you see the output **only if the step fails**, or
+with `-v` once it has finished, or live with `-F/--follow`. So `print` works as a progress
+log for a long step: follow it with `-F`, or with `tail -f` on the log file.
+
+Output is read one line at a time, so progress bars that redraw a single line with `\r`
+(tqdm and similar) only show up when they print a newline.
 
 ---
 
@@ -270,7 +274,8 @@ comes.
 | the content of an input file | that step reruns (`inputs changed: <name>`) |
 | `params`, `function`, input/output paths in the TOML | that step reruns (`config changed`) |
 | the step's module file (even a comment) | every step in that module reruns (`code changed`) |
-| a file listed in `watch` | that step reruns (`code changed`) |
+| a local module the step imports, directly or indirectly | that step reruns (`code changed: <file>`) |
+| a file listed in `watch` (data, SQL, templates, dynamic imports) | that step reruns (`code changed`) |
 | delete or edit an output | that step reruns (`output missing` / `output modified`) |
 | the `description` or `critical` flag | nothing; these don't affect results |
 | file timestamps only (`touch`) | nothing; caching compares content |
@@ -293,19 +298,31 @@ Later steps stay cached only if a rerun produces identical bytes. Things that br
 
 These don't make results wrong. They just mean later steps rerun more often than needed.
 
-### Track helper modules with `watch`
+### Helper modules are tracked; use `watch` for everything else
 
-Only the module file that contains the step function is fingerprinted. If
-`steps/model.py` imports `steps/features.py`, editing `features.py` does **not**
-invalidate the model step unless you add:
+When `steps/model.py` imports `steps/features.py`, editing `features.py` reruns the model
+step, and the reason names the file: `code changed: steps/features.py`. The runner reads
+the step module's `import` statements (without running them) and follows them through
+other local modules, including imports inside functions, relative imports and package
+`__init__.py` files. A module is local when it is found under `python_path`; the standard
+library and installed packages are never tracked.
+
+Two things can't be seen this way, and need `watch`:
+
+- modules loaded dynamically, such as `importlib.import_module(name)`;
+- non-Python files the code reads, such as a lookup table, a SQL query or a prompt
+  template.
 
 ```toml
-watch = ["steps/features.py"]
+watch = ["sql/features.sql"]
 ```
 
 `watch` paths are relative to the working directory (the TOML file's folder by default), and
-the files must exist. You can watch any file, including a lookup table, a SQL query or a
-prompt template.
+the files must exist.
+
+Checkpoints written before imports were tracked are filled in on the next run instead of
+being invalidated. If you edited a helper that wasn't in `watch` since your last run, run
+once with `-f` (or `-r STEP`) after upgrading.
 
 ### Steps that read the outside world
 
@@ -336,6 +353,7 @@ Checkpoints are content hashes, not absolute paths, so copying or moving a proje
 data-pipeline -n                    # what would run, and why? (runs nothing)
 data-pipeline                       # run whatever is out of date
 data-pipeline -v                    # same, and show each step's printed output
+data-pipeline -F                    # same, and print each step's output live, as it runs
 data-pipeline -r train              # rerun one step regardless of its checkpoint
 data-pipeline -r train -r evaluate  # several
 data-pipeline -o eda report         # run only these steps (their inputs must exist)
@@ -457,7 +475,17 @@ depends_on = ["check_schema"]
 Set a `timeout` (in seconds) on anything that could hang, such as network calls or big
 training jobs. When it's exceeded, the worker process is killed and the step is reported as
 `timed out after Ns`. This counts as a failure, so it halts the run or warns depending on
-`critical`.
+`critical`. Whatever the step printed before it was killed is kept in the dump and the log.
+
+To watch a long step, run with `-F`, or follow its log from another terminal:
+
+```bash
+tail -f .pipeline/logs/train.log
+```
+
+If you press Ctrl-C, the worker is stopped, its log is kept, and the run ends with
+`■ interrupted · log: <path>`. The log shows the step's last output, and usually the
+traceback of where it was when you stopped it.
 
 ### Running from Python
 
@@ -484,6 +512,7 @@ options.
 [3/6] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
 ┌─ eda: exit code 1 ─ analysis:explore
   …full captured output and traceback…
+log: .pipeline/logs/eda.log
 └────────────────────────────────────────────────────────────
 [4/6] train     ✓ ran        1.10s  estimator=random_forest train_acc=1  (config changed)
 [6/6] report    – skipped           upstream step(s) did not complete: eda  [non-critical, continuing]
@@ -498,6 +527,9 @@ options.
 | `⚠ warning` | a non-critical step failed; the error is printed right below it |
 | `– skipped` | a non-critical step couldn't run because something it depends on failed |
 | `✗ FAILED` | a critical step failed; the error is printed and the run stops |
+
+The last line of a failure dump is the path of the step's log file. With `-F`, the output
+is printed above as it arrives, so the dump shows `(output above)` instead of repeating it.
 
 In a terminal, a dim `… running` placeholder appears while a step executes and is replaced
 by its final line. Colors are disabled with `--no-color` or the `NO_COLOR` environment
@@ -521,7 +553,7 @@ variable, and automatically when output is redirected to a file.
 | `exit code 1` with `SystemExit` in the traceback | the step called `sys.exit()` | return normally instead |
 | `TypeError: Object of type date is not JSON serializable` (orchestrator crash) | a TOML date/time value in `params` | write dates as strings (`day = "2026-01-01"`) and parse them in the step; this is a known limitation |
 | a step keeps rerunning even though nothing changed | an earlier step writes non-deterministic output | check `-n` to see which input changed; see §6 *Make outputs deterministic* |
-| a step **doesn't** rerun after you edited a helper | helpers aren't fingerprinted | add the helper to `watch` |
+| a step **doesn't** rerun after you edited a helper | the helper is loaded dynamically, isn't under `python_path`, or isn't Python | add it to `watch` |
 | a step doesn't rerun after the source data changed | it reads external data with no declared input | use `-r STEP`, or declare the source file as an input |
 
 When you're not sure why a step behaves the way it does, start with `-n`. The reason column
@@ -536,7 +568,7 @@ tells you what the orchestrator thinks changed.
 - [ ] Every file a step reads is listed in its `inputs`; every file it writes is in `outputs`.
 - [ ] Every step lists its third-party packages in `requires`.
 - [ ] All randomness is seeded through `params`.
-- [ ] Local helper modules are listed in `watch`.
+- [ ] Dynamic imports and non-Python helpers (SQL, templates, lookup tables) are listed in `watch`.
 - [ ] Optional steps (plots, reports, experiments) are `critical = false`, and no critical
       step depends on them.
 - [ ] Long or network-bound steps have a `timeout`.

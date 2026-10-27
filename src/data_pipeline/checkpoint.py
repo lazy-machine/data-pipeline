@@ -8,12 +8,13 @@ are not re-read on every run.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ class Fingerprint:
     code: str
     config: str
     inputs: dict[str, str]
+    imports: dict[str, str] = field(default_factory=dict)
 
 
 class State:
@@ -78,7 +80,7 @@ class State:
     def record(self, name: str, fp: Fingerprint, outputs: dict[str, str], **extra: Any) -> None:
         self.steps[name] = {
             "code": fp.code, "config": fp.config, "inputs": fp.inputs,
-            "outputs": outputs, **extra,
+            "imports": fp.imports, "outputs": outputs, **extra,
         }
         self.save()
 
@@ -98,18 +100,81 @@ class State:
         os.replace(tmp, self.path)
 
 
-def module_file(pipeline: Pipeline, module: str) -> Path | None:
-    """Locate a step module's source without importing it (or its parents)."""
+def _local_module(pipeline: Pipeline, module: str) -> Path | None:
+    """The file ``module`` resolves to under ``python_path``; installed modules are not local."""
     rel = Path(*module.split("."))
     for root in pipeline.python_path:
-        for cand in (root / rel.with_suffix(".py"), root / rel / "__init__.py"):
+        for cand in (root / rel / "__init__.py", root / rel.with_suffix(".py")):  # as Python does
             if cand.is_file():
                 return cand
+    return None
+
+
+def module_file(pipeline: Pipeline, module: str) -> Path | None:
+    """Locate a step module's source without importing it (or its parents)."""
+    if found := _local_module(pipeline, module):
+        return found
     if "." not in module:  # top-level installed module: find_spec does not execute it
         spec = importlib.util.find_spec(module)
         if spec and spec.origin and os.path.isfile(spec.origin):
             return Path(spec.origin)
     return None
+
+
+def _prefixes(dotted: str) -> list[str]:
+    parts = dotted.split(".")
+    return [".".join(parts[:i]) for i in range(1, len(parts) + 1)]
+
+
+def _imported_names(module: str, path: Path) -> set[str]:
+    """Every module name ``path`` may import, found statically (the file is never run)."""
+    try:
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return set()  # still hashed by the caller; the worker reports the real error
+    package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.update(_prefixes(alias.name))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parts = package.split(".") if package else []
+                if node.level - 1 >= len(parts):
+                    continue  # beyond the top-level package: fails at import time anyway
+                base = ".".join(parts[:len(parts) - node.level + 1])
+                target = f"{base}.{node.module}" if node.module else base
+            elif node.module:
+                target = node.module
+            else:
+                continue
+            names.update(_prefixes(target))
+            names.update(f"{target}.{a.name}" for a in node.names if a.name != "*")
+    return names
+
+
+def local_imports(pipeline: Pipeline, module: str) -> list[Path]:
+    """Local files a step module imports, directly or through other local modules.
+
+    Parent packages count too, since Python runs their ``__init__.py`` on import.
+    Dynamic imports (``importlib.import_module``) cannot be seen; ``watch`` covers them.
+    """
+    src = _local_module(pipeline, module)
+    if src is None:
+        return []
+    seen = {src}
+    queue = [(module, src)]
+    parents = set(_prefixes(module)[:-1])
+    while queue:
+        name, path = queue.pop()
+        for cand in sorted(_imported_names(name, path) | parents):
+            found = _local_module(pipeline, cand)
+            if found is not None and found not in seen:
+                seen.add(found)
+                queue.append((cand, found))
+        parents = set()
+    return sorted(seen - {src})
 
 
 def _digest(obj: Any) -> str:
@@ -128,16 +193,35 @@ def fingerprint(pipeline: Pipeline, step: Step, state: State) -> Fingerprint:
         "inputs": step.inputs, "outputs": step.outputs,
     })
     inputs = {k: state.hash_path(pipeline.resolve(rel)) or "-" for k, rel in step.inputs.items()}
-    return Fingerprint(code=code.hexdigest(), config=config, inputs=inputs)
+    imports = {
+        Path(os.path.relpath(f, pipeline.workdir)).as_posix(): state.hash_file(f)
+        for f in local_imports(pipeline, step.module)
+    }
+    return Fingerprint(code=code.hexdigest(), config=config, inputs=inputs,
+                       imports=dict(sorted(imports.items())))
+
+
+def _few(names: list[str]) -> str:
+    return ", ".join(names[:3]) + (", …" if len(names) > 3 else "")
 
 
 def stale_reason(pipeline: Pipeline, step: Step, state: State, fp: Fingerprint) -> str | None:
-    """Why the step must run, or None if its checkpoint is valid."""
+    """Why the step must run, or None if its checkpoint is valid.
+
+    A checkpoint written before imports were tracked is backfilled in place rather than
+    invalidated, so upgrading does not rerun every step; the caller saves the state.
+    """
     prev = state.steps.get(step.name)
     if prev is None:
         return "no checkpoint"
     if prev.get("code") != fp.code:
         return "code changed"
+    if "imports" not in prev:
+        prev["imports"] = fp.imports
+    elif prev["imports"] != fp.imports:
+        old = prev["imports"]
+        changed = sorted(k for k in old.keys() | fp.imports.keys() if old.get(k) != fp.imports.get(k))
+        return f"code changed: {_few(changed)}"
     if prev.get("config") != fp.config:
         return "config changed"
     if prev.get("inputs") != fp.inputs:

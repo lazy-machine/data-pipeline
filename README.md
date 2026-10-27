@@ -48,7 +48,7 @@ The core needs only the standard library plus `packaging`. The `examples` depend
 ## Usage
 
 ```
-data-pipeline [CONFIG] [-n] [-f] [-r STEP]... [-o STEP ...] [-v] [--no-color]
+data-pipeline [CONFIG] [-n] [-f] [-r STEP]... [-o STEP ...] [-v] [-F] [--no-color]
 ```
 
 | option | effect |
@@ -59,6 +59,7 @@ data-pipeline [CONFIG] [-n] [-f] [-r STEP]... [-o STEP ...] [-v] [--no-color]
 | `-r`, `--rerun STEP` | ignore the checkpoint of one step (repeatable) |
 | `-o`, `--only STEP ...` | run only these steps; their inputs must already exist |
 | `-v`, `--verbose` | also show the captured output of successful steps |
+| `-F`, `--follow` | print each step's output live, as it runs |
 
 Exit codes: `0` success (warnings included), `1` a critical step failed, `2` bad config or
 arguments, `130` interrupted.
@@ -82,7 +83,7 @@ requires = ["scikit-learn>=1.3", "joblib"]    # verified before anything runs
 critical = true                               # false: failure only warns
 timeout = 600                                 # seconds; the worker is killed after this
 depends_on = []                               # extra ordering beyond file dependencies
-watch = ["steps/helpers.py"]                  # extra files whose changes invalidate the step
+watch = ["sql/features.sql"]                  # non-Python files or dynamic imports that invalidate the step
 description = "Fit a classifier"
 ```
 
@@ -105,14 +106,16 @@ def train(ctx):
 
 `ctx` has `name`, `inputs`, `outputs`, `params`, `workdir` and a `log()` helper. The return
 value can be `None`, a string, or a flat dict (floats are shown to 4 significant figures).
-Anything printed is captured and only shown when the step fails, or with `-v`. Raising any
+Anything printed is written to `<state_dir>/logs/<step>.log` as it arrives, and shown on
+the console when the step fails, with `-v`, or live with `-F`. Raising any
 exception fails the step. The step must write every declared output.
 
 ## Checkpoints
 
 A step's fingerprint combines:
 
-- **code**: the SHA-256 of the step's module file plus any `watch` files,
+- **code**: the SHA-256 of the step's module file, the local modules it imports (directly
+  or through other local modules), and any `watch` files,
 - **config**: `function`, `params`, `inputs` and `outputs`,
 - **inputs**: the SHA-256 of every input's content (directories are hashed recursively).
 
@@ -123,10 +126,16 @@ step re-runs and writes byte-identical outputs, the steps after it stay cached. 
 are cached by size and mtime, so large unchanged files are not re-read.
 
 The status line says why a step ran: `no checkpoint`, `code changed`, `config changed`,
-`inputs changed: <names>`, `output missing: <name>`, `output modified: <name>`, `forced`.
+`code changed: <files>`, `inputs changed: <names>`, `output missing: <name>`,
+`output modified: <name>`, `forced`.
 
-Code is fingerprinted per module file. If a step imports a local helper module, list that
-helper in `watch` so editing it invalidates the step.
+Imports are found by reading the code, never by running it. A module is local when it is
+found under `python_path`; the standard library and installed packages are not tracked.
+Modules loaded with `importlib.import_module` and non-Python files belong in `watch`.
+
+After upgrading from a version that didn't track imports, run with `-f` once if you edited
+a helper without `watch` since your last run: older checkpoints are filled in rather than
+invalidated, so that upgrading doesn't rerun everything.
 
 ## Layout
 

@@ -42,6 +42,13 @@ def pid(ctx):
 
 def hard_exit(ctx):
     os._exit(3)
+
+def hello(ctx):
+    print("hello")
+
+def start_then_hang(ctx):
+    print("started", flush=True)
+    time.sleep(10)
 '''
 
 
@@ -351,3 +358,52 @@ def test_cli_exit_codes(tmp_path, capsys):
     assert main([str(tmp_path / "missing.toml")]) == 2
     bad = make(tmp_path, '[[steps]]\nname = "x"\nfunction = "fns:boom"\n')
     assert main([str(bad), "--no-color"]) == 1
+
+
+def test_step_log_is_written(tmp_path):
+    cfg = make(tmp_path, '[[steps]]\nname = "greet"\nfunction = "fns:hello"\n')
+    run(cfg)
+    log = tmp_path / ".pipeline/logs/greet.log"
+    assert "hello" in log.read_text()
+    mtime = log.stat().st_mtime_ns
+    r, _ = run(cfg)
+    assert statuses(r) == {"greet": "cached"}
+    assert log.stat().st_mtime_ns == mtime
+
+
+def test_failed_step_log_and_dump_path(tmp_path):
+    cfg = make(tmp_path, '[[steps]]\nname = "bad"\nfunction = "fns:boom"\n')
+    _, out = run(cfg)
+    text = (tmp_path / ".pipeline/logs/bad.log").read_text()
+    assert "about to fail" in text and "kaboom" in text
+    assert "log: " in out and "bad.log" in out
+
+
+HANG = '[[steps]]\nname = "hang"\nfunction = "fns:start_then_hang"\ntimeout = {}\n'
+
+
+def test_timeout_keeps_partial_output(tmp_path):
+    cfg = make(tmp_path, HANG.format(2))
+    r, _ = run(cfg)
+    o = r.outcomes["hang"]
+    assert "timed out" in o.detail
+    assert "started" in o.output
+    assert "started" in (tmp_path / ".pipeline/logs/hang.log").read_text()
+
+
+class FakeTTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
+@pytest.mark.parametrize("stream", [io.StringIO, FakeTTY])
+def test_follow_streams_before_step_ends(tmp_path, stream):
+    cfg = make(tmp_path, HANG.format(2))
+    buf = stream()
+    Orchestrator(config.load(cfg), Reporter(buf, color=False, follow=True)).run()
+    out = buf.getvalue()
+    assert out.count("started") == 1
+    assert out.index("started") < out.index("timed out")
+    assert "(output above)" in out and "log: " in out
+    if stream is FakeTTY:  # the "… running" placeholder is erased before the first line
+        assert "running\r\033[K[1/1] hang\n    │ started\n" in out

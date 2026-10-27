@@ -7,7 +7,7 @@ import sys
 
 from . import config
 from .orchestrator import Orchestrator
-from .report import Reporter
+from .report import Reporter, display_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="run only these steps (their inputs must already exist)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="also show the captured output of successful steps")
+    ap.add_argument("-F", "--follow", action="store_true",
+                    help="print each step's output live, as it is written")
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     return ap
 
@@ -45,13 +47,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ unknown step(s): {', '.join(unknown)} (known: {', '.join(sorted(names))})")
         return 2
 
-    reporter = Reporter(verbose=args.verbose, color=False if args.no_color else None)
+    reporter = Reporter(verbose=args.verbose, color=False if args.no_color else None,
+                        follow=args.follow)
+    orchestrator = Orchestrator(pipeline, reporter)
     try:
-        result = Orchestrator(pipeline, reporter).run(
+        result = orchestrator.run(
             only=args.only, force=args.force, rerun=args.rerun,
             dry_run=args.dry_run)
     except KeyboardInterrupt:
-        print("\n■ interrupted")
+        log = orchestrator.running_log
+        print("\n■ interrupted" + (f" · log: {display_path(log)}" if log else ""))
         return 130
     return 0 if result.ok else 1
 
