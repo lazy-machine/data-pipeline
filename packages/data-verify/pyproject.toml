@@ -30,7 +30,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-data-pipeline = { path = "../data-pipeline", editable = true }
+data-pipeline = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

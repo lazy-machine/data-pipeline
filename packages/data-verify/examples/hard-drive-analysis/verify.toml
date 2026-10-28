@@ -22,11 +22,11 @@
 python_path = ["."]
 
 [inputs]
-snapshots = "../../../hard-drive-analysis-v3/build/snapshots.parquet"
-cohort = "../../../hard-drive-analysis-v3/build/cohort.parquet"
-schema = "../../../hard-drive-analysis-v3/build/feature-schema.json"
-study = "../../../hard-drive-analysis-v3/config/study.toml"
-sample = "../../../hard-drive-analysis-v3/config/sample.toml"
+snapshots = "../../../../../hard-drive-analysis-v3/build/snapshots.parquet"
+cohort = "../../../../../hard-drive-analysis-v3/build/cohort.parquet"
+schema = "../../../../../hard-drive-analysis-v3/build/feature-schema.json"
+study = "../../../../../hard-drive-analysis-v3/config/study.toml"
+sample = "../../../../../hard-drive-analysis-v3/config/sample.toml"
 
 [outputs]
 report = "build/verify-report.json"
