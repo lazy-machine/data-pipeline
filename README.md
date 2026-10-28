@@ -12,24 +12,30 @@ A thin orchestrator walks the steps one at a time. For every step it:
    fresh interpreter, so steps share no memory, globals or loaded modules.
 4. **Verifies and records** the outputs, then prints a one-line status.
 
+Before any model runs, a **data gate** checks the splits for leakage and poisoning and
+halts the pipeline if it finds any. The gate is an ordinary step,
+[data-verify](packages/data-verify/README.md) (`function = "data_verify:verify"`), shipped in
+this repository as a second package so that the runner itself stays dependency-free.
+
 Successful steps get one line each. When a step fails, its captured stdout/stderr and the
 full traceback are dumped to stdout. Steps marked `critical = false` only warn on failure
 and the pipeline keeps going (their dependents get skipped). A critical failure halts it.
 
 ```
-▶ iris · 6 steps · examples/iris/pipeline.toml
-[1/6] clean     ↷ cached            rows=149 dropped=1 classes=3
-[2/6] split     ↷ cached            train=111 test=38
-[3/6] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
+▶ iris · 7 steps · examples/iris/pipeline.toml
+[1/7] clean     ↷ cached            rows=149 dropped=1 classes=3
+[2/7] split     ↷ cached            train=111 test=38
+[3/7] verify    ↷ cached            checks=27 passed=26 warnings=1 skipped=24
+[4/7] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
 ┌─ eda: exit code 1 ─ analysis:explore
 Traceback (most recent call last):
   ...
 AttributeError: 'DataFrame' object has no attribute 'nope'
 └────────────────────────────────────────────────────────────
-[4/6] train     ✓ ran        1.10s  estimator=random_forest train_acc=1  (config changed)
-[5/6] evaluate  ✓ ran        1.03s  accuracy=0.9474 f1_macro=0.9466  (inputs changed: model)
-[6/6] report    – skipped           upstream step(s) did not complete: eda  [non-critical, continuing]
-✓ completed with warnings · 2 ran · 2 cached · 1 warning(s) · 1 skipped · 3.08s
+[5/7] train     ✓ ran        1.10s  estimator=random_forest train_acc=1  (config changed)
+[6/7] evaluate  ✓ ran        1.03s  accuracy=0.9474 f1_macro=0.9466  (inputs changed: model)
+[7/7] report    – skipped           upstream step(s) did not complete: eda  [non-critical, continuing]
+✓ completed with warnings · 2 ran · 3 cached · 1 warning(s) · 1 skipped · 3.08s
 ```
 
 For a walkthrough, best practices and troubleshooting, see the [usage guide](docs/GUIDE.md).
@@ -37,13 +43,36 @@ For a walkthrough, best practices and troubleshooting, see the [usage guide](doc
 ## Setup
 
 ```bash
-uv sync                                              # core + dev + example dependencies
+uv sync                                              # runner, gate, dev and example dependencies
 uv run data-pipeline examples/iris/pipeline.toml     # run the example
-uv run pytest                                        # run the tests
+uv run pytest                                        # run the tests of both packages
 ```
 
-The core needs only the standard library plus `packaging`. The `examples` dependency group
-(pandas, scikit-learn, matplotlib) is only needed for the Iris example.
+The repository is a uv workspace with two packages:
+
+| package | path | depends on |
+|---|---|---|
+| `data-pipeline` (the runner) | `src/data_pipeline/` | the standard library and `packaging` |
+| `data-verify` (the gate) | `packages/data-verify/` | pandas, numpy, pyarrow; duckdb for SQL assertions |
+
+The `examples` dependency group (pandas, scikit-learn, matplotlib, data-verify) is only
+needed for the Iris example.
+
+## Use it in a project
+
+Keep your project in its own folder with its own `pyproject.toml`, and depend on this one:
+
+```bash
+uv init --bare my-analysis && cd my-analysis
+uv add --editable "../data-pipeline[verify]"   # runner + gate; drop [verify] for the runner alone
+uv add pandas scikit-learn                     # whatever your steps import
+uv run data-pipeline -n                        # with a pipeline.toml in place
+```
+
+To pin a version instead of following a checkout, use
+`uv add "data-pipeline[verify] @ git+file:///abs/path/to/data-pipeline@<commit>"`. The
+[usage guide](docs/GUIDE.md) §2 covers project layout and starting from the Iris example.
+§7 covers where the gate goes.
 
 ## Usage
 
@@ -148,6 +177,11 @@ src/data_pipeline/
   context.py       StepContext passed to step functions
   report.py        status lines and failure dumps
   cli.py           command line interface
-examples/iris/     end-to-end example: clean, split, EDA, train, evaluate, report
-tests/             pytest suite
+tests/             runner tests
+packages/data-verify/
+  src/data_verify/ the gate step and its checks (README.md is its contract)
+  tests/           gate tests
+examples/iris/     end-to-end example: clean, split, verify, EDA, train, evaluate, report
+docs/GUIDE.md      usage guide
+AGENTS.md          rules for agents working on this repository or building on it
 ```

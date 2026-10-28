@@ -1,6 +1,7 @@
 # data-verify
 
-A gate step for [data-pipeline](../data-pipeline) projects. It reads the data your pipeline
+A gate step for [data-pipeline](../../README.md) projects, shipped in the same repository
+(a uv workspace member). It reads the data your pipeline
 produced (the train/val/test splits, plus any source or auxiliary tables) and fails the
 step, stopping everything downstream, when it finds **data leakage** (anything that lets a
 model see the answers or the future of what it is scored on) or **poisoning** (tampered,
@@ -26,9 +27,12 @@ Steps that `depends_on = ["verify"]` never run on data that failed the gate.
 ## Add it to a pipeline
 
 ```bash
-uv add --editable ../data-verify          # or: uv add "data-verify @ file:///path/to/data-verify"
-uv add duckdb                             # only if you use SQL assertions
+uv add --editable "../data-pipeline[verify]"   # runner + gate, from a sibling checkout of data-pipeline
+uv add duckdb                                  # only if you use SQL assertions
 ```
+
+The [usage guide](../../docs/GUIDE.md) (§2 and §7) covers the other ways to depend on it and
+where the gate goes in a pipeline; `examples/iris` at the repo root is a working example.
 
 Put the gate right after the step that writes the splits, and make every training and
 evaluation step depend on it:
@@ -346,7 +350,8 @@ attack crafted to match the clean distribution; and it trusts the roles you decl
 
 data-pipeline fingerprints `data_verify/__init__.py` (an installed module), not the rest of
 the package. The version string lives there, so upgrading data-verify reruns the gate.
-After editing data-verify itself without a version bump, run `data-pipeline -r verify`.
+After editing data-verify itself without a version bump (with an editable install, any
+edit to the source), run `data-pipeline -r verify`.
 The gate's own params, inputs and `watch` files invalidate it as usual.
 
 ## Command line
@@ -365,10 +370,13 @@ Exit codes: `0` passed, `1` blocked, `2` invalid config.
 
 ## Development
 
+From the repo root (one workspace, one virtual environment):
+
 ```bash
 uv sync
-uv run pytest          # injects every leak/poisoning pattern into clean data
-uv run data-verify run examples/hard-drive-analysis/verify.toml   # needs ../hard-drive-analysis-v3/build
+uv run pytest packages/data-verify     # injects every leak/poisoning pattern into clean data
+uv run data-verify run packages/data-verify/examples/hard-drive-analysis/verify.toml
+                                       # needs ../hard-drive-analysis-v3/build next to the repo
 ```
 
 Layout: `spec.py` (params parsing), `core.py` (loading, hashing, registry, Verifier),

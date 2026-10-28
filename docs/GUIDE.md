@@ -1,8 +1,10 @@
 # Using data-pipeline: a practical guide
 
 The [README](../README.md) is the reference for every option and key. This guide covers how
-to use them: how to build a pipeline from scratch, how to write steps that cache well, how
-to choose which steps are critical, and what to do when something goes wrong.
+to use them: how to set up a project that depends on the runner, how to build a pipeline,
+how to write steps that cache well, where the data gate goes, how to build reusable steps
+on top, and what to do when something goes wrong. The gate's own contract is in
+[packages/data-verify/README.md](../packages/data-verify/README.md).
 
 ---
 
@@ -22,6 +24,9 @@ Keep these four facts in mind and the rest of the guide follows from them:
 4. **Failures are either fatal or tolerated.** A critical step that fails stops the run.
    A non-critical step that fails prints a warning, and only the steps that depend on it
    are skipped.
+5. **Models only see data that passed the gate.** The `verify` step (data-verify) checks
+   the splits for leakage and poisoning, and every training and evaluation step depends on
+   it (§7).
 
 ```
 pipeline.toml ─► orchestrator ─► for each step, in order:
@@ -33,16 +38,51 @@ pipeline.toml ─► orchestrator ─► for each step, in order:
                                    outputs present? ─► record checkpoint ─► ✓
 ```
 
+Three principles follow from these facts. Projects built on the runner, and changes to the
+runner itself, should keep to them:
+
+- **Minimal.** The runner depends on nothing but the standard library and `packaging`.
+  Capabilities such as the gate are steps in their own packages, not runner features. A
+  project adds only the dependencies its steps import.
+- **Reusable.** A step is a function whose behaviour is fully set by its `inputs` and
+  `params`. A step that more than one project needs goes into a package and is referenced
+  as `function = "package:step"`, rather than copied (§11).
+- **Verifiable.** Every file is declared, outputs are deterministic, failures are loud, and
+  data reaches a model only through the gate. Anyone can rerun the pipeline and get the
+  same bytes, or see exactly why not (`-n`).
+
 ---
 
-## 2. Build your first pipeline
+## 2. Set up a project
 
-Here's a small pipeline built from scratch: load sales data, aggregate it, and plot it.
+A project is its own folder with its own `pyproject.toml` and virtual environment. It
+depends on data-pipeline and never copies the runner's source: fixes and new checks then
+reach every project, and each project's dependencies stay its own.
 
-### 2.1 Lay out the project
+### 2.1 Depend on the runner and the gate
+
+| You want | Command (run inside the project) |
+|---|---|
+| runner + gate, following a local checkout (the usual case) | `uv add --editable "../data-pipeline[verify]"` |
+| a fixed, reproducible version | `uv add "data-pipeline[verify] @ git+file:///abs/path/to/data-pipeline@<commit>"` |
+| the runner only (no model, no gate) | `uv add --editable ../data-pipeline` |
+
+The `verify` extra installs data-verify (pandas, numpy, pyarrow). The paths assume the
+project and `data-pipeline` are sibling folders. uv records them in the project's
+`pyproject.toml` under `[tool.uv.sources]`, so `uv sync` restores them on another machine
+with the same layout. Then add what your steps import (`uv add pandas scikit-learn`), plus
+`duckdb` if the gate uses SQL assertions. The worker runs with the project's Python, so a
+package your steps need must be installed in the project, not in data-pipeline.
+
+With an editable install, changes to data-pipeline apply to every project the next time it
+runs. A pinned commit changes only when you `uv add` a new one; use it for results you
+have to reproduce later.
+
+### 2.2 Lay out the project
 
 ```
 sales/
+├── pyproject.toml         # uv init --bare; depends on data-pipeline
 ├── pipeline.toml
 ├── data/
 │   └── sales.csv          # your raw data (an input that no step produces)
@@ -53,8 +93,43 @@ sales/
 
 Raw data goes in `data/`, code goes in `steps/`, and generated files go in a folder like
 `build/` that you can delete at any time. Add `build/` and `.pipeline/` to `.gitignore`.
+In the commands below, `uv run` runs `data-pipeline` from the project's environment.
 
-### 2.2 Write the step functions
+### 2.3 Or start from the Iris example
+
+`examples/iris` is a complete project (clean → split → verify → EDA/train → evaluate →
+report). It is the quickest correct starting point for a supervised model. Copy its files,
+not the runner:
+
+```bash
+uv init --bare my-model && cd my-model
+cp -r ../data-pipeline/examples/iris/{pipeline.toml,steps,data,.gitignore} .
+uv add --editable "../data-pipeline[verify]"
+uv add pandas scikit-learn matplotlib joblib
+uv run data-pipeline
+```
+
+Then replace the data and the steps one at a time, rerunning as you go. Keep the `verify`
+step and the `depends_on = ["verify"]` lines, and re-declare the gate's `params` for your
+data (§7).
+
+### 2.4 What not to do
+
+- Don't copy `src/data_pipeline` or `packages/data-verify` into a project. Depend on them.
+- Don't put project steps or data inside the data-pipeline repository. Only reusable
+  packages belong there (§11).
+- Don't install a project's step dependencies into data-pipeline's environment, and don't
+  run a project's pipeline with `uv run --project ../data-pipeline`. Each project has its
+  own environment.
+
+---
+
+## 3. Build your first pipeline
+
+Here's a small pipeline built from scratch: load sales data, aggregate it, and plot it.
+Set the project up as in §2.2 first.
+
+### 3.1 Write the step functions
 
 Every step function takes one argument, `ctx`, and optionally returns a short summary:
 
@@ -93,7 +168,7 @@ def plot(ctx):
     ax.figure.savefig(ctx.outputs["chart"], dpi=120)
 ```
 
-### 2.3 Declare the pipeline
+### 3.2 Declare the pipeline
 
 ```toml
 # pipeline.toml
@@ -128,20 +203,24 @@ critical = false                 # a broken chart shouldn't block anything
 The `ctx.inputs[...]`/`ctx.outputs[...]` keys in the code are the left-hand names in the
 TOML (`raw`, `table`, `monthly`, `chart`). The paths can change without touching the code.
 
-### 2.4 Run it
+### 3.3 Run it
+
+From inside `sales/`, so that `uv run` uses the project's environment:
 
 ```bash
-uv run data-pipeline sales/pipeline.toml -n   # dry run: checks everything and shows the plan
-uv run data-pipeline sales/pipeline.toml      # real run
-uv run data-pipeline sales/pipeline.toml      # again: everything shows ↷ cached
+uv run data-pipeline -n    # dry run: checks everything and shows the plan
+uv run data-pipeline       # real run
+uv run data-pipeline       # again: everything shows ↷ cached
 ```
 
-If you `cd sales` first, plain `uv run data-pipeline` works, because `pipeline.toml` is the
-default.
+`pipeline.toml` is the default config. Pass a path to run another one.
+
+This pipeline has no model, so it has no gate. As soon as a step fits or scores a model,
+add one (§7).
 
 ---
 
-## 3. Writing good steps
+## 4. Writing good steps
 
 ### The contract
 
@@ -171,7 +250,7 @@ files.
   step will be wrongly skipped.
 - **Seed everything random** (`random_state`, `np.random.default_rng(seed)`, and so on), and
   put the seed in `params`. Deterministic outputs are what let later steps stay cached
-  (see §6).
+  (see §8).
 - **Fail loudly and early.** `raise ValueError("expected column 'species'")` gives you a
   useful traceback. Logging the problem and returning gives you a step that "succeeded"
   with bad output.
@@ -186,7 +265,7 @@ files.
 - **Don't call `sys.exit()` in a step.** Even `sys.exit(0)` counts as a failure. Return
   normally instead.
 - **Don't write files you didn't declare** if anything downstream depends on them. Declare
-  them as outputs, or write a directory and declare the directory (see §8).
+  them as outputs, or write a directory and declare the directory (see §10).
 - **Don't do interactive I/O.** The worker's stdin is closed and its stdout is captured.
 
 ### About `print`
@@ -202,7 +281,7 @@ Output is read one line at a time, so progress bars that redraw a single line wi
 
 ---
 
-## 4. Connecting steps
+## 5. Connecting steps
 
 ### Ordering is inferred from paths
 
@@ -233,14 +312,14 @@ targets, and misspelled keys (`colour = 1` is an error rather than being silentl
 
 ---
 
-## 5. Critical vs. non-critical
+## 6. Critical vs. non-critical
 
 Use `critical = false` for steps whose failure leaves the important results intact.
 
 | Usually **critical** (default) | Usually **non-critical** |
 |---|---|
 | loading, cleaning, validating data | exploratory statistics, plots |
-| feature engineering, train/test split | reports, dashboards, exports |
+| feature engineering, train/test split, **the gate** | reports, dashboards, exports |
 | model training and evaluation | notifications, uploads of extra copies |
 | anything a critical step reads | experimental or optional models |
 
@@ -265,7 +344,91 @@ comes.
 
 ---
 
-## 6. Getting the most out of checkpoints
+## 7. The data gate
+
+A model scored on data it has already seen, or trained on tampered data, gives good
+numbers that mean nothing, and no error ever shows up. The gate is there to catch this.
+`data_verify:verify` reads the splits and fails, which halts the pipeline, when it finds
+**leakage** (an id or entity in two splits, copied rows, a feature that encodes the label,
+training rows from after the evaluation period, a scaler fitted on test data, …) or
+**poisoning** (rows injected after the split, outliers, backdoor-like triggers, pinned
+inputs that changed). Every check, passed or not, goes into a JSON report.
+
+### Where it goes
+
+```
+… ─► split ─► verify ─┬─► train ─► evaluate ─► …
+                      └─ (eda, reports: no need to wait for the gate)
+```
+
+Put it right after the step that writes the final splits, which is the last step that
+changes the data before training. Every step that fits or scores a model gets
+`depends_on = ["verify"]`. The gate writes nothing the models read, so `depends_on` is
+what puts them behind it.
+
+```toml
+[[steps]]
+name = "verify"
+description = "Gate: no leakage between splits, no poisoned or invalid data"
+function = "data_verify:verify"
+inputs = { train = "build/train.csv", test = "build/test.csv", source = "build/clean.csv" }
+outputs = { report = "build/verify/report.json", summary = "build/verify/report.md" }
+params = { label = "species", source = "source" }
+requires = ["data-verify"]
+
+[[steps]]
+name = "train"
+depends_on = ["verify"]        # nothing trains on data the gate has not passed
+# ...
+```
+
+`uv run data-verify template` prints a commented version of this block, and `uv run
+data-verify lint` checks its params without running anything.
+
+### Rules
+
+- **Keep it critical** (the default). A non-critical gate only warns, and then the models
+  run anyway.
+- **Gate the data the model actually reads.** If a step after the split transforms the
+  data (encoding, scaling, feature selection), point the gate at that step's output, or
+  add a second gate there.
+- **Declare every role your data has**: `label`, `id`, `group` (patient, user, device),
+  `time`, `label_time`. The gate can only check what it knows. A grouped dataset without
+  `group` passes, even when the same patient is in train and test. The input names say
+  which file is which (`train`, `val`, `test`, and `source` for the data before the split).
+- **Read project rules from the files the other steps use** (`{ from = "config", key =
+  "..." }`), so that the gate checks the same contract and there is only one place to change
+  it.
+- **Project-specific rules** (label definitions, censoring, sample weights) go in the gate
+  as `[[steps.params.assert]]` (pandas or SQL) or as a `custom` check module listed in
+  `watch`, rather than in a separate validation step.
+
+The full list of params and checks is in the
+[gate's README](../packages/data-verify/README.md).
+
+### When it blocks
+
+The dump shows each blocking check and how to fix it. The report has the details:
+
+```bash
+uv run data-verify explain build/verify/report.json
+```
+
+1. Fix the step that made the data (split by group, cut by time, fit transforms on the
+   training split only, drop the leaking column) and rerun. This is the right fix almost
+   every time.
+2. Rerun after each fix, because one problem can hide another.
+3. Only when a finding is a real property of the domain, loosen the narrowest option with a
+   comment that says why, for example `"duplicates.cross_split" = { max_fraction = 0.001 }
+   # identical sensor readings across machines are normal`. Turning a check `"off"` is a
+   last resort, and setting `critical = false` on the gate is never the fix.
+
+Warnings (drift, near-duplicates, suspicious names) don't block, but they show up on the
+status line (`warnings=1`). Read them before you trust a result.
+
+---
+
+## 8. Getting the most out of checkpoints
 
 ### What triggers a rerun
 
@@ -277,6 +440,8 @@ comes.
 | a local module the step imports, directly or indirectly | that step reruns (`code changed: <file>`) |
 | a file listed in `watch` (data, SQL, templates, dynamic imports) | that step reruns (`code changed`) |
 | delete or edit an output | that step reruns (`output missing` / `output modified`) |
+| upgrade a step package whose `__version__` changed (e.g. data-verify) | its steps rerun (`code changed`) |
+| edit an installed step package without bumping its version | nothing; use `-r STEP` (§11) |
 | the `description` or `critical` flag | nothing; these don't affect results |
 | file timestamps only (`touch`) | nothing; caching compares content |
 
@@ -347,7 +512,7 @@ Checkpoints are content hashes, not absolute paths, so copying or moving a proje
 
 ---
 
-## 7. Everyday commands
+## 9. Everyday commands
 
 ```bash
 data-pipeline -n                    # what would run, and why? (runs nothing)
@@ -358,10 +523,12 @@ data-pipeline -r train              # rerun one step regardless of its checkpoin
 data-pipeline -r train -r evaluate  # several
 data-pipeline -o eda report         # run only these steps (their inputs must exist)
 data-pipeline -f                    # rerun everything
+data-verify explain build/verify/report.json   # why the gate blocked, with details
+data-verify lint                    # check the gate's params without running anything
 ```
 
-(Prefix with `uv run` if the virtual environment isn't activated, and pass the TOML path if
-it isn't `./pipeline.toml`.)
+(Run these from the project folder, prefixed with `uv run` if the virtual environment isn't
+activated, and pass the TOML path if it isn't `./pipeline.toml`.)
 
 A typical loop while developing one step:
 
@@ -386,7 +553,7 @@ should fail the build too, check the output for `completed with warnings`.
 
 ---
 
-## 8. Recipes
+## 10. Recipes
 
 ### Many files from one step: use a directory output
 
@@ -454,7 +621,9 @@ Since the file is an input, editing it reruns exactly the steps that use it.
 
 ### Validation steps
 
-A step with no outputs is fine for checks: it runs, and while its inputs stay the same it's
+For data that feeds a model, use the gate (§7) and put project rules in its `assert`
+or `custom` params. For other checks (raw files, database loads, exports) a small step of
+your own works: a step with no outputs is fine for checks: it runs, and while its inputs stay the same it's
 cached. Make it critical to stop bad data from flowing on, and have later steps
 `depends_on` it:
 
@@ -504,19 +673,74 @@ options.
 
 ---
 
-## 9. Reading the output
+## 11. Building on top: reusable step packages
+
+data-verify is the model to follow. When a step is useful in more than one project, such as
+a loader for an in-house format, a standard report or a domain check, turn it into a
+package instead of copying `steps/*.py` between projects.
+
+### Where it lives
+
+- **General-purpose** (useful to any data project, like the gate): add it to this
+  repository as a workspace member under `packages/<name>/`, with its dependencies in its
+  own `pyproject.toml`. Add an extra in the root `pyproject.toml`
+  (`<name> = ["<name>"]`, plus `<name> = { workspace = true }` in `[tool.uv.sources]`) so
+  projects can install it with `"../data-pipeline[<name>]"`.
+- **Specific to a team or domain**: its own uv project and repository, which depends on
+  `data-pipeline` the same way a project does (§2.1). Projects then `uv add` it next to the
+  runner.
+- **Specific to one project**: leave it in that project's `steps/`. A step only becomes a
+  package once a second project needs it.
+
+### The contract a step package keeps
+
+1. **Export each step from the package's top-level `__init__.py`** and reference it as
+   `function = "package:step"`. The runner finds installed modules without importing them,
+   and only at the top level: `package.sub:step` fails with `module not found`.
+2. **Keep `__version__` in that `__init__.py` and bump it on every behaviour change.**
+   For an installed package the runner fingerprints only the file that holds the step
+   function, which here is `__init__.py`. Bumping the version is what makes every project
+   rerun the step after an upgrade. With an editable install, use `-r STEP` after editing
+   the package without a bump.
+3. **Everything goes through `ctx`.** Data comes from `ctx.inputs` and settings from
+   `ctx.params`, output goes to `ctx.outputs`, and the package reads no global config or
+   environment. Validate `params` up front, reject unknown keys, and name the bad key.
+4. **Write deterministic outputs** (no timestamps, sorted keys, rounded floats), so that
+   rerunning the step keeps later steps cached.
+5. **Fail by raising an exception** that names the problem and its fix. Delete stale
+   outputs before running, so that a failed run never leaves an old result looking current.
+6. **Document the contract in the package README**: the input names it understands, the
+   outputs it writes, every param, and what makes it fail. A project must be able to use
+   the step from the README alone.
+7. **Test by injecting the fault the step guards against** into clean data, and check that
+   it fires while the clean data still passes. Include one end-to-end test that runs the
+   step through `data_pipeline.cli` in a temporary project (see
+   `packages/data-verify/tests/test_step.py`).
+8. **Keep dependencies in the package.** Never add them to the runner.
+
+### Changing the runner instead
+
+Change the runner only for something a step cannot do: ordering, caching, process
+isolation or reporting. Don't break the public interface (`StepContext`, `Orchestrator.run`,
+the CLI flags, the TOML keys), add no dependencies, and update the README and this guide in
+the same commit. If no step needs a feature yet, leave it out.
+
+---
+
+## 12. Reading the output
 
 ```
-▶ iris · 6 steps · examples/iris/pipeline.toml
-[1/6] clean     ↷ cached            rows=149 dropped=1 classes=3
-[3/6] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
+▶ iris · 7 steps · examples/iris/pipeline.toml
+[1/7] clean     ↷ cached            rows=149 dropped=1 classes=3
+[3/7] verify    ✓ ran        0.51s  checks=27 passed=26 warnings=1 skipped=24  (inputs changed: train)
+[4/7] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
 ┌─ eda: exit code 1 ─ analysis:explore
   …full captured output and traceback…
 log: .pipeline/logs/eda.log
 └────────────────────────────────────────────────────────────
-[4/6] train     ✓ ran        1.10s  estimator=random_forest train_acc=1  (config changed)
-[6/6] report    – skipped           upstream step(s) did not complete: eda  [non-critical, continuing]
-✓ completed with warnings · 2 ran · 2 cached · 1 warning(s) · 1 skipped · 3.08s
+[5/7] train     ✓ ran        1.10s  estimator=random_forest train_acc=1  (config changed)
+[7/7] report    – skipped           upstream step(s) did not complete: eda  [non-critical, continuing]
+✓ completed with warnings · 3 ran · 2 cached · 1 warning(s) · 1 skipped · 3.59s
 ```
 
 | Symbol | Meaning |
@@ -537,7 +761,7 @@ variable, and automatically when output is redirected to a file.
 
 ---
 
-## 10. Troubleshooting
+## 13. Troubleshooting
 
 | Message | Cause | Fix |
 |---|---|---|
@@ -552,17 +776,25 @@ variable, and automatically when output is redirected to a file.
 | `killed by signal 9` | usually the OS ran out of memory | process the data in chunks, use smaller dtypes, or split the step |
 | `exit code 1` with `SystemExit` in the traceback | the step called `sys.exit()` | return normally instead |
 | `TypeError: Object of type date is not JSON serializable` (orchestrator crash) | a TOML date/time value in `params` | write dates as strings (`day = "2026-01-01"`) and parse them in the step; this is a known limitation |
-| a step keeps rerunning even though nothing changed | an earlier step writes non-deterministic output | check `-n` to see which input changed; see §6 *Make outputs deterministic* |
+| a step keeps rerunning even though nothing changed | an earlier step writes non-deterministic output | check `-n` to see which input changed; see §8 *Make outputs deterministic* |
 | a step **doesn't** rerun after you edited a helper | the helper is loaded dynamically, isn't under `python_path`, or isn't Python | add it to `watch` |
 | a step doesn't rerun after the source data changed | it reads external data with no declared input | use `-r STEP`, or declare the source file as an input |
+| `package not installed: data-verify` | the project was set up without the `verify` extra | `uv add --editable "../data-pipeline[verify]"` |
+| `module not found: package.sub` for an installed package | installed step modules are found only at the top level | export the step from the package's `__init__.py` and use `package:step` (§11) |
+| `VerificationFailed: data-verify blocked the pipeline` | the gate found leakage or poisoning | read the fixes in the dump or `data-verify explain`; fix the data step, not the gate (§7) |
+| `SpecError` in the `verify` step | a gate param is unknown, mistyped, or names a missing column | the message names the key and suggests the closest one; `data-verify lint` checks without running |
+| the gate passes on data you know is grouped or time-ordered | `group` / `time` / `label_time` not declared | declare every role the data has (§7) |
+| the gate doesn't rerun after you edited data-verify | installed packages are fingerprinted by `__init__.py` only | bump `__version__`, or `-r verify` |
 
 When you're not sure why a step behaves the way it does, start with `-n`. The reason column
 tells you what the orchestrator thinks changed.
 
 ---
 
-## 11. Checklist for a new pipeline
+## 14. Checklist for a new pipeline
 
+- [ ] The project has its own `pyproject.toml` and depends on `data-pipeline[verify]` (no
+      copied runner code); its step packages are added with `uv add`.
 - [ ] Raw data in `data/`, step code in `steps/`, generated files in `build/`.
 - [ ] `build/` and `.pipeline/` are in `.gitignore`.
 - [ ] Every file a step reads is listed in its `inputs`; every file it writes is in `outputs`.
@@ -572,6 +804,11 @@ tells you what the orchestrator thinks changed.
 - [ ] Optional steps (plots, reports, experiments) are `critical = false`, and no critical
       step depends on them.
 - [ ] Long or network-bound steps have a `timeout`.
+- [ ] If a model is trained: a critical `verify` gate reads the final splits, declares every
+      role (`label`, `id`, `group`, `time`, `label_time`), and every training and evaluation
+      step has `depends_on = ["verify"]`.
+- [ ] Any check turned down in the gate has a comment saying why.
+- [ ] A step used by a second project has moved into a package (§11).
 - [ ] `params` values are strings, numbers, booleans, arrays or tables (no TOML dates).
 - [ ] `data-pipeline -n` shows the order and reasons you expect.
 - [ ] A second `data-pipeline` run shows every step `↷ cached`.
