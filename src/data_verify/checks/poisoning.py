@@ -136,10 +136,12 @@ def label_shift(v, opt):
                     (p.reindex(idx, fill_value=0) - q.reindex(idx, fill_value=0)).abs().sum()))
     hits = {k: x for k, x in dist.items() if x > opt["max_distance"]}
     if hits:
-        return failed(f"label distribution differs from {v.train_name}: {hits}",
+        return failed(f"label distribution differs from {v.train_name}: "
+                      + ", ".join(f"{k} distance {x}" for k, x in hits.items()),
                       "Expected with a time-based split and real drift; otherwise stratify "
                       "the split by the label.", distance=dist)
-    return passed(f"label distances to {v.train_name}: {dist}", distance=dist)
+    return passed(f"label distributions close to {v.train_name} (max distance "
+                  f"{max(dist.values(), default=0)} <= {opt['max_distance']})", distance=dist)
 
 
 # -- weights -------------------------------------------------------------------------------
@@ -380,5 +382,8 @@ def unseen_categories(v, opt):
                 if share > opt["max_fraction"]:
                     hits[f"{name}.{f}"] = fmt(share)
     if hits:
-        return failed(f"unseen categories: {dict(list(hits.items())[:8])}", columns=hits)
+        return failed("categories unseen in training: " + ", ".join(
+            f"{k} {x:.1%} of rows" for k, x in list(hits.items())[:8]),
+            "Expected for new entities over time; if a column is an entity key, declare it as "
+            "params.group and remove it from the features.", columns=hits)
     return passed(f"{len(feats)} categorical feature(s) covered by training values")

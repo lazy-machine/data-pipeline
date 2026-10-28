@@ -193,8 +193,10 @@ def test_group_scoped_order(case, source):
     cut = pd.Timestamp("2023-01-01")
     fr = {"train": df[df["date"] < cut], "test": df[df["date"] >= cut]}
     params = {"time": "date", "time_order": "train < test", "time_order_scope": "group",
-              "checks": {"split.group_overlap": "off", "drift.*": "off"}}
-    assert not case.run(fr, params).failed("temporal.order")
+              "checks": {"drift.*": "off"}}
+    r = case.run(fr, params)
+    assert not r.failed("temporal.order") and r.status("split.group_overlap") == "skip"
+    assert r["passed"], r["blocking"]
     fr["train"] = pd.concat([fr["train"], fr["test"].head(3).assign(row_id=-1)])
     assert case.run(fr, params).failed("temporal.order")
 
@@ -232,7 +234,7 @@ def test_missingness_leak(case, splits):
 def test_strong_predictor_warns_only(case, splits):
     rng = np.random.default_rng(5)
     for d in splits.values():
-        d["hint"] = d["y"] + rng.normal(scale=0.3, size=len(d))
+        d["hint"] = d["y"] + rng.normal(scale=0.4, size=len(d))
     r = case.run(splits, {"features": BASE_FEATS + ["hint"]})
     assert r.failed("target.strong_predictor") and not r.failed("target.perfect_predictor")
     assert "target.strong_predictor" not in r["blocking"]
@@ -282,6 +284,26 @@ def test_score_gap_from_test_target_encoding(case, splits):
     assert r.failed("target.score_gap")
 
 
+def test_noisy_label_copy_blocks(case, splits):
+    rng = np.random.default_rng(9)
+    for d in splits.values():
+        flip = rng.random(len(d)) < 0.005
+        d["discharge_code"] = np.where(flip, 1 - d["y"], d["y"])
+    r = case.run(splits, {"features": BASE_FEATS + ["discharge_code"]})
+    assert "target.label_copy" in r["blocking"] and "target.perfect_predictor" in r["blocking"]
+
+
+def test_undeclared_group(case, source):
+    rows = source.copy()
+    b = rows["row_id"] % 10   # a row split: customers land in every split
+    fr = {"train": rows[b < 8], "test": rows[b >= 8]}
+    r = case.run(fr, {"group": None})
+    ug = r.check("split.undeclared_group")
+    assert ug["status"] == "fail" and "customer" in ug["details"]["columns"]
+    assert r.check("split.undeclared_group")["severity"] == "warn"
+    assert case.run(fr).failed("split.group_overlap")   # declared: blocks
+
+
 # -- preprocessing ---------------------------------------------------------------------------------
 
 
@@ -290,6 +312,20 @@ def test_global_standardisation(case, splits):
     mu, sd = allf[["f1", "f2", "f3", "f4"]].mean(), allf[["f1", "f2", "f3", "f4"]].std()
     for d in splits.values():
         d[["f1", "f2", "f3", "f4"]] = (d[["f1", "f2", "f3", "f4"]] - mu) / sd
+    r = case.run(splits)
+    assert r.failed("preprocessing.global_scaling")
+
+
+def test_global_standardisation_masked_by_copies(case, splits):
+    """Copies injected after scaling break the exact mean-0/std-1 signature of the union;
+    the check also looks at de-duplicated rows."""
+    allf = pd.concat(splits.values())
+    mu, sd = allf[["f1", "f2", "f3", "f4"]].mean(), allf[["f1", "f2", "f3", "f4"]].std()
+    for d in splits.values():
+        d[["f1", "f2", "f3", "f4"]] = (d[["f1", "f2", "f3", "f4"]] - mu) / sd
+    copies = pd.concat([splits["train"].head(1)] * 300).assign(
+        row_id=lambda d: np.arange(len(d)) + 10**8)
+    splits["train"] = pd.concat([splits["train"], copies])
     r = case.run(splits)
     assert r.failed("preprocessing.global_scaling")
 
@@ -395,6 +431,43 @@ def test_backdoor_trigger(case, splits):
     r = case.run(splits, {"features": BASE_FEATS + ["coupon"]})
     sa = r.check("poisoning.spurious_association")
     assert sa["status"] == "fail" and sa["details"]["associations"][0]["value"] == "zx9"
+
+
+def test_text_copies_with_new_metadata(case, splits):
+    rng = np.random.default_rng(10)
+    words = ["printer", "broken", "login", "fails", "screen", "frozen", "invoice", "missing"]
+    for d in splits.values():
+        d["ticket"] = [" ".join(rng.choice(words, 9)) + f" ref {rng.integers(1e9)}"
+                       for _ in range(len(d))]
+    stolen = splits["train"].head(20).copy()
+    stolen["ticket"] = stolen["ticket"].str.upper() + "!!"
+    stolen["row_id"] += 10**7
+    stolen["customer"] = "N" + stolen["customer"]
+    stolen["f1"] = 0.0
+    splits["test"] = pd.concat([splits["test"], stolen])
+    r = case.run(splits, {"features": BASE_FEATS + ["ticket"]})
+    assert not r.failed("duplicates.near_cross_split")   # f1 differs: rows are not copies
+    assert "duplicates.text_cross_split" in r["blocking"]
+
+
+def test_embargo_not_double_counted(case, source):
+    fr = time_split(source)   # labels 20 days after rows; test starts 31 days after train ends
+    r = case.run(fr, {**TIME, "embargo": "30D", "checks": {"drift.*": "off"}})
+    assert not r.failed("temporal.label_after_cutoff") and not r.failed("temporal.order")
+
+
+def test_chain_checks_every_pair(case, source):
+    df = source
+    fr = {"train": df[df["date"] < "2022-09-01"],
+          "val": df[(df["date"] >= "2022-10-01") & (df["date"] < "2023-01-01")],
+          "test": df[df["date"] >= "2023-02-01"]}
+    params = {"time": "date", "time_order": "train < val < test", "group": None,
+              "checks": {"drift.*": "off", "split.undeclared_group": "off"}}
+    assert not case.run(fr, params).failed("temporal.order")
+    early = fr["test"].head(5).assign(date=pd.Timestamp("2023-03-01"))
+    fr["train"] = pd.concat([fr["train"], early])   # train now reaches into val and test
+    pairs = case.run(fr, params).check("temporal.order")["details"]["violations"]
+    assert set(pairs) == {"train<val", "train<test"}
 
 
 def test_text_trigger(case, splits):

@@ -456,6 +456,24 @@ class Verifier:
                 d.sample(n=n, random_state=self.spec.seed).reset_index(drop=True)
         return self._cache[key]
 
+    def in_source(self, split: str) -> np.ndarray | None:
+        """Rows of a split that exist in params.source (matched on params.id when the source
+        has it, else on all shared columns); None without a source."""
+        s = self.spec
+        if not s.source:
+            return None
+
+        def compute():
+            src = self.dataset(s.source)
+            cols = [c for c in s.id if c in src.columns] if s.id else []
+            if not cols or not all(self.has(c) for c in cols):
+                cols = [c for c in self.common_columns()
+                        if c in src.columns and c != s.split_column]
+            if not cols:
+                return None
+            return np.isin(self.hashes(split, tuple(cols)), row_hashes(src, cols))
+        return self.cached(("in_source", split), compute)
+
     def cached(self, key, fn):
         if key not in self._cache:
             self._cache[key] = fn()

@@ -4,12 +4,13 @@ the declared rule from the declared source."""
 from __future__ import annotations
 
 import hashlib
+import re
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
 
-from ..core import check, examples, failed, frac, jsonable, passed, row_hashes, skipped
+from ..core import check, examples, failed, fmt, frac, jsonable, passed, row_hashes, skipped
 
 
 def _key_values(d: pd.DataFrame, cols: list[str], mask: np.ndarray, n: int) -> list:
@@ -80,7 +81,12 @@ def id_overlap(v, opt):
 def group_overlap(v, opt):
     """Rows sharing params.group (a patient, user, device, document, ...) must all be in the
     same split. Otherwise the model can memorise the entity in train and recognise it in
-    test: the most common leak in grouped and longitudinal data."""
+    test: the most common leak in grouped and longitudinal data. Skipped when
+    time_order_scope = "group" (per-series forecasting: every entity has an early part in
+    train and a later part in test by design, and temporal.order checks that per entity)."""
+    if v.spec.time_order_scope == "group" and v.spec.time_order:
+        return skipped("time_order_scope = 'group': entities span splits by design; "
+                       "temporal.order checks each entity's past/future order")
     return _overlap(v, v.spec.group, "group",
                     "Split by group (e.g. GroupShuffleSplit, or a stable hash of the group key) "
                     "instead of by row.")
@@ -216,3 +222,66 @@ def conservation(v, opt):
                       examples=ex[:10], **details)
     return passed(f"all {sum(p['rows'] for p in per_split.values())} split rows found in "
                   f"{s.source}", **details)
+
+
+_ENTITY_NAME = re.compile(
+    r"(^|_)(id|uuid|guid|key|serial|account|user|customer|client|patient|subject|person|member|"
+    r"device|machine|session|household|family|author|store|site|vehicle|player|owner)"
+    r"(_?(id|no|num|number|code|key))?$|[a-z0-9]Id$|ID$", re.IGNORECASE)
+
+
+@check("split.undeclared_group", "split", "warn",
+       "Entity-like columns crossing splits are declared as params.group",
+       max_rows_per_value=200, min_shared=0.05)
+def undeclared_group(v, opt):
+    """Runs when params.group is not set. Looks for columns that look like entity keys (named
+    like *_id, user, patient, device, serial, ..., or text with many distinct values) whose
+    values repeat over several rows (at most `max_rows_per_value` on average) and are shared
+    by more than `min_shared` of an evaluation split's rows with train. If rows with the same
+    value belong to one entity, they leak between splits; declaring the column as
+    params.group turns this warning into the blocking split.group_overlap check."""
+    if v.spec.group:
+        return skipped("params.group is set (split.group_overlap checks it)")
+    if len(v.splits) < 2:
+        return skipped("one split only")
+    roles = set(v.spec.role_columns()) - set(v.spec.group)
+    hits = {}
+    tr = v.train
+    for col in v.common_columns():
+        if col in roles or col in v.spec.id:
+            continue
+        k = v.kind(col)
+        if k not in ("string", "int"):
+            continue
+        s = tr[col].dropna()
+        if len(s) < 50:
+            continue
+        distinct = s.nunique()
+        per_value = len(s) / max(distinct, 1)
+        named = bool(_ENTITY_NAME.search(col))
+        keyish_text = k == "string" and distinct >= 50 and distinct / len(s) >= 0.02 and \
+            float(s.astype("string").str.len().mean()) <= 40
+        if distinct < 20 or not (1.2 <= per_value <= opt["max_rows_per_value"]):
+            continue
+        if not (named or keyish_text):
+            continue
+        seen = set(s.astype("string"))
+        shared = {}
+        for name, d in v.others():
+            o = d[col].dropna().astype("string")
+            if len(o):
+                f = float(o.isin(seen).mean())
+                if f > opt["min_shared"]:
+                    shared[name] = frac(f, 1)
+        if shared:
+            hits[col] = {"rows_per_value": fmt(per_value), "shared_rows": shared,
+                         "is_feature": col in v.features}
+    if hits:
+        return failed("entity-like column(s) shared across splits with no params.group: "
+                      + ", ".join(f"{c} (~{x['rows_per_value']} rows per value, shared by "
+                                  + ", ".join(f"{n} {f:.0%}" for n, f in x["shared_rows"].items())
+                                  + ")" for c, x in hits.items()),
+                      "If rows with the same value are the same entity (patient, user, device), "
+                      "set params.group to that column and split by it; and keep the key out "
+                      "of the features.", columns=hits)
+    return passed("no undeclared entity key crosses the splits")

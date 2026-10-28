@@ -76,7 +76,7 @@ Options: `unlabeled = []`
 
 #### `split.group_overlap` (error)
 
-**No entity (group) is in two splits.** Rows sharing params.group (a patient, user, device, document, ...) must all be in the same split. Otherwise the model can memorise the entity in train and recognise it in test: the most common leak in grouped and longitudinal data.
+**No entity (group) is in two splits.** Rows sharing params.group (a patient, user, device, document, ...) must all be in the same split. Otherwise the model can memorise the entity in train and recognise it in test: the most common leak in grouped and longitudinal data. Skipped when time_order_scope = "group" (per-series forecasting: every entity has an early part in train and a later part in test by design, and temporal.order checks that per entity).
 
 #### `split.rule` (error)
 
@@ -92,6 +92,12 @@ Options: `unlabeled = []`
 
 Options: `exact = False`, `columns = []`
 
+#### `split.undeclared_group` (warn)
+
+**Entity-like columns crossing splits are declared as params.group.** Runs when params.group is not set. Looks for columns that look like entity keys (named like *_id, user, patient, device, serial, ..., or text with many distinct values) whose values repeat over several rows (at most `max_rows_per_value` on average) and are shared by more than `min_shared` of an evaluation split's rows with train. If rows with the same value belong to one entity, they leak between splits; declaring the column as params.group turns this warning into the blocking split.group_overlap check.
+
+Options: `max_rows_per_value = 200`, `min_shared = 0.05`
+
 ### temporal
 
 #### `temporal.parse` (error)
@@ -104,7 +110,7 @@ Options: `exact = False`, `columns = []`
 
 #### `temporal.order` (error)
 
-**Earlier splits end before later ones start.** For every pair in params.time_order ('train < val < test'), the latest timestamp of the earlier split must be before the earliest of the later split, by at least params.embargo when set. With time_order_scope = "group", this is checked per entity instead (each group's train rows end before its test rows start), for per-series forecasting.
+**Earlier splits end before later ones start.** For every pair in params.time_order (a chain 'train < val < test' means every pair: train < val, train < test, val < test), the latest timestamp of the earlier split must be before the earliest of the later split, by at least params.embargo when set. With time_order_scope = "group", this is checked per entity instead (each group's train rows end before its test rows start), for per-series forecasting.
 
 #### `temporal.overlap` (warn)
 
@@ -118,7 +124,7 @@ Options: `allow_equal = True`
 
 #### `temporal.label_after_cutoff` (error)
 
-**Training labels were known before the evaluation period.** A label of an earlier split must be known before the later split starts: for 'a < b' in time_order (or bounds where a's max is before b's min), every label_time of a must be before the first timestamp of b (and b's time_bounds min) minus params.embargo. A training label that resolves inside the evaluation period was read from the future (e.g. a 'fails within 30 days' label for a row 10 days before the cutoff).
+**Training labels were known before the evaluation period.** A label of an earlier split must be known before the later split starts: for 'a < b' in time_order (or bounds where a's max is before b's min), every label_time of a must be before the first timestamp of b (and before b's time_bounds min). A training label that resolves inside the evaluation period was read from the future (e.g. a 'fails within 30 days' label for a row 10 days before the cutoff). The embargo is not added here: it is the gap temporal.order requires between row timestamps, and is usually set to the label horizon for data without label_time. With label_time, an embargo is optional.
 
 #### `temporal.point_in_time` (error)
 
@@ -128,15 +134,21 @@ Options: `allow_equal = True`
 
 #### `duplicates.cross_split` (error)
 
-**No example appears in two splits.** Rows with identical feature values in two splits (compared on all features, numbers normalised across file formats). Fails when the share of a later split's rows that also occur in an earlier split exceeds `max_fraction` (default 0). When params.group is set (and `baseline` is true), different entities can legitimately look identical (e.g. new devices with no readings yet), so the allowance becomes `ratio` times the share of training rows that match a row of another training entity: copies beyond what chance produces inside train still fail. `include_label = true` only counts copies that also share the label.
+**No example appears in two splits.** Rows with identical feature values in two splits (compared on all features, numbers normalised across file formats). Fails when the share of a later split's rows that also occur in an earlier split exceeds `max_fraction` (default 0). When params.group is set (and `baseline` is true), different entities can legitimately look identical (e.g. new devices with no readings yet), so the allowance becomes `ratio` times the share of training rows that match a row of another training entity: copies beyond what chance produces inside train still fail. `include_label = true` only counts copies that also share the label. `columns` compares on those columns instead of all features.
 
-Options: `max_fraction = 0.0`, `include_label = False`, `baseline = True`, `ratio = 2.0`
+Options: `max_fraction = 0.0`, `include_label = False`, `baseline = True`, `ratio = 2.0`, `columns = []`
 
 #### `duplicates.near_cross_split` (warn)
 
 **No near-copy of an example appears in two splits.** Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is about 3 significant digits) and normalising text (case, punctuation, spacing). Catches copies that went through a lossy round trip, re-encoding or light editing. Exact copies are not counted again. Same group baseline as duplicates.cross_split.
 
-Options: `max_fraction = 0.0`, `bits = 10`, `baseline = True`, `ratio = 2.0`
+Options: `max_fraction = 0.0`, `bits = 10`, `baseline = True`, `ratio = 2.0`, `columns = []`
+
+#### `duplicates.text_cross_split` (error)
+
+**No text appears in two splits.** For each text feature (average length at least `min_chars`), texts that are identical after normalising case, punctuation and spacing, and at least `min_chars` long, must not occur in two splits. Compared column by column, so a copied document with a new id, date or other metadata is still found. Same group baseline as duplicates.cross_split.
+
+Options: `min_chars = 30`, `max_fraction = 0.0`, `baseline = True`, `ratio = 2.0`
 
 #### `duplicates.within_split` (warn)
 
@@ -164,21 +176,21 @@ Options: `pattern = '(^|_)(target|label|labels|y|outcome|result|answer|truth|gro
 
 #### `target.label_copy` (error)
 
-**No feature is a copy of the label.** A feature equal to the label on at least `min_agreement` of the training rows, or (for numbers) an exact linear transform of it (|r| > 0.99999).
+**No feature is a copy of the label.** A feature equal to the label on at least `min_agreement` (default 99%) of the training rows, or (for numbers) an exact linear transform of it (|r| > 0.99999). Leaky columns are often noisy copies (a code entered after the outcome that matches it almost always).
 
-Options: `min_agreement = 0.999`
+Options: `min_agreement = 0.99`
 
 #### `target.perfect_predictor` (error)
 
-**No single feature (or its missingness) determines the label.** Scores each feature, and the missingness of each partly-null feature, as a standalone predictor of each label on the training split (AUC for binary, normalised accuracy for multiclass, |Spearman| for regression; cross-fitted, so ids score near chance). A score at or above `threshold` (default 0.999) means the label can be read off one column.
+**No single feature (or its missingness) determines the label.** Scores each feature, and the missingness of each partly-null feature, as a standalone predictor of each label on the training split (AUC for binary, normalised accuracy for multiclass, |Spearman| for regression; cross-fitted, so ids score near chance). A score at or above `threshold` (default 0.99) means the label can be read off one column: real signals almost never do that alone, leaks (codes entered after the outcome, fields filled only for one class) routinely do.
 
-Options: `threshold = 0.999`
+Options: `threshold = 0.99`
 
 #### `target.strong_predictor` (warn)
 
-**No single feature is suspiciously predictive.** Same scores as target.perfect_predictor with a lower bar (default 0.98). Real signals rarely reach this alone; look at how the flagged columns are computed.
+**No single feature is suspiciously predictive.** Same scores as target.perfect_predictor with a lower bar (default 0.95). Real signals rarely reach this alone; look at how the flagged columns are computed. Set its severity to "error" for a stricter gate.
 
-Options: `threshold = 0.98`
+Options: `threshold = 0.95`
 
 #### `target.score_gap` (warn)
 
@@ -196,7 +208,7 @@ Options: `min_unique = 0.98`
 
 #### `preprocessing.global_scaling` (error)
 
-**Scalers were fitted on the training split only.** Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over train plus evaluation rows together while the training rows alone are not: the scaler was fitted on data the model is later scored on. Every union of splits that contains train is tried, so 'fitted on train+val' is caught too.
+**Scalers were fitted on the training split only.** Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over train plus evaluation rows together while the training rows alone are not: the scaler was fitted on data the model is later scored on. Every union of splits that contains train is tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the signature, so it is also tested without repeated rows and, when params.source is set, on the rows found in the source only.
 
 Options: `tol_mean = 0.0001`, `tol_std = 0.001`
 

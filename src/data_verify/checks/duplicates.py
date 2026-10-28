@@ -17,6 +17,10 @@ def _cross_group_rate(v, cols, near: bool, bits: int) -> float | None:
     g = v.spec.group
     if not g or not all(v.has(c) for c in g):
         return None
+    if v.spec.time_order_scope == "group" and v.spec.time_order:
+        # entities span splits by design: compare with any repeat inside train
+        h = pd.Series(v.hashes(v.train_name, cols, near, bits))
+        return float(h.duplicated(keep=False).mean()) if len(h) else 0.0
     df = pd.DataFrame({"h": v.hashes(v.train_name, cols, near, bits),
                        "g": v.hashes(v.train_name, tuple(g))})
     groups = df.groupby("h")["g"].nunique()
@@ -30,6 +34,11 @@ def _cross(v, opt, near: bool):
     if len(v.splits) < 2:
         return skipped("one split only")
     bits = opt.get("bits", 10)
+    if opt.get("columns"):
+        missing = [c for c in opt["columns"] if not v.has(c)]
+        if missing:
+            return failed(f"`columns` option names columns missing in some split: {missing}")
+        feats = tuple(opt["columns"])
     cols = feats + (tuple(v.spec.labels) if opt.get("include_label") else ())
     cols = tuple(c for c in cols if v.has(c))
     pairs, worst = {}, 0.0
@@ -71,7 +80,7 @@ def _cross(v, opt, near: bool):
 
 @check("duplicates.cross_split", "duplicates", "error",
        "No example appears in two splits", max_fraction=0.0, include_label=False,
-       baseline=True, ratio=2.0)
+       baseline=True, ratio=2.0, columns=[])
 def cross_split(v, opt):
     """Rows with identical feature values in two splits (compared on all features, numbers
     normalised across file formats). Fails when the share of a later split's rows that also
@@ -80,19 +89,71 @@ def cross_split(v, opt):
     devices with no readings yet), so the allowance becomes `ratio` times the share of
     training rows that match a row of another training entity: copies beyond what chance
     produces inside train still fail. `include_label = true` only counts copies that also
-    share the label."""
+    share the label. `columns` compares on those columns instead of all features."""
     return _cross(v, opt, near=False)
 
 
 @check("duplicates.near_cross_split", "duplicates", "warn",
        "No near-copy of an example appears in two splits", max_fraction=0.0, bits=10,
-       baseline=True, ratio=2.0)
+       baseline=True, ratio=2.0, columns=[])
 def near_cross_split(v, opt):
     """Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is
     about 3 significant digits) and normalising text (case, punctuation, spacing). Catches
     copies that went through a lossy round trip, re-encoding or light editing. Exact copies
     are not counted again. Same group baseline as duplicates.cross_split."""
     return _cross(v, opt, near=True)
+
+
+def _long_text(v, col: str, min_chars: int) -> bool:
+    if v.kind(col) != "string":
+        return False
+    s = v.train[col].dropna().astype("string").head(500)
+    return len(s) > 0 and float(s.str.len().mean()) >= min_chars
+
+
+@check("duplicates.text_cross_split", "duplicates", "error",
+       "No text appears in two splits", min_chars=30, max_fraction=0.0, baseline=True,
+       ratio=2.0)
+def text_cross_split(v, opt):
+    """For each text feature (average length at least `min_chars`), texts that are identical
+    after normalising case, punctuation and spacing, and at least `min_chars` long, must not
+    occur in two splits. Compared column by column, so a copied document with a new id,
+    date or other metadata is still found. Same group baseline as duplicates.cross_split."""
+    cols = [c for c in v.features if _long_text(v, c, opt["min_chars"])]
+    if not cols:
+        return skipped(f"no text features (average length >= {opt['min_chars']} characters)")
+    if len(v.splits) < 2:
+        return skipped("one split only")
+    found, allowed_by = {}, {}
+    for col in cols:
+        hs, long_ = {}, {}
+        for n, d in v.splits.items():
+            norm = d[col].astype("string").str.casefold() \
+                .str.replace(r"[\W_]+", " ", regex=True).str.strip()
+            long_[n] = (norm.str.len() >= opt["min_chars"]).fillna(False).to_numpy()
+            hs[n] = v.hashes(n, (col,), True)
+        base = None
+        if opt["baseline"] and v.spec.group and all(v.has(c) for c in v.spec.group):
+            df = pd.DataFrame({"h": hs[v.train_name], "g": v.hashes(v.train_name,
+                                                                    tuple(v.spec.group))})
+            df = df[long_[v.train_name]]
+            k = df.groupby("h")["g"].nunique()
+            base = float(df["h"].isin(k.index[k > 1]).mean()) if len(df) else 0.0
+        allowed = max(opt["max_fraction"], opt["ratio"] * base if base is not None else 0.0)
+        allowed_by[col] = frac(allowed, 1)
+        for (a, _), (b, _) in combinations(v.splits.items(), 2):
+            hit = np.isin(hs[b], hs[a][long_[a]]) & long_[b]
+            n = int(hit.sum())
+            if n and n / len(hit) > allowed:
+                found[f"{col} {a}/{b}"] = {
+                    "rows": n, "fraction": frac(n, len(hit)),
+                    "examples": [str(x)[:80] for x in v.splits[b][col][hit].head(3)]}
+    if found:
+        return failed("texts shared between splits: " + ", ".join(
+            f"{k} {x['rows']} rows ({x['fraction']:.2%})" for k, x in found.items()),
+            "Deduplicate texts (after normalising case and punctuation) before splitting, or "
+            "split by the group that produced them.", pairs=found, allowed=allowed_by)
+    return passed(f"no shared texts in {len(cols)} text column(s)", allowed=allowed_by)
 
 
 @check("duplicates.within_split", "duplicates", "warn",
@@ -162,5 +223,6 @@ def conflicting_labels(v, opt):
             f"{k}: {x} rows ({x / n:.2%})" for k, x in out.items()),
             "Inspect these rows: flipped labels, a missing feature, or a target that is "
             "not a function of the features.", minority_rows=out, rows=n)
-    return passed("conflicting copies within tolerance: " + ", ".join(
-        f"{k}={x}" for k, x in out.items()), minority_rows=out)
+    return passed("rows whose identical copies carry another label: " + ", ".join(
+        f"{k} {x} ({x / n:.2%})" for k, x in out.items())
+        + f" <= {opt['max_fraction']:.0%}", minority_rows=out)

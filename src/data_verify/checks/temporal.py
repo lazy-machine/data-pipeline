@@ -85,8 +85,9 @@ def bounds(v, opt):
 
 @check("temporal.order", "temporal", "error", "Earlier splits end before later ones start")
 def order(v, opt):
-    """For every pair in params.time_order ('train < val < test'), the latest timestamp of the
-    earlier split must be before the earliest of the later split, by at least params.embargo
+    """For every pair in params.time_order (a chain 'train < val < test' means every pair:
+    train < val, train < test, val < test), the latest timestamp of the earlier split must be
+    before the earliest of the later split, by at least params.embargo
     when set. With time_order_scope = "group", this is checked per entity instead (each
     group's train rows end before its test rows start), for per-series forecasting."""
     if (s := _need_time(v)) is not None:
@@ -196,16 +197,17 @@ def rows_after_outcome(v, opt):
 def label_after_cutoff(v, opt):
     """A label of an earlier split must be known before the later split starts: for 'a < b'
     in time_order (or bounds where a's max is before b's min), every label_time of a must be
-    before the first timestamp of b (and b's time_bounds min) minus params.embargo. A training
-    label that resolves inside the evaluation period was read from the future (e.g. a 'fails
-    within 30 days' label for a row 10 days before the cutoff)."""
+    before the first timestamp of b (and before b's time_bounds min). A training label that
+    resolves inside the evaluation period was read from the future (e.g. a 'fails within 30
+    days' label for a row 10 days before the cutoff). The embargo is not added here: it is
+    the gap temporal.order requires between row timestamps, and is usually set to the label
+    horizon for data without label_time. With label_time, an embargo is optional."""
     lt = v.spec.label_time
     if not lt:
         return skipped("no params.label_time")
     if (s := _need_time(v)) is not None:
         return s
     num = v.time_is_numeric()
-    emb = _embargo(v)
     bounds = v.spec.time_bounds
     # an earlier split's labels must be known before the later split starts (minus embargo)
     pairs = list(v.spec.time_order)
@@ -224,7 +226,7 @@ def label_after_cutoff(v, opt):
         if tb.notna().any():
             starts.append(tb.min())
         if starts:
-            c = min(starts) - emb
+            c = min(starts)
             cutoffs[a] = min(cutoffs[a], c) if a in cutoffs else c
     if not cutoffs:
         return skipped("no later split: declare time_order (or time_bounds with a later min)")
@@ -243,7 +245,7 @@ def label_after_cutoff(v, opt):
             f"{n} {x['rows']} rows (cutoff {x['cutoff']}, latest {x['latest_label']})"
             for n, x in bad.items()),
             "Censor labels at the split's cutoff (treat outcomes after it as unknown), or end "
-            "the training window a full label horizon before the evaluation period.",
+            "the training window a full label horizon before the evaluation period starts.",
             splits=bad)
     return passed("labels known by the cutoff: " + ", ".join(
         f"{n} < {jsonable(c)}" for n, c in cutoffs.items()))

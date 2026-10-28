@@ -7,12 +7,21 @@ model see the answers or the future of what it is scored on) or **poisoning** (t
 injected or corrupted training data). Every check, passed or not, goes into a JSON report.
 
 ```
-[2/4] verify   ✗ FAILED  2.1s  VerificationFailed
-data-verify blocked the pipeline: 1 blocking check(s) failed
-  x split.group_overlap: 12 group value(s) appear in more than one split: train/test (12, e.g. ['C0042', 'C0107'])
+[3/5] verify    ✗ FAILED     0.51s  exit code 1
+┌─ verify: exit code 1 ─ data_verify:verify
+Traceback (most recent call last):
+  ...
+data_verify.step.VerificationFailed: data-verify blocked the pipeline: 2 blocking check(s) failed
+  x split.group_overlap: 971 group value(s) appear in more than one split: train/test (398, e.g. ['P0000', 'P0003']), ...
     fix: Split by group (e.g. GroupShuffleSplit, or a stable hash of the group key) instead of by row.
+  x target.perfect_predictor: 2 feature(s) alone predict the label (AUC >= 0.99): isnull(followup_lab)->readmitted=1.0, discharge_code->readmitted=0.992616
+    fix: A single column that (almost) determines the label is usually computed from the outcome or recorded after it. ...
 report: build/verify/report.json  (details: data-verify explain build/verify/report.json)
+└────────────────────────────────────────────────────────────
+■ halted at 'verify' · 2 cached · 1 failed · 0.52s
 ```
+
+Steps that `depends_on = ["verify"]` never run on data that failed the gate.
 
 ## Add it to a pipeline
 
@@ -40,7 +49,16 @@ depends_on = ["verify"]        # nothing trains on data the gate has not passed
 # ...
 ```
 
-`data-verify template` prints a commented version of this block.
+`data-verify template` prints a commented version of this block. `data-verify lint` checks
+the params of every data-verify step in `./pipeline.toml` without running anything (the
+step itself only sees its params when its turn comes, after the upstream steps ran).
+
+**Declare every role that exists in your data.** The gate can only check what it knows:
+without `group`, rows of one patient in train and test look like different rows (the
+`split.undeclared_group` warning tries to spot such columns); without `time`, a random split
+of time-dependent data looks fine. With the default `features = "auto"` every column without
+a role is treated as a feature, including stray keys: list `features` explicitly when you
+know them.
 
 ## The contract
 
@@ -75,9 +93,11 @@ step fails, so you can always read why it blocked.
 - **A blocking check fails**: the step raises `VerificationFailed` with each failure and its
   fix. data-pipeline marks the step failed, prints that message, and halts (the step is
   critical by default). A check that crashes counts as failed: an unverified check never
-  passes silently.
+  passes silently. The step's log lists only failures and warnings; the report has every
+  check.
 - **The params are invalid** (unknown key, wrong type, missing column for a rule): the step
-  raises `SpecError`, which names the key and suggests the closest valid one.
+  raises `SpecError`, which names the key and suggests the closest valid one. Outputs of a
+  previous run are deleted first, so a stale report never survives a failed run.
 
 `fail_on` sets what blocks: `"error"` (default; failed checks of severity error),
 `"warn"` (warnings too), `"never"` (report only).
@@ -148,9 +168,9 @@ inputs are missing report `skip` with the reason. `data-verify params` prints th
 | key | value | meaning |
 |---|---|---|
 | `time_bounds` | table | split = { min = ..., max = ... } (inclusive). Example: train = { max = "2023-12-31" }, test = { min = "2024-01-01" }. |
-| `time_order` | string \| list | "train < val < test": every row of the left split is before every row of the right one. |
-| `embargo` | duration | Minimum gap for time_order: "7D", "12h", or a number of days (units when time is numeric). |
-| `time_order_scope` | global \| group | group: check time_order per entity (per-series forecasting) instead of globally. |
+| `time_order` | string \| list | "train < val < test": every row of a left split is before every row of a split to its right (every pair of the chain is checked). |
+| `embargo` | duration | Minimum gap between row timestamps for time_order: "7D", "12h", or a number of days (units when time is numeric). Use the label horizon when there is no label_time. |
+| `time_order_scope` | global \| group | group: check time_order per entity (per-series forecasting) instead of globally; split.group_overlap is then skipped, since entities span splits by design. |
 | `split_rule` | table | How splits were assigned. { key, method = sha256\|sha1\|md5\|modulo\|values, template = "{key}", modulo = 100, buckets = { train = [0, 70], ... } } or { key, method = "values", values = { train = [...], ... } }. |
 | `split_ratios` | table | Planned shares, e.g. { train = 0.7, val = 0.1, test = 0.2, tolerance = 0.05, unit = "rows" \| "groups" }. |
 | `schema` | table | { columns = [...], ordered = bool, dtypes = { col = kind }, ranges = { col = [min, max] }, allowed = { col = [...] }, not_null = [...], unique = [...], datasets = [extra inputs to check] }. |
@@ -163,8 +183,8 @@ inputs are missing report `skip` with the reason. `data-verify params` prints th
 
 | key | value | meaning |
 |---|---|---|
-| `assert` | list of tables | `[[steps.params.assert]]` name, and one of: expr (pandas expression true on every row of `dataset`, default every split), sql (DuckDB query returning violating rows), sql_count (DuckDB query returning the number of violations). Optional severity, category, description, hint. `${var}` is replaced from vars. In SQL, every data input and every split is a view under its name. |
-| `vars` | table | Values for `${name}` in assertions (refs allowed). |
+| `assert` | list of tables | [[steps.params.assert]] name, and one of: expr (pandas expression true on every row of `dataset`, default every split), sql (DuckDB query returning violating rows), sql_count (DuckDB query returning the number of violations). Optional severity, category, description, hint. ${var} is replaced from vars. In SQL, every data input and every split is a view under its name. |
+| `vars` | table | Values for ${name} in assertions (refs allowed). |
 | `custom` | list | "module:function" checks, called with the Verifier; call v.add(name, ok, message, severity=...) or return a list of dicts. |
 
 ### Behaviour
@@ -215,11 +235,51 @@ time_order = "train < val < test"
 embargo = "30D"                      # at least the label horizon
 ```
 
-With `time` but no `time_order`/`time_bounds`, `temporal.overlap` warns that evaluation rows
-fall inside the training period.
+- A chain `"a < b < c"` checks every pair (a < b, a < c, b < c).
+- `embargo` is the minimum gap between the last row of the earlier split and the first row
+  of the later one. Without `label_time`, set it to at least the label horizon. With
+  `label_time`, `temporal.label_after_cutoff` checks directly that every earlier-split label
+  was known before the later split starts, and the embargo is optional (it is not added on
+  top of that check).
+- With `time` but no `time_order`/`time_bounds`, `temporal.overlap` warns that evaluation
+  rows fall inside the training period.
+
+**Per-series forecasting** (each store/sensor has its past in train and its future in
+test): declare the entity as `group` and set `time_order_scope = "group"`. Then
+`split.group_overlap` steps aside (entities span splits by design) and `temporal.order`
+checks, entity by entity, that train rows end before test rows start.
+
+```toml
+[steps.params]
+label = "demand_next_7d"
+group = "store_id"
+time = "date"
+time_order = "train < test"
+time_order_scope = "group"
+embargo = "7D"
+```
 
 **One table with a split column:**
 `params = { split_column = "split", table = "snapshots", label = "y" }`.
+
+**Text data:** text columns (average length >= 30 characters) are compared across splits
+after normalising case, punctuation and spacing (`duplicates.text_cross_split`, blocking),
+whatever the other columns say, and their words are searched for backdoor triggers
+(`poisoning.spurious_association`).
+
+**A stricter gate:** some checks only warn because their signal has legitimate look-alikes
+(drift, a backdoor-like token that is a genuine new pattern, id-like columns). When your
+data should never show them, promote them:
+
+```toml
+[steps.params.checks]
+"poisoning.spurious_association" = "error"
+"target.id_like" = "error"
+"target.strong_predictor" = "error"
+"duplicates.near_cross_split" = "error"
+```
+
+or set `fail_on = "warn"` to block on every warning.
 
 **Unlabeled test split:** `checks = { "schema.roles" = { unlabeled = ["test"] } }`.
 
@@ -247,16 +307,16 @@ step's `watch` list so editing it reruns the gate.
 
 ## What it checks
 
-49 built-in checks; `data-verify checks` lists them with their options, and
+51 built-in checks; `data-verify checks` lists them with their options, and
 [docs/CHECKS.md](docs/CHECKS.md) describes each one.
 
 | area | blocks (error) | warns |
 |---|---|---|
-| split | same `id` or `group` in two splits; repeated ids; split not matching `split_rule`; split rows missing from `source` (injected/altered rows) | split shares off `split_ratios` |
-| duplicates | identical feature rows in two splits (beyond what different entities share by chance in train) | near-copies across splits (rounded numbers, normalised text); mass-repeated rows in train; identical rows with conflicting labels |
+| split | same `id` or `group` in two splits; repeated ids; split not matching `split_rule`; split rows missing from `source` (injected/altered rows) | split shares off `split_ratios`; an undeclared entity-like column (`*_id`, `patient`, `device`, ...) shared across splits |
+| duplicates | identical feature rows in two splits (beyond what different entities share by chance in train); the same text (normalised) in two splits | near-copies across splits (rounded numbers, normalised text); mass-repeated rows in train; identical rows with conflicting labels |
 | temporal | rows outside `time_bounds`; splits overlapping in time (or per group); labels known only after the evaluation period starts; rows dated after their own outcome; features observed after the row's time; unparseable dates | time-stamped splits overlapping when no time rule is declared |
-| target | label/key/time columns or `forbidden` patterns used as features; a feature equal to the label; one feature (or its missingness) that alone determines the label | strongly predictive single features; features far more predictive in one split (target encoding fitted with evaluation labels); outcome-like names; id-like features |
-| preprocessing | scaler fitted on train+evaluation data (standardised or min-max over the union only); fitted vocabularies containing levels absent from training data | |
+| target | label/key/time columns or `forbidden` patterns used as features; a feature equal to the label on ≥ 99% of rows; one feature (or its missingness) that alone predicts the label with AUC / normalised accuracy / \|Spearman\| ≥ 0.99 | single features ≥ 0.95; features far more predictive in one split (target encoding fitted with evaluation labels); outcome-like names; id-like features |
+| preprocessing | scaler fitted on train+evaluation data (standardised or min-max over the union only, also tested without repeated rows and on rows found in `source`, so later injections do not hide it); fitted vocabularies containing levels absent from training data | |
 | labels | missing / out-of-domain labels, single-class train; evaluation classes absent from train | classes missing from a split; label distribution shift |
 | weights | negative / infinite / all-zero weights | a few rows holding most of the weight |
 | poisoning | pinned input changed (`pins`) | excess of extreme values in train vs held-out data; backdoor-like value or text token tied to one class in train only |
@@ -265,7 +325,9 @@ step's `watch` list so editing it reruns the gate.
 
 ### When the gate blocks
 
-1. Read the message and `hint`, or run `data-verify explain <report>`.
+1. Read the message and `hint`, or run `data-verify explain <report>`. Several problems can
+   hide each other (rows injected after scaling blur the scaling signature, for instance),
+   so rerun after each fix.
 2. Fix the data step (split by group, cut by time, fit transforms on train only, drop the
    column) and rerun. That is the expected outcome almost every time.
 3. Only if the finding is a property of the domain, tune the narrowest knob and say why in a
@@ -292,6 +354,7 @@ The gate's own params, inputs and `watch` files invalidate it as usual.
 ```
 data-verify run pipeline.toml [--step NAME]   run a data-verify step without the orchestrator
 data-verify run verify.toml                   standalone config: [inputs] [outputs] [params]
+data-verify lint [pipeline.toml] [--step N]   validate params without running anything
 data-verify explain REPORT.json [--all]       failed checks, details and fixes
 data-verify checks [--json | --markdown]      every check, severity and options
 data-verify params [--markdown]               every params key

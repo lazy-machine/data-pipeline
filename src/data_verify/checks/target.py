@@ -55,10 +55,11 @@ def suspicious_names(v, opt):
 
 
 @check("target.label_copy", "target", "error", "No feature is a copy of the label",
-       min_agreement=0.999)
+       min_agreement=0.99)
 def label_copy(v, opt):
-    """A feature equal to the label on at least `min_agreement` of the training rows, or (for
-    numbers) an exact linear transform of it (|r| > 0.99999)."""
+    """A feature equal to the label on at least `min_agreement` (default 99%) of the training
+    rows, or (for numbers) an exact linear transform of it (|r| > 0.99999). Leaky columns
+    are often noisy copies (a code entered after the outcome that matches it almost always)."""
     if not v.labels:
         return skipped("no params.label")
     d = v.sample(v.train_name)
@@ -131,26 +132,33 @@ def _predictor(v, opt, strength: str):
                       "missingness gives the label away. If the relationship is real and known "
                       "at prediction time, raise the threshold for this check.",
                       features=hits, top=top, threshold=opt["threshold"])
-    return passed("strongest single feature: " + ", ".join(
-        f"{lbl}: {next(iter(t.items()), ('-', '-'))[0]}={next(iter(t.values()), '-')}"
-        for lbl, t in top.items()), top=top)
+    def best(lbl, t):
+        if not t:
+            return f"{lbl}: no measurable feature"
+        k, x = next(iter(t.items()))
+        return f"{lbl}: {k} {metric[v.task(lbl)]} {x}"
+    return passed(f"no feature reaches {opt['threshold']}; strongest: "
+                  + "; ".join(best(lbl, t) for lbl, t in top.items()), top=top)
 
 
 @check("target.perfect_predictor", "target", "error",
-       "No single feature (or its missingness) determines the label", threshold=0.999)
+       "No single feature (or its missingness) determines the label", threshold=0.99)
 def perfect_predictor(v, opt):
     """Scores each feature, and the missingness of each partly-null feature, as a standalone
     predictor of each label on the training split (AUC for binary, normalised accuracy for
     multiclass, |Spearman| for regression; cross-fitted, so ids score near chance). A score
-    at or above `threshold` (default 0.999) means the label can be read off one column."""
+    at or above `threshold` (default 0.99) means the label can be read off one column: real
+    signals almost never do that alone, leaks (codes entered after the outcome, fields filled
+    only for one class) routinely do."""
     return _predictor(v, opt, "perfect")
 
 
 @check("target.strong_predictor", "target", "warn",
-       "No single feature is suspiciously predictive", threshold=0.98)
+       "No single feature is suspiciously predictive", threshold=0.95)
 def strong_predictor(v, opt):
-    """Same scores as target.perfect_predictor with a lower bar (default 0.98). Real signals
-    rarely reach this alone; look at how the flagged columns are computed."""
+    """Same scores as target.perfect_predictor with a lower bar (default 0.95). Real signals
+    rarely reach this alone; look at how the flagged columns are computed. Set its severity
+    to "error" for a stricter gate."""
     return _predictor(v, opt, "strong")
 
 
@@ -279,13 +287,26 @@ def global_scaling(v, opt):
     """Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over
     train plus evaluation rows together while the training rows alone are not: the scaler was
     fitted on data the model is later scored on. Every union of splits that contains train is
-    tried, so 'fitted on train+val' is caught too."""
+    tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the
+    signature, so it is also tested without repeated rows and, when params.source is set,
+    on the rows found in the source only."""
     if len(v.splits) < 2:
         return skipped("one split only")
     names = list(v.splits)
     hits = {}
-    for f in v.numeric_features():
-        m = {n: _moments(numeric_values(v.splits[n][f])) for n in names}
+    feats = v.numeric_features()
+    # row subsets to test: all rows; without repeats; without repeats and rows absent from
+    # params.source. Rows injected after scaling would otherwise hide the signature.
+    unique = {n: ~pd.Series(v.hashes(n, tuple(v.features))).duplicated().to_numpy()
+              for n in names}
+    variants = [None, unique]
+    if all(v.in_source(n) is not None for n in names):
+        variants.append({n: unique[n] & v.in_source(n) for n in names})
+    for f, keep in ((f, k) for f in feats for k in variants):
+        if f in hits:
+            continue
+        m = {n: _moments(numeric_values(v.splits[n][f]) if keep is None else
+                         numeric_values(v.splits[n][f])[keep[n]]) for n in names}
         tr = m[v.train_name]
         if tr[0] < 3:
             continue
@@ -312,7 +333,8 @@ def global_scaling(v, opt):
                       + ", ".join(f"{k} ({x})" for k, x in list(hits.items())[:6]),
                       "Fit the scaler on the training split only (fit on train, transform the "
                       "others), e.g. inside a sklearn Pipeline after the split.", features=hits)
-    return passed(f"{len(v.numeric_features())} numeric features show no cross-split scaling")
+    return passed(f"no feature is standardised or min-max scaled over evaluation rows "
+                  f"({len(v.numeric_features())} numeric features tested)")
 
 
 @check("preprocessing.fitted_levels", "preprocessing", "error",

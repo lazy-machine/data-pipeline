@@ -189,7 +189,8 @@ def parse_duration(value: Any, where: str) -> pd.Timedelta | float:
 
 
 def parse_time_order(value: Any) -> list[tuple[str, str]]:
-    """'train < val < test' or ['train < test', 'val < test'] or [['train','test']]."""
+    """'train < val < test' (every pair of the chain) or ['train < test', 'val < test'] or
+    [['train','test']]."""
     if value is None:
         return []
     items = [value] if isinstance(value, str) else value
@@ -200,12 +201,13 @@ def parse_time_order(value: Any) -> list[tuple[str, str]]:
             chain = [p.strip() for p in item.split("<")]
             _expect(len(chain) >= 2 and all(chain),
                     f"time_order entry {item!r} must look like 'train < val < test'")
-            pairs += list(zip(chain, chain[1:], strict=False))
+            pairs += [(chain[i], chain[j]) for i in range(len(chain))
+                      for j in range(i + 1, len(chain))]
         elif isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item):
             pairs.append((item[0], item[1]))
         else:
             raise SpecError(f"time_order entry {item!r} must be 'a < b' or ['a', 'b']")
-    return pairs
+    return list(dict.fromkeys(pairs))
 
 
 @dataclass
@@ -279,6 +281,51 @@ def is_data_input(path: Path) -> bool:
     return path.is_dir() or path.suffix.lower() in TABULAR_SUFFIXES
 
 
+def normalize_checks(checks: Any, known_checks) -> dict[str, dict[str, Any]]:
+    """Validate params.checks: ids (globs allowed for severity), severities, options."""
+    _expect(isinstance(checks, dict), "checks must be a table: \"<check id>\" = options")
+    for cid, opt in checks.items():
+        if isinstance(opt, str):
+            opt = {"severity": opt}
+        _expect(isinstance(opt, dict), f"checks.\"{cid}\" must be a severity string or a table")
+        matched = [k for k in known_checks if fnmatch.fnmatchcase(k, cid)]
+        _expect(bool(matched), f"checks: no check matches '{cid}'" + suggest(cid, known_checks)
+                + ". See `data-verify checks`.")
+        if "severity" in opt:
+            _expect(opt["severity"] in SEVERITIES,
+                    f"checks.\"{cid}\".severity must be one of {SEVERITIES}")
+        extra = set(opt) - {"severity"}
+        if extra:
+            _expect(len(matched) == 1 and cid == matched[0],
+                    f"checks.\"{cid}\": options other than severity need an exact check id")
+            known_opts = known_checks[cid].options
+            bad = extra - set(known_opts)
+            _expect(not bad, f"checks.\"{cid}\": unknown option(s) " + ", ".join(
+                f"'{k}'{suggest(k, known_opts)}" for k in sorted(bad))
+                + f"; options: {sorted(known_opts) or 'none'}")
+        checks[cid] = opt
+    return checks
+
+
+def check_structure(raw: dict[str, Any], known_checks) -> None:
+    """The checks that need no data and no config files: keys, check ids and options,
+    assertion fields. `data-verify lint` runs only this when inputs are not built yet."""
+    unknown = sorted(set(raw) - TOP_KEYS)
+    _expect(not unknown, "unknown params key(s): " + ", ".join(
+        f"'{k}'{suggest(k, TOP_KEYS)}" for k in unknown)
+        + ". See `data-verify params` for every key.")
+    if isinstance(raw.get("checks"), dict):
+        normalize_checks(dict(raw["checks"]), known_checks)
+    asserts = raw.get("assert", [])
+    for i, a in enumerate([asserts] if isinstance(asserts, dict) else asserts or []):
+        if isinstance(a, dict):
+            allowed = {"name", "dataset", "expr", "sql", "sql_count", "severity", "category",
+                       "description", "hint"}
+            bad = set(a) - allowed
+            _expect(not bad, f"assert[{i}]: unknown key(s) " + ", ".join(
+                f"'{k}'{suggest(k, allowed)}" for k in sorted(bad)))
+
+
 def parse(params: dict[str, Any], inputs: dict[str, Path], known_checks) -> Spec:
     """Validate `params` (merged over an optional `spec` input) into a Spec."""
     refs = Refs(inputs)
@@ -293,10 +340,7 @@ def parse(params: dict[str, Any], inputs: dict[str, Path], known_checks) -> Spec
         else:
             raw[k] = v
 
-    unknown = sorted(set(raw) - TOP_KEYS)
-    _expect(not unknown, "unknown params key(s): " + ", ".join(
-        f"'{k}'{suggest(k, TOP_KEYS)}" for k in unknown)
-        + ". See `data-verify params` for every key.")
+    check_structure(raw, known_checks)
     p = refs.resolve(raw, "params")
     s = Spec()
 
@@ -495,29 +539,7 @@ def parse(params: dict[str, Any], inputs: dict[str, Path], known_checks) -> Spec
                 f"custom entry {c!r} must look like 'module:function'")
 
     # -- behaviour -------------------------------------------------------------------------
-    checks = p.get("checks", {})
-    _expect(isinstance(checks, dict), "checks must be a table: \"<check id>\" = options")
-    for cid, opt in checks.items():
-        if isinstance(opt, str):
-            opt = {"severity": opt}
-        _expect(isinstance(opt, dict), f"checks.\"{cid}\" must be a severity string or a table")
-        matched = [k for k in known_checks if fnmatch.fnmatchcase(k, cid)]
-        _expect(bool(matched), f"checks: no check matches '{cid}'" + suggest(cid, known_checks)
-                + ". See `data-verify checks`.")
-        if "severity" in opt:
-            _expect(opt["severity"] in SEVERITIES,
-                    f"checks.\"{cid}\".severity must be one of {SEVERITIES}")
-        extra = set(opt) - {"severity"}
-        if extra:
-            _expect(len(matched) == 1 and cid == matched[0],
-                    f"checks.\"{cid}\": options other than severity need an exact check id")
-            known_opts = known_checks[cid].options
-            bad = extra - set(known_opts)
-            _expect(not bad, f"checks.\"{cid}\": unknown option(s) " + ", ".join(
-                f"'{k}'{suggest(k, known_opts)}" for k in sorted(bad))
-                + f"; options: {sorted(known_opts) or 'none'}")
-        checks[cid] = opt
-    s.checks = checks
+    s.checks = normalize_checks(p.get("checks", {}), known_checks)
     s.fail_on = p.get("fail_on", "error")
     _expect(s.fail_on in ("error", "warn", "never"), "fail_on must be 'error', 'warn' or 'never'")
     s.sample_rows = int(p.get("sample_rows", s.sample_rows))

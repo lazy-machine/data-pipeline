@@ -20,6 +20,7 @@ data-verify: leakage and poisoning gate for data-pipeline projects
 
   data-verify run pipeline.toml [--step NAME]   run a data-verify step of a pipeline file
   data-verify run verify.toml                   run a standalone config (inputs/outputs/params)
+  data-verify lint [pipeline.toml] [--step N]   validate params before anything runs
   data-verify explain REPORT.json [--all]       show what failed and how to fix it
   data-verify checks [--json | --markdown]      every check, its severity and options
   data-verify params [--markdown]               every params key
@@ -29,7 +30,7 @@ exit codes: 0 passed, 1 blocked, 2 bad config
 """
 
 
-def _load_target(path: Path, step_name: str | None):
+def _load_target(path: Path, step_name: str | None, need_inputs: bool = True):
     data = tomllib.loads(path.read_text())
     base = path.parent
     if "steps" in data:
@@ -57,7 +58,7 @@ def _load_target(path: Path, step_name: str | None):
     inputs = {k: (workdir / p).resolve() for k, p in step.get("inputs", {}).items()}
     outputs = {k: (workdir / p).resolve() for k, p in step.get("outputs", {}).items()}
     missing = [f"{k}: {p}" for k, p in inputs.items() if not p.exists()]
-    if missing:
+    if missing and need_inputs:
         raise SpecError("input(s) not found: " + "; ".join(missing))
     return step.get("params", {}), inputs, outputs, workdir, py_path
 
@@ -80,6 +81,21 @@ def cmd_run(args) -> int:
         rp = outputs.get("report")
         print(failure_message(report, str(rp) if rp else None), file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_lint(args) -> int:
+    from .core import REGISTRY
+    from .spec import check_structure, parse
+    params, inputs, _, _, _ = _load_target(Path(args.config), args.step, need_inputs=False)
+    missing = sorted(k for k, p in inputs.items() if not p.exists())
+    if missing:
+        check_structure(params, REGISTRY)
+        print(f"params OK (structure only: input(s) {missing} not built yet, so references "
+              "and column names are checked when the step runs)")
+    else:
+        parse(params, inputs, REGISTRY)
+        print("params OK (fully resolved against the inputs)")
     return 0
 
 
@@ -124,6 +140,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("config")
     r.add_argument("--step")
     r.add_argument("--all", action="store_true", help="also list passed and skipped checks")
+    li = sub.add_parser("lint")
+    li.add_argument("config", nargs="?", default="pipeline.toml")
+    li.add_argument("--step")
     e = sub.add_parser("explain")
     e.add_argument("report")
     e.add_argument("--all", action="store_true")
@@ -139,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_run(args)
         if args.cmd == "explain":
             return cmd_explain(args)
+        if args.cmd == "lint":
+            return cmd_lint(args)
         if args.cmd == "checks":
             print(json.dumps(checks_json(), indent=2) if args.json else
                   checks_markdown() if args.markdown else checks_text())

@@ -302,16 +302,21 @@ def verify(ctx) -> dict[str, Any]:
     if unknown:
         raise SpecError(f"unknown output(s) {unknown}: data-verify writes 'report' (JSON) and "
                         "'summary' (Markdown)")
+    for p in outputs.values():  # a failed run must not leave the previous verdict behind
+        p.unlink(missing_ok=True)
     log = getattr(ctx, "log", print)
     inputs = {k: Path(p) for k, p in ctx.inputs.items()}
     report = run(dict(ctx.params), inputs, log, getattr(ctx, "workdir", None))
     write_outputs(report, outputs)
-    for line in console_lines(report):
-        log(line)
+    for line in console_lines(report):   # failures and warnings; the report has the rest
+        if line.startswith(("BLOCK", "WARN")):
+            log(line)
+    c = report["counts"]
+    log(f"{c['pass']} passed, {len(report['blocking'])} blocking, {len(report['warnings'])} "
+        f"warning(s), {c['skip']} skipped, {c['off']} off")
     if not report["passed"]:
         where = _rel(outputs["report"], getattr(ctx, "workdir", None)) if "report" in outputs \
             else None
         raise VerificationFailed(failure_message(report, where))
-    c = report["counts"]
     return {"checks": c["pass"] + c["fail"] + c["error"], "passed": c["pass"],
             "warnings": len(report["warnings"]), "skipped": c["skip"]}

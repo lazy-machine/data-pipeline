@@ -135,6 +135,21 @@ def test_cli_standalone_config_and_errors(tmp_path, capsys):
     assert "did you mean 'group'" in capsys.readouterr().err
 
 
+def test_lint_and_stale_report(tmp_path, capsys):
+    root = make_project(tmp_path / "lint", leak=False)
+    assert main(["lint", str(root / "pipeline.toml")]) == 0
+    assert "structure only" in capsys.readouterr().out
+    assert run_pipeline(root).returncode == 0
+    assert main(["lint", str(root / "pipeline.toml")]) == 0
+    assert "fully resolved" in capsys.readouterr().out
+    toml = root / "pipeline.toml"
+    toml.write_text(toml.read_text().replace('label = "y"', 'lable = "y"'))
+    assert main(["lint", str(toml)]) == 2
+    assert "did you mean" in capsys.readouterr().err
+    assert run_pipeline(root).returncode == 1
+    assert not (root / "build/verify/report.json").exists()   # no stale verdict
+
+
 def test_unknown_output_key(tmp_path):
     from types import SimpleNamespace
 

@@ -47,12 +47,14 @@ PARAMS: list[tuple[str, list[tuple[str, str, str]]]] = [
          "split = { min = ..., max = ... } (inclusive). Example: train = { max = "
          "\"2023-12-31\" }, test = { min = \"2024-01-01\" }."),
         ("time_order", "string | list",
-         "\"train < val < test\": every row of the left split is before every row of the "
-         "right one."),
-        ("embargo", "duration", "Minimum gap for time_order: \"7D\", \"12h\", or a number of "
-                                "days (units when time is numeric)."),
+         "\"train < val < test\": every row of a left split is before every row of a "
+         "split to its right (every pair of the chain is checked)."),
+        ("embargo", "duration", "Minimum gap between row timestamps for time_order: \"7D\", "
+                                "\"12h\", or a number of days (units when time is numeric). "
+                                "Use the label horizon when there is no label_time."),
         ("time_order_scope", "global | group",
-         "group: check time_order per entity (per-series forecasting) instead of globally."),
+         "group: check time_order per entity (per-series forecasting) instead of globally; "
+         "split.group_overlap is then skipped, since entities span splits by design."),
         ("split_rule", "table",
          "How splits were assigned. { key, method = sha256|sha1|md5|modulo|values, "
          "template = \"{key}\", modulo = 100, buckets = { train = [0, 70], ... } } or "
@@ -123,11 +125,15 @@ def params_text() -> str:
     return "\n".join(out)
 
 
+def _cell(text: str) -> str:
+    return text.replace("|", "\\|")
+
+
 def params_markdown() -> str:
     out = []
     for group, items in PARAMS:
         out += [f"### {group}", "", "| key | value | meaning |", "|---|---|---|"]
-        out += [f"| `{k}` | {v} | {d} |" for k, v, d in items]
+        out += [f"| `{k}` | {_cell(v)} | {_cell(d)} |" for k, v, d in items]
         out.append("")
     return "\n".join(out)
 
@@ -185,4 +191,8 @@ label = "target"               # the column to predict
 # forbidden = ["*_after_*"]    # columns that must never be features
 # [steps.params.checks]
 # "drift.*" = "off"            # turn checks off or tune them; see `data-verify checks`
+
+# One table holding every split instead of one file per split:
+#   inputs = { data = "build/dataset.parquet" }
+#   params: split_column = "split", splits = ["train", "val", "test"]
 '''
