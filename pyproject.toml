@@ -8,6 +8,10 @@ dependencies = [
     "packaging>=26.3",
 ]
 
+[project.optional-dependencies]
+# The data gate (packages/data-verify): `uv add --editable "../data-pipeline[verify]"`.
+verify = ["data-verify"]
+
 [project.scripts]
 data-pipeline = "data_pipeline.cli:main"
 
@@ -18,8 +22,11 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.6",
+    "duckdb>=1.1",       # data-verify's SQL assertions are tested too
 ]
 examples = [
+    "data-verify",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "pandas>=3.0.6",
@@ -30,5 +37,11 @@ examples = [
 # Keep dependencies isolated in a dedicated virtual environment.
 default-groups = ["dev", "examples"]
 
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+data-verify = { workspace = true }
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/data-verify/tests"]

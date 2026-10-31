@@ -1,0 +1,46 @@
+[project]
+name = "data-verify"
+version = "0.1.0"
+description = "Leakage and poisoning gate for data-pipeline projects: verifies processed data and train/val/test splits before training"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pyarrow>=15",
+]
+
+[project.optional-dependencies]
+# SQL assertions (`sql` / `sql_count` in params.assert) run on DuckDB.
+sql = ["duckdb>=1.1"]
+
+[project.scripts]
+data-verify = "data_verify.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "duckdb>=1.1",
+    "data-pipeline",
+]
+
+[tool.uv.sources]
+data-pipeline = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

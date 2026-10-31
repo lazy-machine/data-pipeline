@@ -1,0 +1,188 @@
+# The hard-drive-analysis-v3 pre-training gate expressed as a data-verify config.
+#
+#   uv run data-verify run examples/hard-drive-analysis/verify.toml
+#
+# It reads that project's build artifacts (read-only) and reproduces every check of its own
+# steps/verify.py: generic checks cover the split, time, schema and leakage rules, and SQL
+# assertions cover the project-specific label, censoring and sampling-weight rules.
+#
+# Inside that project's pipeline.toml, the same content goes in a step:
+#
+#   [[steps]]
+#   name = "verify"
+#   function = "data_verify:verify"
+#   inputs = { snapshots = "build/snapshots.parquet", cohort = "build/cohort.parquet",
+#              schema = "build/feature-schema.json", study = "config/study.toml",
+#              sample = "config/sample.toml" }
+#   outputs = { report = "build/verify-report.json", summary = "build/verify-report.md" }
+#   requires = ["data-verify", "duckdb"]
+#   [steps.params]   <- everything under [params] below
+
+# hdd_checks.py (custom checks) lives next to this file
+python_path = ["."]
+
+[inputs]
+snapshots = "../../../../../hard-drive-analysis-v3/build/snapshots.parquet"
+cohort = "../../../../../hard-drive-analysis-v3/build/cohort.parquet"
+schema = "../../../../../hard-drive-analysis-v3/build/feature-schema.json"
+study = "../../../../../hard-drive-analysis-v3/config/study.toml"
+sample = "../../../../../hard-drive-analysis-v3/config/sample.toml"
+
+[outputs]
+report = "build/verify-report.json"
+summary = "build/verify-report.md"
+
+[params]
+# one table, split column
+table = "snapshots"
+split_column = "split"
+splits = ["train", "val", "test"]
+
+# roles
+label = ["event", "duration_days"]
+task = { event = "binary", duration_days = "regression" }
+group = "serial_number"
+time = "date"
+weight = "weight"
+features = { from = "schema", key = "features" }
+# columns that describe the outcome or the observation window must never be features
+forbidden = ["failure*", "*_date", "censor*", "date_days", "stratum", "drive_weight",
+             "n_post_failure_days"]
+
+# time: train/val end at train_end, test starts at test_start
+time_bounds.train = { max = { from = "study", key = "split.train_end" } }
+time_bounds.val = { max = { from = "study", key = "split.train_end" } }
+time_bounds.test = { min = { from = "study", key = "split.test_start" } }
+time_order = ["train < test", "val < test"]
+
+# drives go to splits by a stable sha256 bucket of the serial number
+split_rule = { key = "serial_number", method = "sha256", template = "split:{key}", modulo = 100, buckets = { train = { from = "study", key = "split.train_buckets" }, val = { from = "study", key = "split.val_buckets" }, test = { from = "study", key = "split.test_buckets" } } }
+
+# drive-model categories are the 30 most common models among train drives (+ "other")
+fitted_levels = [{ name = "model_code", levels = { from = "schema", key = "categorical.model_code" }, dataset = "cohort", column = "model", where = "split == 'train'", allow = ["other"], top_k = true }]
+
+# Python checks: module:function, found on python_path
+custom = ["hdd_checks:stride_rows_on_stride_days"]
+
+[params.schema]
+columns = ["serial_number", "date", "split", "duration_days", "event", "weight", { from = "schema", key = "features" }]
+ordered = true
+dtypes = { date = "datetime", event = "int", duration_days = "int" }
+not_null = ["serial_number", "date", "split", "duration_days", "event", "weight"]
+unique = [["serial_number", "date"]]
+allowed = { event = [0, 1] }
+ranges = { duration_days = [0, inf], weight = [0, inf] }
+
+[params.vars]
+train_end = { from = "study", key = "split.train_end" }
+horizon = { from = "study", key = "label.binary_horizon" }
+min_failing = { from = "study", key = "evaluation.min_failing_drives" }
+failing_fraction = { from = "sample", key = "scales.{scale}.failing_fraction" }
+healthy_fraction = { from = "sample", key = "scales.{scale}.healthy_fraction" }
+stride = { from = "sample", key = "scales.{scale}.stride_days" }
+dense = { from = "sample", key = "scales.{scale}.dense_days" }
+
+[params.checks]
+# temporal split on purpose: drift and label shift between periods are expected
+"drift.features" = "off"
+"labels.shift" = "off"
+# a drive's weight is 1/sampling fraction * stride; a 10x spread is by design
+"weights.concentration" = { max_ratio = 10000.0 }
+
+# -- project rules: labels, censoring and weights, recomputed from the cohort -------------
+
+[[params.assert]]
+name = "cohort_serials_unique"
+sql = "SELECT serial_number, count(*) AS n FROM cohort GROUP BY serial_number HAVING n > 1"
+
+[[params.assert]]
+name = "snapshot_split_matches_cohort"
+category = "split"
+sql = """SELECT s.serial_number, s.split, c.split AS cohort_split FROM snapshots s
+         LEFT JOIN cohort c USING (serial_number)
+         WHERE c.split IS NULL OR c.split <> s.split"""
+
+[[params.assert]]
+name = "cohort_weights_match_sampling"
+category = "weights"
+sql = """SELECT serial_number, stratum, drive_weight FROM cohort
+         WHERE abs(drive_weight - CASE stratum WHEN 'failing' THEN 1 / ${failing_fraction}
+                                               ELSE 1 / ${healthy_fraction} END) > 1e-9"""
+
+[[params.assert]]
+name = "one_model_per_drive"
+severity = "warn"
+sql = "SELECT serial_number FROM cohort WHERE n_models_per_month > 1"
+
+[[params.assert]]
+name = "no_snapshot_after_failure"
+category = "temporal"
+description = "A snapshot after the drive failed would describe the failure itself"
+sql = """SELECT s.serial_number, s.date, c.failure_date FROM snapshots s JOIN cohort c USING (serial_number)
+         WHERE c.failure_date IS NOT NULL AND s.date > c.failure_date"""
+
+[[params.assert]]
+name = "labels_match_cohort"
+category = "labels"
+description = "event and duration_days recomputed from the cohort, censored at train_end for train/val"
+sql = """WITH e AS (
+           SELECT s.serial_number, s.date, s.split, s.event, s.duration_days, c.failure_date,
+                  CASE WHEN s.split = 'test' THEN c.last_date
+                       ELSE least(c.last_date, DATE '${train_end}') END AS censor
+           FROM snapshots s JOIN cohort c USING (serial_number)),
+         f AS (SELECT *, (failure_date IS NOT NULL AND failure_date <= censor)::INT AS ev FROM e)
+         SELECT * FROM f
+         WHERE event <> ev
+            OR (event = 1 AND duration_days <> date_diff('day', date, failure_date))
+            OR (event = 0 AND duration_days <> date_diff('day', date, censor))"""
+
+[[params.assert]]
+name = "train_labels_do_not_see_test_period"
+category = "temporal"
+description = "A train/val failure after train_end must be censored, not labelled"
+sql = """SELECT s.serial_number, s.date, c.failure_date FROM snapshots s JOIN cohort c USING (serial_number)
+         WHERE s.split IN ('train', 'val') AND s.event = 1 AND c.failure_date > DATE '${train_end}'"""
+
+[[params.assert]]
+name = "no_visible_failure_labelled_censored"
+category = "labels"
+sql = """SELECT s.serial_number, s.date FROM snapshots s JOIN cohort c USING (serial_number)
+         WHERE s.event = 0 AND c.failure_date IS NOT NULL
+           AND date_diff('day', s.date, c.failure_date) < ${horizon}
+           AND (s.split = 'test' OR c.failure_date <= DATE '${train_end}')"""
+
+[[params.assert]]
+name = "snapshot_weights_valid"
+category = "weights"
+description = "Each snapshot weighs drive_weight (dense days) or drive_weight * stride"
+sql = """SELECT s.serial_number, s.date, s.weight, c.drive_weight FROM snapshots s JOIN cohort c USING (serial_number)
+         WHERE NOT (abs(s.weight - c.drive_weight) < 1e-6 OR abs(s.weight - c.drive_weight * ${stride}) < 1e-6)"""
+
+[[params.assert]]
+name = "dense_rows_before_visible_failure"
+category = "weights"
+description = "Rows at full weight (every day kept) only in the dense window before a visible failure"
+sql = """SELECT s.serial_number, s.date FROM snapshots s JOIN cohort c USING (serial_number)
+         WHERE ${stride} > 1 AND abs(s.weight - c.drive_weight) < 1e-6
+           AND NOT coalesce(c.failure_date IS NOT NULL
+               AND date_diff('day', s.date, c.failure_date) < ${dense}
+               AND c.failure_date <= CASE WHEN s.split = 'test' THEN c.last_date
+                   ELSE least(c.last_date, DATE '${train_end}') END, false)"""
+
+[[params.assert]]
+name = "failures_present_in_every_split"
+category = "labels"
+sql = """SELECT x.split FROM (VALUES ('train'), ('val'), ('test')) x(split)
+         LEFT JOIN (SELECT split, count(DISTINCT serial_number) AS n FROM snapshots
+                    WHERE event = 1 GROUP BY split) f USING (split)
+         WHERE coalesce(f.n, 0) = 0"""
+
+[[params.assert]]
+name = "enough_failures_per_split"
+category = "labels"
+severity = "warn"
+description = "Fewer failing drives than evaluation.min_failing_drives makes metrics noisy"
+sql = """SELECT x.split, coalesce(f.n, 0) AS failing_drives FROM (VALUES ('train'), ('val'), ('test')) x(split)
+         LEFT JOIN (SELECT split, count(DISTINCT serial_number) AS n FROM snapshots
+                    WHERE event = 1 GROUP BY split) f USING (split)
+         WHERE coalesce(f.n, 0) < ${min_failing}"""
