@@ -88,12 +88,21 @@ def path_size(path: Path) -> int:
 
 
 def read_table(path: Path, allow_pickle: bool = False) -> pd.DataFrame:
+    try:
+        return _read_table(path, allow_pickle)
+    except SpecError:
+        raise
+    except Exception as e:  # noqa: BLE001  an unreadable input is a problem with the input
+        raise SpecError(f"cannot read input {path.name}: {type(e).__name__}: {e}") from None
+
+
+def _read_table(path: Path, allow_pickle: bool) -> pd.DataFrame:
     if path.is_dir():
         files = sorted(p for p in path.rglob("*")
                        if p.is_file() and not p.name.startswith((".", "_")))
         if files and all(p.suffix.lower() in (".parquet", ".pq") for p in files):
             return pd.read_parquet(path)
-        frames = [read_table(p, allow_pickle) for p in files if is_data_input(p)]
+        frames = [_read_table(p, allow_pickle) for p in files if is_data_input(p)]
         if not frames:
             raise SpecError(f"{path}: directory holds no readable data files")
         return pd.concat(frames, ignore_index=True)
@@ -160,9 +169,50 @@ def is_numeric_kind(k: str) -> bool:
     return k in ("int", "float")
 
 
+def _num_text(f: float) -> str:
+    return str(int(f)) if f.is_integer() and abs(f) < 2**53 else str(f)
+
+
+def value_texts(s: pd.Series) -> pd.Series:
+    """A column as strings, with whole floats written as integers ("1.0" -> "1"), so a float
+    column (any numeric CSV column with a NaN) compares equal to declared values."""
+    if kind(s) != "float":
+        return s.astype("string")
+    f = s.astype("float64")
+    out = f.astype("string")
+    whole = np.isfinite(f) & (f % 1 == 0) & (f.abs() < 2**53)
+    out[whole] = f[whole].astype("int64").astype("string")
+    return out
+
+
+def value_text(x: Any, numeric: bool = False) -> str:
+    """A declared value (params) as the string `value_texts` gives the same value in data.
+    With numeric = True a numeric-looking string ("1") matches the number too."""
+    if numeric and isinstance(x, str):
+        try:
+            x = float(x)
+        except ValueError:
+            return x
+    if isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, (bool, np.bool_)):
+        return _num_text(float(x))
+    return str(x)
+
+
+def value_set(values, s: pd.Series) -> set[str]:
+    """Declared values as `value_texts` strings for comparing against column `s`."""
+    numeric = is_numeric_kind(kind(s))
+    return {value_text(x, numeric) for x in values}
+
+
 def to_datetime(s: pd.Series) -> pd.Series:
-    out = pd.to_datetime(s, errors="coerce", format="mixed") if not \
-        pdt.is_datetime64_any_dtype(s.dtype) else s
+    """Datetimes as naive UTC; offsets that differ (a CSV round trip across DST) are fine."""
+    if pdt.is_datetime64_any_dtype(s.dtype):
+        out = s
+    else:
+        try:
+            out = pd.to_datetime(s, errors="coerce", format="mixed")
+        except ValueError:  # mixed offsets, or naive and tz-aware values together
+            out = pd.to_datetime(s, errors="coerce", format="mixed", utc=True)
     if getattr(out.dt, "tz", None) is not None:
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
     return out.astype("datetime64[ns]")
@@ -313,8 +363,14 @@ class Verifier:
                                 f"'{s.table}' (columns: {list(table.columns)[:20]})")
             col = table[s.split_column].astype("string")
             values = list(col.dropna().unique().tolist())
-            names = s.split_names or sorted(
-                values, key=lambda v: (SPLIT_RANKS.get(v.lower(), 1), v))
+            names = s.split_names
+            if not names:  # only recognised split names; a typo must not become a split
+                names = sorted((x for x in values if x.lower() in SPLIT_RANKS),
+                               key=lambda x: (SPLIT_RANKS[x.lower()], x))
+                if not names:
+                    raise SpecError(f"split column '{s.split_column}' holds no standard split "
+                                    f"name (values: {sorted(values)[:10]}); list the split "
+                                    "values in params.splits")
             self.unknown_split_values = sorted(set(values) - set(names))
             self.null_split_rows = int(col.isna().sum())
             for n in names:
@@ -432,10 +488,18 @@ class Verifier:
                 else to_datetime(s)
         return self._cache[key]
 
-    def time_value(self, value: Any, numeric: bool):
-        if numeric:
-            return float(value)
-        return pd.Timestamp(str(value)) if not isinstance(value, pd.Timestamp) else value
+    def time_value(self, value: Any, numeric: bool, where: str = "time_bounds"):
+        try:
+            if numeric:
+                return float(value)
+            ts = value if isinstance(value, pd.Timestamp) else pd.Timestamp(str(value))
+            # time columns are naive UTC (see to_datetime); a bound with an offset becomes so too
+            return ts.tz_convert("UTC").tz_localize(None) if ts.tz is not None else ts
+        except (ValueError, TypeError):
+            want = "a number" if numeric else "a date or time like '2023-05-30'"
+            raise SpecError(f"{where} = {value!r}: time column '{self.spec.time}' is "
+                            f"{'numeric' if numeric else 'a datetime'}, so this must be "
+                            f"{want}") from None
 
     def time_is_numeric(self) -> bool:
         return self.kind(self.spec.time) in ("int", "float")

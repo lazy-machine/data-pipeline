@@ -182,7 +182,7 @@ The tables below are the output of `data-verify params --markdown`.
 
 | key | value | meaning |
 |---|---|---|
-| `splits` | list \| table | Split inputs in time/workflow order. Default: inputs named train/val/valid/validation/dev/calib/test/holdout/eval/oot, in that order. A table maps split name -> input name. With split_column: the split values to expect. |
+| `splits` | list \| table | Split inputs in time/workflow order. Default: inputs named train/val/valid/validation/dev/calib/test/holdout/eval/oot, in that order. A table maps split name -> input name. With split_column: the split values to expect (default: the standard names above; any other value in the column fails schema.splits_present). |
 | `split_column` | column | One table holds every split; this column says which split each row is in. |
 | `table` | input | With split_column: the input holding the table (needed if there are several data inputs). |
 | `train` | split | The split the model is fitted on. Default: the first train-like split. |
@@ -208,7 +208,7 @@ The tables below are the output of `data-verify params --markdown`.
 
 | key | value | meaning |
 |---|---|---|
-| `time_bounds` | table | split = { min = ..., max = ... } (inclusive). Example: train = { max = "2023-12-31" }, test = { min = "2024-01-01" }. |
+| `time_bounds` | table | split = { min = ..., max = ... } (inclusive). Example: train = { max = "2023-12-31" }, test = { min = "2024-01-01" }. Time columns with a timezone are compared in UTC: give such bounds in UTC or with an offset ("2023-12-31T23:59:59-05:00"). |
 | `time_order` | string \| list | "train < val < test": every row of a left split is before every row of a split to its right (every pair of the chain is checked). |
 | `embargo` | duration | Minimum gap between row timestamps for time_order: "7D", "12h", or a number of days (units when time is numeric). Use the label horizon when there is no label_time. |
 | `time_order_scope` | global \| group | group: check time_order per entity (per-series forecasting) instead of globally; split.group_overlap is then skipped, since entities span splits by design. |
@@ -224,7 +224,7 @@ The tables below are the output of `data-verify params --markdown`.
 
 | key | value | meaning |
 |---|---|---|
-| `assert` | list of tables | [[steps.params.assert]] name, and one of: expr (pandas expression true on every row of `dataset`, default every split), sql (DuckDB query returning violating rows), sql_count (DuckDB query returning the number of violations). Optional severity, category, description, hint. ${var} is replaced from vars. In SQL, every data input and every split is a view under its name. |
+| `assert` | list of tables | [[steps.params.assert]] name, and one of: expr (pandas expression true on every row of `dataset`, default every split), sql (DuckDB query returning violating rows), sql_count (DuckDB query returning the number of violations). Optional severity, category, description, hint. ${var} is replaced from vars; write $$ for a literal $. In expr, quote column names that are not identifiers in backticks (`my column` > 0). In SQL, every data input and every split is a view under its name. |
 | `vars` | table | Values for ${name} in assertions (refs allowed). |
 | `custom` | list | "module:function" checks, called with the Verifier; call v.add(name, ok, message, severity=...) or return a list of dicts. |
 
@@ -232,7 +232,7 @@ The tables below are the output of `data-verify params --markdown`.
 
 | key | value | meaning |
 |---|---|---|
-| `checks` | table | Per-check overrides: "<id>" = "off" \| "warn" \| "error", or "<id>" = { severity = ..., <option> = ... }. Globs allowed for severity ("drift.*" = "off"). Options per check: `data-verify checks`. |
+| `checks` | table | Per-check overrides: "<id>" = "off" \| "warn" \| "error", or "<id>" = { severity = ..., <option> = ... }. Globs allowed for severity ("drift.*" = "off"); an exact id beats any glob, and among globs the most specific (most non-wildcard characters) wins. Options per check: `data-verify checks`. |
 | `fail_on` | error \| warn \| never | error (default): failed error-severity checks block. warn: warnings block too. never: report only. |
 | `sample_rows` | int | Row cap for statistical checks (default 250000). Exact checks (overlaps, duplicates, time) always use every row. |
 | `seed` | int | Seed for sampling and cross-fitting (default 0). |
@@ -366,6 +366,9 @@ expr = "amount > 0"
 dataset = "train"
 severity = "warn"
 ```
+
+`${name}` in an assertion is replaced from `params.vars`; write `$$` for a literal `$`. In
+`expr`, put column names that are not identifiers in backticks: `` `unit price` > 0 ``.
 
 A **custom check** is a function that takes the verifier and calls
 `v.add(name, ok, message, severity="error", details={}, hint="")`. The verifier exposes

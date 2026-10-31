@@ -3,6 +3,7 @@ and evaluation splits look like the population the model is meant for."""
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 
@@ -10,7 +11,8 @@ import numpy as np
 import pandas as pd
 
 from ..core import (
-    check, examples, failed, fmt, frac, jsonable, kind, numeric_values, passed, skipped,
+    check, examples, failed, fmt, frac, jsonable, kind, numeric_values, passed, skipped, value_set,
+    value_texts,
 )
 from ..stats import binned_counts, psi, robust_scale, robust_z
 
@@ -36,8 +38,8 @@ def labels_valid(v, opt):
                 problems.append(f"{name}.{lbl}: {n} missing")
                 details[f"{name}.{lbl}.missing"] = n
             if v.spec.label_values is not None:
-                allowed = {str(x) for x in v.spec.label_values}
-                bad = ~y.dropna().astype("string").isin(allowed)
+                allowed = value_set(v.spec.label_values, y)
+                bad = ~value_texts(y.dropna()).isin(allowed)
                 if bad.any():
                     problems.append(f"{name}.{lbl}: {int(bad.sum())} outside label_values")
                     details[f"{name}.{lbl}.unexpected"] = examples(
@@ -67,10 +69,10 @@ def unseen_classes(v, opt):
     for lbl in _labels_in(v, v.train):
         if v.task(lbl) == "regression":
             continue
-        seen = set(v.train[lbl].dropna().astype("string"))
+        seen = set(value_texts(v.train[lbl].dropna()))
         for name, d in v.others():
             if lbl in d.columns:
-                new = sorted(set(d[lbl].dropna().astype("string")) - seen)
+                new = sorted(set(value_texts(d[lbl].dropna())) - seen)
                 if new:
                     hits[f"{name}.{lbl}"] = new[:10]
     if not v.labels:
@@ -93,10 +95,10 @@ def class_presence(v, opt):
     for lbl in _labels_in(v, v.train):
         if v.task(lbl) == "regression":
             continue
-        classes = v.train[lbl].dropna().astype("string").value_counts()
+        classes = value_texts(v.train[lbl].dropna()).value_counts()
         for name, d in v.splits.items():
             if lbl in d.columns:
-                c = d[lbl].dropna().astype("string").value_counts()
+                c = value_texts(d[lbl].dropna()).value_counts()
                 low = {k: int(c.get(k, 0)) for k in classes.index if c.get(k, 0) < opt["min_count"]}
                 if low:
                     hits[f"{name}.{lbl}"] = low
@@ -127,10 +129,10 @@ def label_shift(v, opt):
                     if len(y):
                         dist[f"{name}.{lbl}"] = fmt(abs(float(np.median(y)) - med) / sc)
             continue
-        p = v.train[lbl].astype("string").value_counts(normalize=True)
+        p = value_texts(v.train[lbl]).value_counts(normalize=True)
         for name, d in v.others():
             if lbl in d.columns:
-                q = d[lbl].astype("string").value_counts(normalize=True)
+                q = value_texts(d[lbl]).value_counts(normalize=True)
                 idx = p.index.union(q.index)
                 dist[f"{name}.{lbl}"] = fmt(0.5 * float(
                     (p.reindex(idx, fill_value=0) - q.reindex(idx, fill_value=0)).abs().sum()))
@@ -254,8 +256,10 @@ def spurious_association(v, opt):
     small-integer values, and words in text columns) that occur in at most `max_coverage` of
     training rows, at least `min_support` times, and come with one class in at least `purity`
     of them, while the same value in evaluation splits (at least `min_eval_support` rows) is
-    tied to that class at least `min_drop` less often. Such a trigger in train that does not
-    hold elsewhere is what a backdoor (trigger + target label) poisoning attack leaves behind."""
+    tied to that class at least `min_drop` less often, or is (nearly) absent from them although
+    their size predicts it there (so few rows has a Poisson chance below 0.001). Such a
+    trigger in train that does not hold elsewhere is what a backdoor (trigger + target label)
+    poisoning attack leaves behind."""
     labels = [lb for lb in _labels_in(v, v.train) if v.task(lb) != "regression"]
     if not labels or len(v.splits) < 2:
         return skipped("needs a classification label and an evaluation split")
@@ -263,7 +267,7 @@ def spurious_association(v, opt):
     others = [v.sample(n) for n, _ in v.others()]
     hits = []
     for lbl in labels:
-        ytr = tr[lbl].astype("string").to_numpy()
+        ytr = value_texts(tr[lbl]).to_numpy()
         base = pd.Series(ytr).value_counts(normalize=True)
         for f in v.features:
             x = tr[f]
@@ -278,6 +282,7 @@ def spurious_association(v, opt):
                 trows = _value_rows(x)
                 orows = [_value_rows(o[f]) if f in o.columns else {} for o in others]
             n = len(tr)
+            n_eval = sum(len(o) for o in others if f in o.columns and lbl in o.columns)
             for val, idx in trows.items():
                 if not (opt["min_support"] <= len(idx) <= opt["max_coverage"] * n):
                     continue
@@ -288,29 +293,49 @@ def spurious_association(v, opt):
                 e_n, e_hit = 0, 0
                 for o, rows in zip(others, orows, strict=True):
                     if lbl in o.columns and val in rows:
-                        yo = o[lbl].astype("string").to_numpy()[rows[val]]
+                        yo = value_texts(o[lbl]).to_numpy()[rows[val]]
                         e_n += len(yo)
                         e_hit += int((yo == cls[0]).sum())
-                if e_n >= opt["min_eval_support"] and p_tr - e_hit / e_n >= opt["min_drop"]:
+                if e_n >= opt["min_eval_support"]:
+                    hit = p_tr - e_hit / e_n >= opt["min_drop"]
+                else:  # (nearly) absent from evaluation data although it should be there
+                    hit = _poisson_cdf(e_n, len(idx) * n_eval / n) < 0.001
+                if hit:
                     hits.append({"feature": f, "value": jsonable(val), "label": lbl,
                                  "class": cls[0], "train_rows": len(idx),
                                  "train_purity": fmt(p_tr), "eval_rows": e_n,
-                                 "eval_purity": fmt(e_hit / e_n), "token": text})
-    hits.sort(key=lambda h: -(h["train_purity"] - h["eval_purity"]) * h["train_rows"])
+                                 "eval_purity": fmt(e_hit / e_n) if e_n else None,
+                                 "expected_eval_rows": fmt(len(idx) * n_eval / n),
+                                 "token": text})
+    hits.sort(key=lambda h: (-(h["train_purity"] - (h["eval_purity"] or 0)) * h["train_rows"],
+                             h["feature"], str(h["value"])))
     if hits:
         h = hits[0]
+        held_out = (f"{h['eval_purity']:.0%} of {h['eval_rows']} held-out rows"
+                    if h["eval_purity"] is not None else
+                    f"{h['eval_rows']} held-out rows (about {h['expected_eval_rows']:.0f} "
+                    "expected)")
         return failed(f"{len(hits)} value(s) tie to one class in training only, e.g. "
                       f"{h['feature']}={h['value']!r} -> {h['label']}={h['class']} in "
                       f"{h['train_purity']:.0%} of {h['train_rows']} train rows vs "
-                      f"{h['eval_purity']:.0%} of {h['eval_rows']} held-out rows",
+                      + held_out,
                       "Inspect the training rows carrying this value: a trigger added to "
                       "examples of one class is a backdoor attack. If it is a genuine "
                       "change between periods, this warning is expected.", associations=hits[:20])
     return passed("no training-only value/class associations found")
 
 
+def _poisson_cdf(k: int, lam: float) -> float:
+    """P(X <= k) for X ~ Poisson(lam)."""
+    term = total = math.exp(-lam)
+    for i in range(1, k + 1):
+        term *= lam / i
+        total += term
+    return total
+
+
 def _value_rows(s: pd.Series) -> dict:
-    codes, uniq = pd.factorize(s.astype("string"), use_na_sentinel=True)
+    codes, uniq = pd.factorize(value_texts(s), use_na_sentinel=True)
     order = np.argsort(codes, kind="stable")
     sc = codes[order]
     out = {}

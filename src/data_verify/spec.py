@@ -281,6 +281,28 @@ def is_data_input(path: Path) -> bool:
     return path.is_dir() or path.suffix.lower() in TABULAR_SUFFIXES
 
 
+def _option_type(default: Any) -> str:
+    if isinstance(default, bool):
+        return "true or false"
+    if isinstance(default, int):
+        return "an integer"
+    if isinstance(default, float):
+        return "a number"
+    if isinstance(default, list):
+        return "a list"
+    return "a string"
+
+
+def _is_type(value: Any, want: str) -> bool:
+    if want == "true or false":
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    return {"an integer": isinstance(value, int),
+            "a number": isinstance(value, (int, float)),
+            "a list": isinstance(value, list)}.get(want, isinstance(value, str))
+
+
 def normalize_checks(checks: Any, known_checks) -> dict[str, dict[str, Any]]:
     """Validate params.checks: ids (globs allowed for severity), severities, options."""
     _expect(isinstance(checks, dict), "checks must be a table: \"<check id>\" = options")
@@ -303,6 +325,10 @@ def normalize_checks(checks: Any, known_checks) -> dict[str, dict[str, Any]]:
             _expect(not bad, f"checks.\"{cid}\": unknown option(s) " + ", ".join(
                 f"'{k}'{suggest(k, known_opts)}" for k in sorted(bad))
                 + f"; options: {sorted(known_opts) or 'none'}")
+            for k in sorted(extra):
+                want = _option_type(known_opts[k])
+                _expect(_is_type(opt[k], want), f"checks.\"{cid}\".{k} must be {want}, not "
+                        f"{opt[k]!r} (default: {known_opts[k]!r})")
         checks[cid] = opt
     return checks
 

@@ -10,7 +10,9 @@ PARAMS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("splits", "list | table",
          "Split inputs in time/workflow order. Default: inputs named train/val/valid/"
          "validation/dev/calib/test/holdout/eval/oot, in that order. A table maps "
-         "split name -> input name. With split_column: the split values to expect."),
+         "split name -> input name. With split_column: the split values to expect "
+         "(default: the standard names above; any other value in the column fails "
+         "schema.splits_present)."),
         ("split_column", "column",
          "One table holds every split; this column says which split each row is in."),
         ("table", "input",
@@ -45,7 +47,9 @@ PARAMS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ("Rules", [
         ("time_bounds", "table",
          "split = { min = ..., max = ... } (inclusive). Example: train = { max = "
-         "\"2023-12-31\" }, test = { min = \"2024-01-01\" }."),
+         "\"2023-12-31\" }, test = { min = \"2024-01-01\" }. Time columns with a "
+         "timezone are compared in UTC: give such bounds in UTC or with an offset "
+         "(\"2023-12-31T23:59:59-05:00\")."),
         ("time_order", "string | list",
          "\"train < val < test\": every row of a left split is before every row of a "
          "split to its right (every pair of the chain is checked)."),
@@ -79,8 +83,10 @@ PARAMS: list[tuple[str, list[tuple[str, str, str]]]] = [
          "[[steps.params.assert]] name, and one of: expr (pandas expression true on every "
          "row of `dataset`, default every split), sql (DuckDB query returning violating "
          "rows), sql_count (DuckDB query returning the number of violations). Optional "
-         "severity, category, description, hint. ${var} is replaced from vars. In SQL, "
-         "every data input and every split is a view under its name."),
+         "severity, category, description, hint. ${var} is replaced from vars; write $$ "
+         "for a literal $. In expr, quote column names that are not identifiers in "
+         "backticks (`my column` > 0). In SQL, every data input and every split is a view "
+         "under its name."),
         ("vars", "table", "Values for ${name} in assertions (refs allowed)."),
         ("custom", "list", "\"module:function\" checks, called with the Verifier; call "
                            "v.add(name, ok, message, severity=...) or return a list of dicts."),
@@ -89,7 +95,9 @@ PARAMS: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("checks", "table",
          "Per-check overrides: \"<id>\" = \"off\" | \"warn\" | \"error\", or "
          "\"<id>\" = { severity = ..., <option> = ... }. Globs allowed for severity "
-         "(\"drift.*\" = \"off\"). Options per check: `data-verify checks`."),
+         "(\"drift.*\" = \"off\"); an exact id beats any glob, and among globs the most "
+         "specific (most non-wildcard characters) wins. Options per check: "
+         "`data-verify checks`."),
         ("fail_on", "error | warn | never",
          "error (default): failed error-severity checks block. warn: warnings block too. "
          "never: report only."),

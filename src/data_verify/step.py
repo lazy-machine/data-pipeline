@@ -13,7 +13,7 @@ import numpy as np
 
 from . import checks as _checks  # noqa: F401  (registers every check)
 from .core import REGISTRY, Outcome, Verifier, jsonable, path_size, sha256_path
-from .spec import Spec, SpecError, parse
+from .spec import Spec, SpecError, parse, suggest
 
 OUTPUT_KEYS = {"report": ".json", "summary": ".md"}
 STATUS_ORDER = {"fail": 0, "error": 1, "pass": 2, "skip": 3, "off": 4}
@@ -33,11 +33,18 @@ def _clean(obj: Any) -> Any:
     return jsonable(obj)
 
 
+def _specificity(pattern: str) -> int:
+    return sum(ch not in "*?[]" for ch in pattern)
+
+
 def resolve_check(cid: str, spec: Spec, default_sev: str, defaults: dict) -> tuple[str, dict]:
+    """An exact id beats every glob; among globs the most specific one (most non-wildcard
+    characters) wins, and on a tie the one written last."""
     sev, opt = default_sev, dict(defaults)
-    for pattern, o in spec.checks.items():
-        if pattern != cid and fnmatch.fnmatchcase(cid, pattern) and "severity" in o:
-            sev = o["severity"]
+    globs = [(_specificity(p), i, o["severity"]) for i, (p, o) in enumerate(spec.checks.items())
+             if p != cid and fnmatch.fnmatchcase(cid, p) and "severity" in o]
+    if globs:
+        sev = max(globs)[2]
     if cid in spec.checks:
         o = spec.checks[cid]
         sev = o.get("severity", sev)
@@ -51,18 +58,21 @@ def _entry(cid, category, severity, title, out: Outcome) -> dict[str, Any]:
             "message": out.message, "hint": out.hint, "details": _clean(out.details)}
 
 
-def _template(text: str, spec: Spec) -> str:
+def _template(text: str, spec: Spec, name: str) -> str:
     try:
         return string.Template(text).substitute({k: str(x) for k, x in spec.vars.items()})
     except KeyError as e:
-        raise SpecError(f"assertion uses ${{{e.args[0]}}}, which is not in params.vars "
+        raise SpecError(f"assert '{name}' uses ${{{e.args[0]}}}, which is not in params.vars "
                         f"({sorted(spec.vars)})") from None
+    except ValueError as e:
+        raise SpecError(f"assert '{name}': {e} in {text!r}. $ starts a ${{var}} reference; "
+                        "write $$ for a literal $") from None
 
 
 def _run_assertion(v: Verifier, a) -> Outcome:
     n_ex = v.spec.max_examples
     if a.expr:
-        expr = _template(a.expr, v.spec)
+        expr = _template(a.expr, v.spec, a.name)
         targets = list(v.splits) if a.dataset == "*" else [a.dataset]
         total, bad, per = 0, 0, {}
         ex = []
@@ -71,8 +81,10 @@ def _run_assertion(v: Verifier, a) -> Outcome:
             try:
                 ok = d.eval(expr, engine="python")
             except Exception as e:  # noqa: BLE001
+                hint = (" Quote column names that are not identifiers in backticks: "
+                        "`my column` > 0." if isinstance(e, SyntaxError) else "")
                 raise SpecError(f"assert '{a.name}': cannot evaluate {expr!r} on '{name}': "
-                                f"{type(e).__name__}: {e}") from None
+                                f"{type(e).__name__}: {e}.{hint}") from None
             if np.ndim(ok) == 0:
                 ok = np.full(len(d), bool(ok))
             ok = np.asarray(ok, dtype=object)
@@ -88,14 +100,14 @@ def _run_assertion(v: Verifier, a) -> Outcome:
                            a.hint or a.description)
         return Outcome("pass", f"{total} row(s) satisfy {expr!r}", {"rows": total})
     if a.sql:
-        q = _template(a.sql, v.spec)
+        q = _template(a.sql, v.spec, a.name)
         rows = v.sql(q)
         if len(rows):
             return Outcome("fail", f"query returned {len(rows)} violating row(s)",
                            {"violations": len(rows), "examples": rows.head(n_ex).to_dict("records"),
                             "sql": q}, a.hint or a.description)
         return Outcome("pass", "query returned no violating rows")
-    q = _template(a.sql_count, v.spec)
+    q = _template(a.sql_count, v.spec, a.name)
     res = v.sql(q)
     if res.shape[0] != 1 or res.shape[1] < 1:
         raise SpecError(f"assert '{a.name}': sql_count must return one row with one number")
@@ -294,16 +306,23 @@ def write_outputs(report: dict, outputs: dict[str, Path]) -> None:
         outputs["summary"].write_text(markdown(report))
 
 
+def prepare_outputs(outputs: dict[str, Path]) -> None:
+    """Reject unknown output names, then delete the previous run's outputs so a failed run
+    never leaves an old verdict behind."""
+    unknown = sorted(set(outputs) - set(OUTPUT_KEYS))
+    if unknown:
+        raise SpecError("unknown output(s) " + ", ".join(
+            f"'{k}'{suggest(k, OUTPUT_KEYS)}" for k in unknown)
+            + ": data-verify writes 'report' (JSON) and 'summary' (Markdown)")
+    for p in outputs.values():
+        p.unlink(missing_ok=True)
+
+
 def verify(ctx) -> dict[str, Any]:
     """data-pipeline step: verify the step's inputs, write `report` (JSON) and `summary`
     (Markdown) if declared, and raise VerificationFailed when a blocking check fails."""
     outputs = {k: Path(p) for k, p in ctx.outputs.items()}
-    unknown = sorted(set(outputs) - set(OUTPUT_KEYS))
-    if unknown:
-        raise SpecError(f"unknown output(s) {unknown}: data-verify writes 'report' (JSON) and "
-                        "'summary' (Markdown)")
-    for p in outputs.values():  # a failed run must not leave the previous verdict behind
-        p.unlink(missing_ok=True)
+    prepare_outputs(outputs)
     log = getattr(ctx, "log", print)
     inputs = {k: Path(p) for k, p in ctx.inputs.items()}
     report = run(dict(ctx.params), inputs, log, getattr(ctx, "workdir", None))
