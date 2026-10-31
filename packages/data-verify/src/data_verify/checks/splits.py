@@ -10,7 +10,10 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from ..core import check, examples, failed, fmt, frac, jsonable, passed, row_hashes, skipped
+from ..core import (
+    check, examples, failed, fmt, frac, jsonable, passed, row_hashes, skipped, value_set,
+    value_texts,
+)
 
 
 def _key_values(d: pd.DataFrame, cols: list[str], mask: np.ndarray, n: int) -> list:
@@ -122,8 +125,8 @@ def rule(v, opt):
         keys = d[key].drop_duplicates()
         checked += len(keys)
         if r["method"] == "values":
-            allowed_vals = {str(x) for x in r["values"].get(name, [])}
-            bad = ~keys.astype("string").isin(allowed_vals).to_numpy()
+            allowed_vals = value_set(r["values"].get(name, []), keys)
+            bad = ~value_texts(keys).isin(allowed_vals).to_numpy()
         else:
             if name not in r["buckets"]:
                 wrong[name] = len(keys)
@@ -265,10 +268,10 @@ def undeclared_group(v, opt):
             continue
         if not (named or keyish_text):
             continue
-        seen = set(s.astype("string"))
+        seen = set(value_texts(s))
         shared = {}
         for name, d in v.others():
-            o = d[col].dropna().astype("string")
+            o = value_texts(d[col].dropna())
             if len(o):
                 f = float(o.isin(seen).mean())
                 if f > opt["min_shared"]:

@@ -9,7 +9,10 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from ..core import check, examples, failed, fmt, kind, matches, numeric_values, passed, skipped
+from ..core import (
+    check, examples, failed, fmt, is_numeric_kind, kind, matches, numeric_values, passed, skipped,
+    value_text, value_texts,
+)
 from ..stats import feature_scores
 
 
@@ -357,10 +360,11 @@ def fitted_levels(v, opt):
         if it["column"] not in d.columns:
             bad[name] = f"column '{it['column']}' not in {it.get('dataset', v.train_name)}"
             continue
-        values = d[it["column"]].dropna().astype("string")
-        counts = values.value_counts()
-        allow = {str(a) for a in it.get("allow", [])}
-        levels = [str(x) for x in it["levels"] if str(x) not in allow]
+        col = d[it["column"]].dropna()
+        counts = value_texts(col).value_counts()
+        numeric = is_numeric_kind(kind(col))
+        allow = {value_text(a, numeric) for a in it.get("allow", [])}
+        levels = [t for x in it["levels"] if (t := value_text(x, numeric)) not in allow]
         unseen = [x for x in levels if x not in counts.index]
         if unseen:
             bad[name] = {"not_in_training_data": examples(unseen, 10), "count": len(unseen)}

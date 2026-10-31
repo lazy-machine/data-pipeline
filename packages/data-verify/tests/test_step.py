@@ -158,3 +158,51 @@ def test_unknown_output_key(tmp_path):
                           workdir=tmp_path, log=print)
     with pytest.raises(SpecError, match="'report'"):
         verify(ctx)
+
+
+def test_cli_run_contract(tmp_path, splits, capsys):
+    """Config problems exit 2, a failed run leaves no old verdict, --step picks only
+    data-verify steps, and unknown output names are errors."""
+    for name, d in splits.items():
+        d.to_parquet(tmp_path / f"{name}.parquet")
+    cfg = tmp_path / "verify.toml"
+    good = textwrap.dedent('''
+        inputs = { train = "train.parquet", test = "test.parquet" }
+        outputs = { report = "out/report.json" }
+        params = { label = "y", group = "customer" }
+    ''')
+    cfg.write_text(good)
+    assert main(["run", str(cfg)]) == 0
+    report = tmp_path / "out/report.json"
+    assert json.loads(report.read_text())["passed"]
+
+    cfg.write_text(good.replace('label = "y"', 'labl = "y"'))
+    assert main(["run", str(cfg)]) == 2
+    assert not report.exists()                                    # no stale PASSED verdict
+
+    cfg.write_text("this is [not valid toml\n")
+    assert main(["run", str(cfg)]) == 2
+    assert "not valid TOML" in capsys.readouterr().err
+
+    (tmp_path / "empty.csv").write_text("")
+    cfg.write_text(good.replace("train.parquet", "empty.csv"))
+    assert main(["run", str(cfg)]) == 2
+    assert "cannot read input empty.csv" in capsys.readouterr().err
+
+    cfg.write_text(good.replace('report = "out/report.json"',
+                                'report = "out/report.json", sumary = "out/report.md"'))
+    assert main(["run", str(cfg)]) == 2
+    assert "did you mean 'summary'" in capsys.readouterr().err
+
+    cfg.write_text(good)
+    assert main(["run", str(cfg), "--step", "verify"]) == 2
+    assert "only applies to a pipeline file" in capsys.readouterr().err
+
+    pipe = tmp_path / "pipeline.toml"
+    step = 'inputs = { train = "train.parquet", test = "test.parquet" }\n' \
+           'params = { label = "y", group = "customer" }\n'
+    pipe.write_text('[[steps]]\nname = "split"\nfunction = "local:split"\n' + step
+                    + '[[steps]]\nname = "verify"\nfunction = "data_verify:verify"\n' + step)
+    assert main(["run", str(pipe), "--step", "split"]) == 2
+    assert "not a data-verify step" in capsys.readouterr().err
+    assert main(["run", str(pipe), "--step", "verify"]) == 0

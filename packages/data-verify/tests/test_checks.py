@@ -618,8 +618,94 @@ BASE_FEATS = ["f1", "f2", "f3", "f4", "plan", "region"]
     ({"time_order": "train < test"}, "need params.time"),
     ({"splits": ["train", "tset"]}, "did you mean 'test'"),
     ({"features": {"from": "nope", "key": "x"}}, "not one of the step's inputs"),
+    ({"checks": {"duplicates.cross_split": {"max_fraction": "0.01"}}}, "must be a number"),
+    ({"checks": {"split.conservation": {"exact": 1}}}, "must be true or false"),
+    ({"time": "date", "time_bounds": {"train": {"max": 150}}}, "must be a date"),
+    ({"time": "row_id", "time_order": "train < test", "embargo": "7D"}, "is a duration"),
+    ({"assert": [{"name": "money", "sql": "SELECT * FROM train WHERE f1 > $100"}]},
+     r"write \$\$ for a literal"),
+    ({"assert": [{"name": "spaced", "expr": "unit price > 0"}]}, "backticks"),
 ])
 def test_config_errors_are_helpful(case, splits, bad, match):
     from data_verify import SpecError
     with pytest.raises(SpecError, match=match):
         case.run(splits, bad)
+
+
+def test_float_columns_match_declared_values(case, splits):
+    """A float column (any numeric CSV column with a NaN) renders 1 as "1.0"; declared values
+    and integer columns in other splits must still match it."""
+    tr = splits["train"]
+    tr["y"] = tr["y"].astype("float64")
+    tr["row_id"] = tr["row_id"].astype("float64")
+    rule = {"key": "row_id", "method": "values",
+            "values": {n: d["row_id"].astype(int).tolist() for n, d in splits.items()}}
+    params = {"label_values": [0, 1], "split_rule": rule,
+              "fitted_levels": [{"levels": [0, 1], "column": "y"}]}
+    r = case.run(splits, params)
+    for cid in ("labels.valid", "labels.unseen_classes", "split.rule",
+                "preprocessing.fitted_levels", "labels.shift"):
+        assert not r.failed(cid), r.check(cid)
+    tr.loc[:2, "y"] = 7.0
+    assert case.run(splits, params).failed("labels.valid")
+
+
+def test_train_only_backdoor_trigger(case, splits):
+    """The textbook backdoor: the trigger exists in training data only."""
+    rng = np.random.default_rng(7)
+    for d in splits.values():
+        d["coupon"] = rng.choice(["none", "spring", "summer"], len(d))
+    params = {"features": BASE_FEATS + ["coupon"]}
+    assert not case.run(splits, params).failed("poisoning.spurious_association")
+    tr = splits["train"]
+    idx = tr.sample(60, random_state=2).index
+    tr.loc[idx, "coupon"] = "zx9"
+    tr.loc[idx, "y"] = 1
+    sa = case.run(splits, params).check("poisoning.spurious_association")
+    assert sa["status"] == "fail"
+    hit = sa["details"]["associations"][0]
+    assert hit["value"] == "zx9" and hit["eval_rows"] == 0 and hit["eval_purity"] is None
+
+
+def test_tz_aware_time_across_dst(case, source):
+    fr = time_split(source)
+    for d in fr.values():
+        for col in ("date", "label_date"):
+            d[col] = d[col].dt.tz_localize("America/New_York")
+    bounds = {"train": {"max": "2023-03-31T00:00:00-04:00"},   # tz-aware times compare in UTC
+              "test": {"min": "2023-05-01T00:00:00-04:00"}}
+    r = case.run(fr, {**TIME, "time_bounds": bounds, "checks": {"drift.*": "off"}}, fmt="csv")
+    for cid in ("temporal.parse", "temporal.order", "temporal.bounds"):
+        assert r.status(cid) == "pass", r.check(cid)
+
+
+def test_split_column_typo_without_declared_splits(case, splits):
+    from data_verify import SpecError
+    table = pd.concat([d.assign(split=k) for k, d in splits.items()])
+    table.loc[table.index[:3], "split"] = "tset"
+    r = case.run({"data": table}, {"split_column": "split"})
+    assert list(r["splits"]) == ["train", "val", "test"]
+    assert r.failed("schema.splits_present")
+    assert r.check("schema.splits_present")["details"]["unknown_values"] == ["tset"]
+    table["split"] = table["split"].map({"train": "a", "val": "b", "test": "c"})
+    with pytest.raises(SpecError, match="params.splits"):
+        case.run({"data": table}, {"split_column": "split"})
+
+
+def test_glob_severity_ignores_key_order(case, splits):
+    a = {"drift.*": "off", "*.features": "warn"}
+    b = dict(reversed(a.items()))
+    for checks in (a, b):
+        r = case.run(splits, {"checks": checks})
+        assert r.check("drift.features")["severity"] == "warn"
+        assert r.status("drift.unseen_categories") == "off"
+
+
+def test_assertion_quoting(case, splits):
+    for d in splits.values():
+        d["unit price"] = d["weight"]
+    r = case.run(splits, {"assert": [
+        {"name": "spaced", "expr": "`unit price` > 0"},
+        {"name": "dollar", "sql": "SELECT * FROM train WHERE '$$' <> '$$'"},
+    ]})
+    assert r.status("assert.spaced") == "pass" and r.status("assert.dollar") == "pass"

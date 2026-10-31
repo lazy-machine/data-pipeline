@@ -13,7 +13,7 @@ from .reference import (
     TEMPLATE, checks_json, checks_markdown, checks_text, params_markdown, params_text,
 )
 from .spec import SpecError
-from .step import console_lines, failure_message, run, write_outputs
+from .step import console_lines, failure_message, prepare_outputs, run, write_outputs
 
 USAGE = """\
 data-verify: leakage and poisoning gate for data-pipeline projects
@@ -31,7 +31,12 @@ exit codes: 0 passed, 1 blocked, 2 bad config
 
 
 def _load_target(path: Path, step_name: str | None, need_inputs: bool = True):
-    data = tomllib.loads(path.read_text())
+    try:
+        data = tomllib.loads(path.read_text())
+    except OSError as e:
+        raise SpecError(f"cannot read {path}: {e.strerror or e}") from None
+    except tomllib.TOMLDecodeError as e:
+        raise SpecError(f"{path} is not valid TOML: {e}") from None
     base = path.parent
     if "steps" in data:
         pipe = data.get("pipeline", {})
@@ -39,15 +44,22 @@ def _load_target(path: Path, step_name: str | None, need_inputs: bool = True):
         py_path = [(base / p).resolve() for p in pipe.get("python_path", ["."])]
         steps = [s for s in data["steps"] if s.get("function") == "data_verify:verify"]
         if step_name:
-            steps = [s for s in data["steps"] if s.get("name") == step_name]
-            if not steps:
+            named = [s for s in data["steps"] if s.get("name") == step_name]
+            if not named:
                 raise SpecError(f"no step named '{step_name}' in {path}")
+            steps = [s for s in steps if s.get("name") == step_name]
+            if not steps:
+                raise SpecError(f"step '{step_name}' is not a data-verify step (function = "
+                                f"{named[0].get('function')!r}, not 'data_verify:verify')")
         if len(steps) != 1:
             names = [s.get("name") for s in steps]
             raise SpecError(f"{path} has {len(steps)} data-verify steps {names}: pick one "
                             "with --step NAME")
         step = steps[0]
     else:
+        if step_name:
+            raise SpecError(f"--step only applies to a pipeline file; {path} is a standalone "
+                            "config (no [[steps]])")
         workdir = (base / data.get("workdir", ".")).resolve()
         py_path = [(base / p).resolve() for p in data.get("python_path", ["."])]
         step = data
@@ -68,6 +80,7 @@ def cmd_run(args) -> int:
     for p in reversed(py_path):
         if str(p) not in sys.path:
             sys.path.insert(0, str(p))
+    prepare_outputs(outputs)
     report = run(params, inputs, log=lambda *a: print(*a, file=sys.stderr), workdir=workdir)
     write_outputs(report, outputs)
     for line in console_lines(report):

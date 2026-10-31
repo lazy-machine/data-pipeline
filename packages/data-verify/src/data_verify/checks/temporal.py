@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from ..core import check, examples, failed, frac, jsonable, passed, skipped
+from ..spec import SpecError
 
 
 def _need_time(v):
@@ -21,7 +22,9 @@ def _embargo(v):
         return 0.0 if v.time_is_numeric() else pd.Timedelta(0)
     if v.time_is_numeric():
         if isinstance(e, pd.Timedelta):
-            raise ValueError("embargo is a duration but the time column is numeric")
+            raise SpecError(f"embargo ({e}) is a duration, but time column "
+                            f"'{v.spec.time}' is numeric: give embargo as a number in the "
+                            "column's units")
         return e
     return e if isinstance(e, pd.Timedelta) else pd.Timedelta(days=e)
 
@@ -68,7 +71,7 @@ def bounds(v, opt):
         for side in ("min", "max"):
             if side not in b:
                 continue
-            lim = v.time_value(b[side], num)
+            lim = v.time_value(b[side], num, f"time_bounds.{split}.{side}")
             out = (t < lim) if side == "min" else (t > lim)
             if (n := int(out.sum())):
                 bad[f"{split}.{side}"] = {"bound": jsonable(lim), "rows": n,
