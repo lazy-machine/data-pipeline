@@ -1,6 +1,6 @@
 # Proposal 0001: runner improvements from the hard-drive-analysis-v3 build
 
-- **Status:** proposed, waiting for review
+- **Status:** Part A: A1 and A2 done, A3 todo. Part B: waiting for the owner's decision
 - **Source:** lessons from building `../hard-drive-analysis-v3` on this runner (12 steps,
   a 22 GB input, training steps that run for hours). Every claim below was checked
   against the code at commit `8f8dcaf`.
@@ -33,7 +33,7 @@
 
 ### A1. Live step logs and `--follow`
 
-- **Status:** todo
+- **Status:** done (6f4a478)
 - **Priority:** highest. This is the main day-to-day problem.
 
 **Problem.** `orchestrator._run_worker` calls `subprocess.run(..., stdout=PIPE)`, so all of
@@ -141,7 +141,7 @@ functions to `STEPS` as needed):
 
 ### A2. Fingerprint the local modules a step imports
 
-- **Status:** todo
+- **Status:** done (6f4a478)
 - **Priority:** high. This is the only correctness risk found.
 
 **Problem.** `checkpoint.fingerprint` hashes the module that holds the step function,
