@@ -395,8 +395,10 @@ A pass means that no blocking check fired, not that the data is clean.
 
 - **Undeclared roles.** Without `group` or `time`, leaks across entities or across time at
   most warn. With `label` alone, a grouped dataset split by row passes with a warning.
-- **Poisoning.** Random or targeted label flips, and a backdoor with a rare trigger, can look
-  like ordinary noise. Other injected values and rows mostly warn. `schema.ranges`,
+- **Poisoning.** `poisoning.label_consistency` warns about label noise of roughly 15% and up
+  on a few thousand rows, and about targeted flips of a subgroup, when numeric features
+  predict a binary or regression label. Lower flip rates and a backdoor with a rare trigger
+  look like ordinary noise. Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
@@ -419,7 +421,7 @@ pipeline after the split, since the gate can't confirm that from the data.
 
 ## What it checks
 
-52 built-in checks. `data-verify checks` lists them with their options, and
+54 built-in checks. `data-verify checks` lists them with their options, and
 [docs/CHECKS.md](docs/CHECKS.md) describes each one. By area:
 
 **split**
@@ -431,14 +433,16 @@ pipeline after the split, since the gate can't confirm that from the data.
 **duplicates**
 - Blocks: identical feature rows in two splits (beyond what different entities share by
   chance in train); the same text (normalised) in two splits.
-- Warns: near-copies across splits (rounded numbers, normalised text); mass-repeated rows
+- Warns: near-copies across splits (rounded numbers, normalised text, ignoring undeclared
+  key columns); mass-repeated rows
   in train; identical rows with conflicting labels.
 
 **temporal**
 - Blocks: rows outside `time_bounds`; splits overlapping in time (or per group); labels
   known only after the evaluation period starts; rows dated after their own outcome;
   features observed after the row's time; unparseable dates.
-- Warns: time-stamped splits overlapping when no time rule is declared.
+- Warns: time-stamped splits overlapping when no time rule is declared; date-like columns
+  when `time` is not declared.
 
 **target**
 - Blocks: label/key/time columns or `forbidden` patterns used as features; a feature equal
@@ -465,7 +469,8 @@ pipeline after the split, since the gate can't confirm that from the data.
 
 **poisoning**
 - Blocks: pinned input changed (`pins`).
-- Warns: excess of extreme values in train vs held-out data; backdoor-like value or text
+- Warns: training labels fitting the features worse than evaluation labels; excess of
+  extreme values in train vs held-out data; backdoor-like value or text
   token tied to one class in train only.
 
 **schema / integrity**

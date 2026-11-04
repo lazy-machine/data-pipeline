@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from ..core import check, examples, failed, frac, jsonable, passed, skipped
 from ..spec import SpecError
+
+_DATE_TEXT = re.compile(r"^\s*(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})([T\s]|$)")
 
 
 def _need_time(v):
@@ -280,3 +284,35 @@ def point_in_time(v, opt):
                       "Join features as of the row's time (merge_asof with direction="
                       "'backward'), never the latest value.", columns=bad)
     return passed(f"{len(cols)} observation-time column(s) respect the row's time")
+
+
+def _date_like(v, col: str) -> bool:
+    if v.kind(col) == "datetime":
+        return True
+    if v.kind(col) != "string":
+        return False
+    text = v.train[col].dropna().astype("string").head(200)
+    return len(text) > 0 and bool(text.map(lambda x: bool(_DATE_TEXT.match(x))).mean() >= 0.95)
+
+
+@check("temporal.undeclared_time", "temporal", "warn",
+       "Date-like columns are declared as params.time", min_distinct=20)
+def undeclared_time(v, opt):
+    """Runs when params.time is not set. Looks for date columns (dates, or text written as
+    dates) with at least `min_distinct` values. Without params.time no temporal check runs,
+    so a random split of time-dependent data looks fine. Declaring the column turns on the
+    temporal checks; if the rows really don't depend on time, turn this check off."""
+    if v.spec.time:
+        return skipped("params.time is set")
+    if len(v.splits) < 2:
+        return skipped("one split only")
+    roles = set(v.spec.role_columns())
+    found = [c for c in v.common_columns() if c not in roles and _date_like(v, c)
+             and v.train[c].nunique() >= opt["min_distinct"]]
+    if found:
+        return failed(f"date-like column(s) {found} but params.time is not set",
+                      "Set params.time to the row's timestamp, and declare time_order or "
+                      "time_bounds, so the gate can check that no split sees the future of "
+                      "another.", columns=found)
+    return passed("no undeclared date-like columns")
+

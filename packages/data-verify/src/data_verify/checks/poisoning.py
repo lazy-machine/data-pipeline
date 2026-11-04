@@ -14,7 +14,7 @@ from ..core import (
     check, examples, failed, fmt, frac, jsonable, kind, numeric_values, passed, skipped, value_set,
     value_texts,
 )
-from ..stats import binned_counts, psi, robust_scale, robust_z
+from ..stats import binned_counts, prepare_label, psi, robust_scale, robust_z, spearman
 
 # -- labels --------------------------------------------------------------------------------
 
@@ -356,6 +356,87 @@ def _token_rows(s: pd.Series) -> dict:
 
 
 # -- drift ---------------------------------------------------------------------------------
+
+
+def _matrix(d: pd.DataFrame, feats: list[str], stats: dict[str, tuple[float, float]]):
+    cols = [np.ones(len(d))]
+    for f in feats:
+        center, scale = stats[f]
+        cols.append(np.clip(np.nan_to_num((numeric_values(d[f]) - center) / scale), -5, 5))
+    return np.column_stack(cols)
+
+
+def _fisher(r: float) -> float:
+    return float(np.arctanh(np.clip(r, -0.999, 0.999)))
+
+
+def _inconsistent(held: float, ev: float, z: float, opt: dict) -> bool:
+    """Evaluation labels fit better than held-out training labels, or the opposite way round."""
+    weaker = ev >= opt["min_signal"] and ev - held >= opt["min_gap"] and z >= opt["z"]
+    backwards = held >= opt["min_signal"] and ev <= -opt["min_signal"] and z <= -opt["z"]
+    return weaker or backwards
+
+
+@check("poisoning.label_consistency", "poisoning", "warn",
+       "Training labels fit the features as well as evaluation labels",
+       z=3.0, min_gap=0.05, min_signal=0.1, min_rows=100)
+def label_consistency(v, opt):
+    """Fits one linear model on half of the training rows, then compares how well it predicts
+    the other half with how well it predicts each evaluation split. Corrupted training labels
+    weaken that relationship in train only, so evaluation labels fit better than held-out
+    training labels by at least `min_gap` and `z` standard errors. Also fires when the model
+    predicts evaluation labels backwards. Needs a binary or regression label and numeric
+    features that predict it (rank correlation of at least `min_signal`). Sees label noise
+    of about 15% and above on a few thousand rows, and targeted flips of a subgroup; not
+    small flip rates or a backdoor with a rare trigger."""
+    if not v.labels or len(v.splits) < 2:
+        return skipped("needs a label and at least two splits")
+    feats = v.numeric_features()
+    if not feats:
+        return skipped("no numeric features")
+    hits, compared = {}, []
+    for lbl in v.labels:
+        if lbl not in v.train.columns or v.task(lbl) == "multiclass":
+            continue
+        task = v.task(lbl)
+        train = v.sample(v.train_name)
+        y, ok, _ = prepare_label(train[lbl], task)
+        train, y = train[ok], y[ok]
+        if len(train) < 2 * opt["min_rows"]:
+            continue
+        stats = {f: robust_scale(numeric_values(train[f])) for f in feats}
+        stats = {f: (c if np.isfinite(c) else 0.0, s if np.isfinite(s) and s > 0 else 1.0)
+                 for f, (c, s) in stats.items()}
+        fit = np.random.default_rng(v.spec.seed).random(len(train)) < 0.5
+        x = _matrix(train, feats, stats)
+        coef = np.linalg.lstsq(x[fit], y[fit].astype(float), rcond=None)[0]
+        held = spearman(x[~fit] @ coef, y[~fit].astype(float))
+        n_held = int((~fit).sum())
+        for name, d in v.others():
+            if lbl not in d.columns:
+                continue
+            d = v.sample(name)
+            ye, oke, _ = prepare_label(d[lbl], task)
+            if oke.sum() < opt["min_rows"]:
+                continue
+            ev = spearman(_matrix(d[oke], feats, stats) @ coef, ye[oke].astype(float))
+            if np.isnan(ev) or np.isnan(held):
+                continue
+            compared.append(f"{lbl} {name}")
+            se = 1.03 * math.sqrt(1 / (n_held - 3) + 1 / (int(oke.sum()) - 3))
+            z = (_fisher(ev) - _fisher(held)) / se
+            if _inconsistent(held, ev, z, opt):
+                hits[f"{lbl} {name}"] = {"held_out_train": fmt(held), name: fmt(ev), "z": fmt(z)}
+    if not compared:
+        return skipped("needs a binary or regression label and enough rows in each split")
+    if hits:
+        return failed("labels fit the features differently in train and evaluation: " + ", ".join(
+            f"{k} (train {x['held_out_train']}, {k.split()[-1]} {x[k.split()[-1]]})"
+            for k, x in hits.items()),
+            "Training labels may be corrupted or flipped. Compare them with their source. A "
+            "real change in the data between splits can also cause this.", comparisons=hits)
+    return passed(f"training labels fit the features as well as evaluation labels "
+                  f"({len(compared)} comparison(s))")
 
 
 @check("drift.features", "drift", "warn", "Feature distributions are stable across splits",

@@ -9,6 +9,31 @@ import numpy as np
 import pandas as pd
 
 from ..core import check, failed, frac, passed, skipped
+from .splits import _ENTITY_NAME
+
+_MAX_REPEATS = 0.01  # share of repeated rows above which columns no longer tell rows apart
+
+
+def _without_keys(v, cols: tuple[str, ...], key_share: float, bits: int) -> tuple[str, ...]:
+    """Drop columns that act as row or entity keys, so that a copy under a new key still
+    matches. The columns stay when the rest cannot tell rows apart on their own."""
+    keys = set()
+    for c in cols:
+        s = v.train[c].dropna()
+        if s.empty:
+            continue
+        values = s.nunique()
+        share = values / len(s)
+        short_text = v.kind(c) == "string" and float(s.astype("string").str.len().mean()) <= 40
+        named_int = v.kind(c) == "int" and bool(_ENTITY_NAME.search(c))
+        if share >= 0.98 and v.kind(c) == "int" or \
+                values >= 50 and share >= key_share and (short_text or named_int):
+            keys.add(c)
+    rest = tuple(c for c in cols if c not in keys)
+    if not keys or not rest:
+        return cols
+    repeats = pd.Series(v.hashes(v.train_name, rest, True, bits)).duplicated().mean()
+    return rest if repeats <= _MAX_REPEATS else cols
 
 
 def _cross_group_rate(v, cols, near: bool, bits: int) -> float | None:
@@ -41,12 +66,15 @@ def _cross(v, opt, near: bool):
         feats = tuple(opt["columns"])
     cols = feats + (tuple(v.spec.labels) if opt.get("include_label") else ())
     cols = tuple(c for c in cols if v.has(c))
+    all_cols = cols
+    if near and not opt.get("columns"):
+        cols = _without_keys(v, cols, opt["key_share"], bits)
     pairs, worst = {}, 0.0
     for (a, _), (b, _) in combinations(v.splits.items(), 2):
         ha, hb = v.hashes(a, cols, near, bits), v.hashes(b, cols, near, bits)
         hit = np.isin(hb, ha)
         if near:  # report only what the exact check does not already see
-            hit &= ~np.isin(v.hashes(b, cols), v.hashes(a, cols))
+            hit &= ~np.isin(v.hashes(b, all_cols), v.hashes(a, all_cols))
         n = int(hit.sum())
         if n:
             worst = max(worst, n / len(hb))
@@ -95,12 +123,15 @@ def cross_split(v, opt):
 
 @check("duplicates.near_cross_split", "duplicates", "warn",
        "No near-copy of an example appears in two splits", max_fraction=0.0, bits=10,
-       baseline=True, ratio=2.0, columns=[])
+       baseline=True, ratio=2.0, columns=[], key_share=0.02)
 def near_cross_split(v, opt):
     """Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is
     about 3 significant digits) and normalising text (case, punctuation, spacing). Catches
     copies that went through a lossy round trip, re-encoding or light editing. Exact copies
-    are not counted again. Same group baseline as duplicates.cross_split."""
+    are not counted again. Same group baseline as duplicates.cross_split. Columns acting as
+    keys are left out, so a copy with a new id still matches: integers distinct on almost
+    every row, and short text or entity-named integers with at least 50 values, distinct on
+    at least `key_share` of rows. They stay when the other columns cannot tell rows apart."""
     return _cross(v, opt, near=True)
 
 

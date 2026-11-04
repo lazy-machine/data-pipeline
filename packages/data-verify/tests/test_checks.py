@@ -9,6 +9,7 @@ import pytest
 from conftest import bucket, time_split
 
 from data_verify import SpecError
+from data_verify.checks.poisoning import _inconsistent
 from data_verify.checks.target import _rounding_step, _standardized
 
 TIME = {"time": "date", "label_time": "label_date", "time_order": "train < test",
@@ -19,7 +20,8 @@ TIME = {"time": "date", "label_time": "label_date", "time_order": "train < test"
 
 
 def test_clean_group_split_passes(case, splits):
-    r = case.run(splits)
+    """The fixture has dates but a group split, so `time` is left undeclared on purpose."""
+    r = case.run(splits, {"checks": {"temporal.undeclared_time": "off"}})
     assert r["passed"], r["blocking"]
     assert r.failures() == [], [r.check(c)["message"] for c in r.failures()]
 
@@ -905,3 +907,195 @@ def test_assertion_quoting(case, splits):
         {"name": "dollar", "sql": "SELECT * FROM train WHERE '$$' <> '$$'"},
     ]})
     assert r.status("assert.spaced") == "pass" and r.status("assert.dollar") == "pass"
+
+
+# -- undeclared time ----------------------------------------------------------------------------
+
+
+def test_undeclared_date_column_warns(case, splits):
+    r = case.run(splits)
+    assert r.failed("temporal.undeclared_time")
+    assert r.check("temporal.undeclared_time")["details"]["columns"] == ["date", "label_date"]
+    assert r["passed"]  # a warning: the gate cannot know the rows depend on time
+
+
+def test_undeclared_date_written_as_text_warns(case, splits):
+    for d in splits.values():
+        d["date"] = d["date"].dt.strftime("%Y-%m-%d")
+        d["label_date"] = d["label_date"].dt.strftime("%d/%m/%Y")
+    r = case.run(splits)
+    assert r.check("temporal.undeclared_time")["details"]["columns"] == ["date", "label_date"]
+
+
+def test_declared_time_skips_the_undeclared_check(case, splits):
+    r = case.run(splits, {"time": "date"})
+    assert r.status("temporal.undeclared_time") == "skip"
+
+
+def test_data_without_dates_passes_the_undeclared_check(case, splits):
+    for d in splits.values():
+        d.drop(columns=["date", "label_date"], inplace=True)
+    r = case.run(splits, {"forbidden": []})
+    assert r.status("temporal.undeclared_time") == "pass"
+
+
+def test_few_distinct_dates_are_not_a_timeline(case, splits):
+    for d in splits.values():
+        d["date"] = pd.Timestamp("2024-01-01")
+        d["label_date"] = pd.Timestamp("2024-02-01")
+    assert not case.run(splits).failed("temporal.undeclared_time")
+
+
+def test_text_that_only_starts_with_digits_is_not_a_date(case, splits):
+    for d in splits.values():
+        d["date"] = [f"{i % 90}-item" for i in range(len(d))]
+        d["label_date"] = [f"code {i}" for i in range(len(d))]
+    assert not case.run(splits).failed("temporal.undeclared_time")
+
+
+# -- near-duplicates under a new key ------------------------------------------------------------
+
+LABEL_ONLY = {"id": [], "group": [], "weight": None, "features": "auto", "forbidden": [],
+              "checks": {"temporal.undeclared_time": "off"}}
+
+
+def _near_copies(splits, rows=100):
+    copies = splits["test"].head(rows).copy()
+    copies["row_id"] += 10**7
+    copies["customer"] = "N" + copies["row_id"].astype(str)
+    copies[["f1", "f2", "f3", "f4"]] *= 1 + 1e-5
+    splits["train"] = pd.concat([splits["train"], copies], ignore_index=True)
+    for d in splits.values():
+        d.drop(columns=["date", "label_date", "weight"], inplace=True)
+    return splits
+
+
+def test_near_copies_under_undeclared_keys_are_found(case, splits):
+    r = case.run(_near_copies(splits), LABEL_ONLY)
+    assert r.failed("duplicates.near_cross_split")
+
+
+def test_exact_copies_under_undeclared_keys_are_found_by_the_near_check(case, splits):
+    """Not the same on every column, so duplicates.cross_split can't see them either."""
+    copies = splits["test"].head(100).copy()
+    copies["row_id"] += 10**7
+    copies["customer"] = "N" + copies["row_id"].astype(str)
+    splits["train"] = pd.concat([splits["train"], copies], ignore_index=True)
+    for d in splits.values():
+        d.drop(columns=["date", "label_date", "weight"], inplace=True)
+    assert case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
+
+
+def test_undeclared_keys_stay_when_the_rest_cannot_tell_rows_apart(case, splits):
+    for d in splits.values():
+        d.drop(columns=["date", "label_date", "weight", "f1", "f2", "f3", "f4"], inplace=True)
+    assert not case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
+
+
+def test_clean_data_with_undeclared_keys_has_no_near_copies(case, splits):
+    for d in splits.values():
+        d.drop(columns=["date", "label_date", "weight"], inplace=True)
+    assert not case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
+
+
+def test_columns_option_is_not_second_guessed(case, splits):
+    r = case.run(_near_copies(splits), {**LABEL_ONLY, "checks": {
+        "temporal.undeclared_time": "off",
+        "duplicates.near_cross_split": {"columns": ["customer", "f1", "f2", "f3"]}}})
+    assert not r.failed("duplicates.near_cross_split")
+
+
+# -- label consistency --------------------------------------------------------------------------
+
+
+def _strong(splits):
+    """Labels the numeric features predict well, as a real target would be."""
+    rng = np.random.default_rng(1)
+    for d in splits.values():
+        z = d["f1"] * 1.5 - d["f2"] + rng.normal(0, 0.7, len(d))
+        d["y"] = (z > 0).astype("int64")
+    return splits
+
+
+def _flip(d, rows):
+    d.loc[rows, "y"] = 1 - d.loc[rows, "y"]
+
+
+def test_clean_labels_are_consistent(case, splits):
+    assert case.run(_strong(splits)).status("poisoning.label_consistency") == "pass"
+
+
+def test_random_label_flips_in_train_warn(case, splits):
+    splits = _strong(splits)
+    _flip(splits["train"], splits["train"].sample(frac=0.15, random_state=0).index)
+    r = case.run(splits)
+    assert r.failed("poisoning.label_consistency")
+    assert r["passed"]  # a warning: a real change between splits looks the same
+
+
+def test_targeted_flips_in_train_warn(case, splits):
+    splits = _strong(splits)
+    tr = splits["train"]
+    _flip(tr, tr[tr["f1"] > 0.5].sample(frac=0.6, random_state=0).index)
+    assert case.run(splits).failed("poisoning.label_consistency")
+
+
+def test_inverted_train_labels_warn(case, splits):
+    splits = _strong(splits)
+    splits["train"]["y"] = 1 - splits["train"]["y"]
+    assert case.run(splits).failed("poisoning.label_consistency")
+
+
+def test_noise_in_evaluation_labels_only_is_not_train_poisoning(case, splits):
+    splits = _strong(splits)
+    _flip(splits["test"], splits["test"].sample(frac=0.2, random_state=0).index)
+    assert not case.run(splits).failed("poisoning.label_consistency")
+
+
+def test_regression_label_flips_warn(case, splits):
+    rng = np.random.default_rng(2)
+    for d in splits.values():
+        d["y"] = d["f1"] * 2 + rng.normal(0, 1, len(d))
+    tr = splits["train"]
+    rows = tr.sample(frac=0.3, random_state=0).index
+    tr.loc[rows, "y"] = rng.permutation(tr.loc[rows, "y"].to_numpy())
+    assert case.run(splits, {"task": "regression"}).failed("poisoning.label_consistency")
+
+
+def test_features_without_signal_cannot_fail(case, splits):
+    rng = np.random.default_rng(3)
+    for d in splits.values():
+        d["y"] = rng.integers(0, 2, len(d))
+    assert case.run(splits).status("poisoning.label_consistency") == "pass"
+
+
+def test_multiclass_is_skipped_with_a_reason(case, splits):
+    for d in splits.values():
+        d["y"] = (d["f1"].rank(pct=True) * 3).astype("int64").clip(0, 2)
+    r = case.run(splits)
+    assert r.status("poisoning.label_consistency") == "skip"
+
+
+def test_small_splits_are_skipped(case, splits):
+    r = case.run({k: d.head(60) for k, d in splits.items()})
+    assert r.status("poisoning.label_consistency") == "skip"
+
+
+def test_small_train_split_is_skipped(case, splits):
+    splits["train"] = splits["train"].head(150)
+    assert case.run(_strong(splits)).status("poisoning.label_consistency") == "skip"
+
+
+@pytest.mark.parametrize("held, ev, z, expected", [
+    (0.30, 0.50, 4.0, True),     # evaluation labels fit better
+    (0.40, -0.40, -9.0, True),   # the model predicts evaluation labels backwards
+    (0.30, 0.50, 2.9, False),    # within noise
+    (0.46, 0.50, 4.0, False),    # significant but negligible
+    (0.00, 0.09, 4.0, False),    # the features predict too little to compare
+    (0.50, 0.30, -4.0, False),   # evaluation weaker than train is ordinary drift
+    (0.05, -0.40, -9.0, False),  # no relationship in train to reverse
+    (0.40, -0.05, -9.0, False),  # evaluation shows no relationship either way
+])
+def test_label_consistency_decision(held, ev, z, expected):
+    opt = {"z": 3.0, "min_gap": 0.05, "min_signal": 0.1}
+    assert _inconsistent(held, ev, z, opt) is expected

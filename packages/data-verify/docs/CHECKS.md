@@ -126,6 +126,12 @@ Options: `allow_equal = True`
 
 **Features were observed by the row's time.** Each column in params.point_in_time holds when a feature (or a joined record) was observed. It must not be after the row's params.time: a feature from the future is unavailable at prediction time.
 
+#### `temporal.undeclared_time` (warn)
+
+**Date-like columns are declared as params.time.** Runs when params.time is not set. Looks for date columns (dates, or text written as dates) with at least `min_distinct` values. Without params.time no temporal check runs, so a random split of time-dependent data looks fine. Declaring the column turns on the temporal checks; if the rows really don't depend on time, turn this check off.
+
+Options: `min_distinct = 20`
+
 ### duplicates
 
 #### `duplicates.cross_split` (error)
@@ -136,9 +142,9 @@ Options: `max_fraction = 0.0`, `include_label = False`, `baseline = True`, `rati
 
 #### `duplicates.near_cross_split` (warn)
 
-**No near-copy of an example appears in two splits.** Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is about 3 significant digits) and normalising text (case, punctuation, spacing). Catches copies that went through a lossy round trip, re-encoding or light editing. Exact copies are not counted again. Same group baseline as duplicates.cross_split.
+**No near-copy of an example appears in two splits.** Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is about 3 significant digits) and normalising text (case, punctuation, spacing). Catches copies that went through a lossy round trip, re-encoding or light editing. Exact copies are not counted again. Same group baseline as duplicates.cross_split. Columns acting as keys are left out, so a copy with a new id still matches: integers distinct on almost every row, and short text or entity-named integers with at least 50 values, distinct on at least `key_share` of rows. They stay when the other columns cannot tell rows apart.
 
-Options: `max_fraction = 0.0`, `bits = 10`, `baseline = True`, `ratio = 2.0`, `columns = []`
+Options: `max_fraction = 0.0`, `bits = 10`, `baseline = True`, `ratio = 2.0`, `columns = []`, `key_share = 0.02`
 
 #### `duplicates.text_cross_split` (error)
 
@@ -265,6 +271,12 @@ Options: `z = 20.0`, `ratio = 3.0`, `slack = 0.005`
 **No rare value or token ties to one class in training only.** Backdoor search. For each classification label, looks for feature values (categories, small-integer values, and words in text columns) that occur in at most `max_coverage` of training rows, at least `min_support` times, and come with one class in at least `purity` of them, while the same value in evaluation splits (at least `min_eval_support` rows) is tied to that class at least `min_drop` less often, or is (nearly) absent from them although their size predicts it there (so few rows has a Poisson chance below 0.001). Such a trigger in train that does not hold elsewhere is what a backdoor (trigger + target label) poisoning attack leaves behind.
 
 Options: `min_support = 20`, `purity = 0.98`, `max_coverage = 0.2`, `min_drop = 0.3`, `min_eval_support = 5`
+
+#### `poisoning.label_consistency` (warn)
+
+**Training labels fit the features as well as evaluation labels.** Fits one linear model on half of the training rows, then compares how well it predicts the other half with how well it predicts each evaluation split. Corrupted training labels weaken that relationship in train only, so evaluation labels fit better than held-out training labels by at least `min_gap` and `z` standard errors. Also fires when the model predicts evaluation labels backwards. Needs a binary or regression label and numeric features that predict it (rank correlation of at least `min_signal`). Sees label noise of about 15% and above on a few thousand rows, and targeted flips of a subgroup; not small flip rates or a backdoor with a rare trigger.
+
+Options: `z = 3.0`, `min_gap = 0.05`, `min_signal = 0.1`, `min_rows = 100`
 
 ### drift
 
