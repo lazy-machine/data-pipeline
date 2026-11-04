@@ -12,7 +12,7 @@ from . import __version__
 from .reference import (
     TEMPLATE, checks_json, checks_markdown, checks_text, params_markdown, params_text,
 )
-from .spec import SpecError
+from .spec import SpecError, split_input_names
 from .step import console_lines, failure_message, prepare_outputs, run, write_outputs
 
 USAGE = """\
@@ -20,7 +20,7 @@ data-verify: leakage and poisoning gate for data-pipeline projects
 
   data-verify run pipeline.toml [--step NAME]   run a data-verify step of a pipeline file
   data-verify run verify.toml                   run a standalone config (inputs/outputs/params)
-  data-verify lint [pipeline.toml] [--step N]   validate params before anything runs
+  data-verify lint [pipeline.toml] [--step N]   validate params, and that splits pass the gate
   data-verify explain REPORT.json [--all]       show what failed and how to fix it
   data-verify checks [--json | --markdown]      every check, its severity and options
   data-verify params [--markdown]               every params key
@@ -97,10 +97,57 @@ def cmd_run(args) -> int:
     return 0
 
 
+def _overlap(a: Path, b: Path) -> bool:
+    return a.is_relative_to(b) or b.is_relative_to(a)
+
+
+def _ungated_steps(path: Path, gate_name: str | None, params, inputs, workdir) -> list[str]:
+    """One line for each step that reads a split the gate checks but can run without it.
+
+    Steps upstream of the gate are left out: they can't depend on it, and what they read
+    isn't the data the model sees until the gate has run.
+    """
+    steps = tomllib.loads(path.read_text()).get("steps")
+    if not steps:
+        return []  # a standalone config has no other steps
+    gates = [s for s in steps if s.get("function") == "data_verify:verify"]
+    gate = next(s for s in gates if gate_name in (None, s.get("name")))
+
+    def paths(step, key):
+        return [(workdir / p).resolve() for p in step.get(key, {}).values()]
+
+    def ancestors(step) -> set[str]:
+        seen: set[str] = set()
+        queue = [step]
+        while queue:
+            current = queue.pop()
+            reads = paths(current, "inputs")
+            for other in steps:
+                name = other.get("name")
+                wrote = any(_overlap(i, o) for i in reads for o in paths(other, "outputs"))
+                if (wrote or name in current.get("depends_on", [])) and name not in seen:
+                    seen.add(name)
+                    queue.append(other)
+        return seen
+
+    split_files = [inputs[n] for n in split_input_names(params, inputs)]
+    before_gate = ancestors(gate)
+    found = []
+    for step in steps:
+        if step in gates or step.get("name") in before_gate:
+            continue
+        read = [f for f in split_files if any(_overlap(f, i) for i in paths(step, "inputs"))]
+        if read and gate.get("name") not in ancestors(step):
+            where = read[0].relative_to(workdir) if read[0].is_relative_to(workdir) else read[0]
+            found.append(f"step '{step.get('name')}' reads {where} without the gate: add "
+                         f"depends_on = [\"{gate.get('name')}\"]")
+    return found
+
+
 def cmd_lint(args) -> int:
     from .core import REGISTRY
     from .spec import check_structure, parse
-    params, inputs, _, _, _ = _load_target(Path(args.config), args.step, need_inputs=False)
+    params, inputs, _, workdir, _ = _load_target(Path(args.config), args.step, need_inputs=False)
     missing = sorted(k for k, p in inputs.items() if not p.exists())
     if missing:
         check_structure(params, REGISTRY)
@@ -109,7 +156,10 @@ def cmd_lint(args) -> int:
     else:
         parse(params, inputs, REGISTRY)
         print("params OK (fully resolved against the inputs)")
-    return 0
+    ungated = _ungated_steps(Path(args.config), args.step, params, inputs, workdir)
+    for line in ungated:
+        print(f"x {line}")
+    return 1 if ungated else 0
 
 
 def cmd_explain(args) -> int:

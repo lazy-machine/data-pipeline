@@ -26,7 +26,8 @@ Keep these four facts in mind and the rest of the guide follows from them:
    are skipped.
 5. **Models only see data that passed the gate.** The `verify` step (data-verify) checks
    the splits for leakage and poisoning, and every training and evaluation step depends on
-   it (§7).
+   it (§7). Passing means no check blocked, not that the data is clean: poisoning mostly
+   warns, and some faults are invisible to it.
 
 ```
 pipeline.toml ─► orchestrator ─► for each step, in order:
@@ -383,8 +384,10 @@ depends_on = ["verify"]        # nothing trains on data the gate has not passed
 # ...
 ```
 
-`uv run data-verify template` prints a commented version of this block, and `uv run
-data-verify lint` checks its params without running anything.
+`uv run data-verify template` prints a commented version of this block. `uv run data-verify
+lint` checks its params without running anything, and fails if a step reads a split without
+depending on the gate. The runner can't tell which step is a model, so nothing else
+enforces this.
 
 ### Rules
 
@@ -424,8 +427,11 @@ uv run data-verify explain build/verify/report.json
    # identical sensor readings across machines are normal`. Turning a check `"off"` is a
    last resort, and setting `critical = false` on the gate is never the fix.
 
-Warnings (drift, near-duplicates, suspicious names) don't block, but they show up on the
-status line (`warnings=1`). Read them before you trust a result.
+Warnings (drift, near-duplicates, suspicious names, most poisoning signs) don't block, but
+the status line names them (`warnings=1 warned=drift.features`), and the report explains
+them. Read them before you trust a result. A project that would rather stop can raise them:
+`checks = { "poisoning.*" = "error" }`, or `fail_on = "warn"` for every warning. Expect false
+alarms on heavy-tailed data.
 
 ---
 
@@ -539,7 +545,7 @@ data-pipeline -r train -r evaluate  # several
 data-pipeline -o eda report         # run only these steps (their inputs must exist)
 data-pipeline -f                    # rerun everything
 data-verify explain build/verify/report.json   # why the gate blocked, with details
-data-verify lint                    # check the gate's params without running anything
+data-verify lint                    # check the gate's params, and that splits pass through it
 ```
 
 (Run these from the project folder, prefixed with `uv run` if the virtual environment isn't

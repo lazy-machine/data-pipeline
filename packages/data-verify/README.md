@@ -2,12 +2,15 @@
 
 A gate step for [data-pipeline](../../README.md) projects, shipped in the same repository
 (a uv workspace member). It reads the data your pipeline
-produced (the train/val/test splits, plus any source or auxiliary tables) and stops the
-pipeline when it finds:
+produced (the train/val/test splits, plus any source or auxiliary tables) and looks for:
 
 - **Data leakage**: anything that lets a model see the answers, or the future, of what it
   is scored on.
 - **Poisoning**: tampered, injected or corrupted training data.
+
+It stops the pipeline on what it can prove, which is most structural leakage once your
+columns are declared. Most poisoning signs only warn, because a statistic rarely proves
+tampering. See [What it cannot see](#what-it-cannot-see).
 
 Every check, passed or not, goes into a JSON report. Steps that `depends_on = ["verify"]`
 never run on data that failed the gate:
@@ -71,7 +74,9 @@ depends_on = ["verify"]        # nothing trains on data the gate has not passed
 
 **3. Check the params** with `data-verify lint`. It validates every data-verify step in
 `./pipeline.toml` without running anything. (The step itself only sees its params when its
-turn comes, after the upstream steps ran.)
+turn comes, after the upstream steps ran.) It also exits 1 if a step reads a split without
+the gate upstream of it, directly or through other steps. Steps that feed the gate, and
+steps that read only `source`, are allowed.
 
 ### Declare every role that exists in your data
 
@@ -124,7 +129,7 @@ step fails, so you can always read why it blocked.
 ### Result
 
 **All blocking checks pass.** The step succeeds; the status line shows
-`checks=… passed=… warnings=… skipped=…`.
+`checks=… passed=… warnings=… skipped=…`, plus `warned=…` naming up to three warnings.
 
 **A blocking check fails.** The step raises `VerificationFailed` with each failure and its
 fix. data-pipeline marks the step failed, prints that message, and halts (the step is
@@ -379,6 +384,24 @@ A **custom check** is a function that takes the verifier and calls
 `v.splits`, `v.train`, `v.dataset(name)`, `v.sql(query)`, `v.var(name)`, `v.features` and
 `v.labels`. Put the check's file in the step's `watch` list so editing it reruns the gate.
 
+## What it cannot see
+
+A pass means that no blocking check fired, not that the data is clean.
+
+- **Undeclared roles.** Without `group` or `time`, leaks across entities or across time at
+  most warn. With `label` alone, a grouped dataset split by row passes with a warning.
+- **Poisoning.** Random or targeted label flips, and a backdoor with a rare trigger, can look
+  like ordinary noise. Other injected values and rows mostly warn. `schema.ranges`,
+  `schema.allowed` and `pins` block, so declare them when you know the valid values.
+- **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
+  0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
+- **Preprocessing that leaves no signature.** Standardisation and min-max scaling fitted on
+  evaluation rows are detected. Target encoding and imputation fitted on them are not.
+
+To be stricter, set `checks = { "poisoning.*" = "error" }`, or `fail_on = "warn"` to block on
+every warning. Expect false alarms on heavy-tailed data. Fit preprocessing inside a
+pipeline after the split, since the gate can't confirm that from the data.
+
 ## What it checks
 
 51 built-in checks. `data-verify checks` lists them with their options, and
@@ -478,7 +501,7 @@ Declare `group`, `time` and `label_time` whenever they exist.
 ```
 data-verify run pipeline.toml [--step NAME]   run a data-verify step without the orchestrator
 data-verify run verify.toml                   standalone config: [inputs] [outputs] [params]
-data-verify lint [pipeline.toml] [--step N]   validate params without running anything
+data-verify lint [pipeline.toml] [--step N]   validate params, and that splits pass the gate
 data-verify explain REPORT.json [--all]       failed checks, details and fixes
 data-verify checks [--json | --markdown]      every check, severity and options
 data-verify params [--markdown]               every params key

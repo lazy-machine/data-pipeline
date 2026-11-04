@@ -281,6 +281,22 @@ def is_data_input(path: Path) -> bool:
     return path.is_dir() or path.suffix.lower() in TABULAR_SUFFIXES
 
 
+def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[str]:
+    """The inputs holding split data, without reading them. Follows the layout rules of
+    ``parse`` but never raises: this also runs before the inputs exist."""
+    source = params.get("source")
+    data = [n for n, path in inputs.items() if is_data_input(path) and n not in ("spec", source)]
+    splits = params.get("splits")
+    if params.get("split_column"):
+        table = params.get("table")
+        return [table] if table in inputs else data
+    if isinstance(splits, dict) and "from" not in splits:
+        return [n for n in splits.values() if n in inputs]
+    if isinstance(splits, list):
+        return [n for n in splits if n in inputs]
+    return [n for n in data if n.lower() in SPLIT_RANKS] or data
+
+
 def _option_type(default: Any) -> str:
     if isinstance(default, bool):
         return "true or false"

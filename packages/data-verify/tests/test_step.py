@@ -6,11 +6,14 @@ import json
 import subprocess
 import sys
 import textwrap
+import tomllib
 from pathlib import Path
 
 import pytest
 
+import data_verify
 from data_verify.cli import main
+from data_verify.step import _named
 
 PREP = '''
 import sys
@@ -206,3 +209,138 @@ def test_cli_run_contract(tmp_path, splits, capsys):
     assert main(["run", str(pipe), "--step", "split"]) == 2
     assert "not a data-verify step" in capsys.readouterr().err
     assert main(["run", str(pipe), "--step", "verify"]) == 0
+
+
+# -- lint: nothing reads a split without the gate ---------------------------------------------
+
+def _lint_project(root: Path, edit=lambda text: text) -> Path:
+    project = make_project(root, leak=False)
+    toml = project / "pipeline.toml"
+    toml.write_text(edit(toml.read_text()))
+    return toml
+
+
+def _ungated(text: str) -> str:
+    return text.replace('depends_on = ["verify"]\n', "")
+
+
+def test_lint_flags_a_step_reading_a_split_without_the_gate(tmp_path, capsys):
+    toml = _lint_project(tmp_path / "p", _ungated)
+    assert main(["lint", str(toml)]) == 1
+    out = capsys.readouterr().out
+    assert "step 'train' reads build/train.parquet without the gate" in out
+    assert 'add depends_on = ["verify"]' in out
+
+
+def test_lint_accepts_the_gate_reached_through_another_step(tmp_path):
+    toml = _lint_project(tmp_path / "p", lambda t: _ungated(t).replace(
+        'inputs = { train = "build/train.parquet" }\noutputs = { model = "build/model.txt" }',
+        'inputs = { train = "build/train.parquet", m = "build/marker.txt" }\n'
+        'outputs = { model = "build/model.txt" }') + """
+[[steps]]
+name = "after_gate"
+function = "prep:train"
+outputs = { model = "build/marker.txt" }
+depends_on = ["verify"]
+""")
+    assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_allows_steps_that_feed_the_gate_or_read_only_the_source(tmp_path):
+    toml = _lint_project(tmp_path / "p", lambda t: t.replace(
+        'test = "build/test.parquet" }\noutputs = { report',
+        'test = "build/test.parquet", stats = "build/stats.json" }\noutputs = { report') + """
+[[steps]]
+name = "overview"
+function = "prep:train"
+inputs = { raw = "build/source.parquet" }
+outputs = { model = "build/overview.txt" }
+
+[[steps]]
+name = "stats"
+function = "prep:train"
+inputs = { train = "build/train.parquet" }
+outputs = { model = "build/stats.json" }
+""")
+    assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_covers_a_table_holding_every_split(tmp_path, capsys):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { rows = "build/rows.parquet", extra = "build/source.parquet" }
+params = { label = "y", split_column = "split", table = "rows", splits = ["train", "test"] }
+
+[[steps]]
+name = "train"
+function = "m:f"
+inputs = { rows = "build/rows.parquet" }
+outputs = { model = "build/model.txt" }
+
+[[steps]]
+name = "side"
+function = "m:f"
+inputs = { extra = "build/source.parquet" }
+outputs = { o = "build/o.txt" }
+""")
+    assert main(["lint", str(toml)]) == 1
+    out = capsys.readouterr().out
+    assert "'train' reads build/rows.parquet" in out and "'side'" not in out
+
+
+def test_lint_follows_a_directory_input(tmp_path, capsys):
+    toml = _lint_project(tmp_path / "p", lambda t: _ungated(t)
+                         .replace('"build/train.parquet"', '"build/splits/train.parquet"')
+                         .replace('"build/val.parquet"', '"build/splits/val.parquet"')
+                         .replace('"build/test.parquet"', '"build/splits/test.parquet"')
+                         .replace('inputs = { train = "build/splits/train.parquet" }\n'
+                                  'outputs = { model',
+                                  'inputs = { every = "build/splits" }\noutputs = { model'))
+    assert main(["lint", str(toml)]) == 1
+    assert "'train' reads" in capsys.readouterr().out
+
+
+def test_lint_skips_the_step_check_for_a_standalone_config(tmp_path, capsys):
+    cfg = tmp_path / "verify.toml"
+    cfg.write_text('inputs = { train = "t.csv", test = "u.csv" }\nparams = { label = "y" }\n')
+    assert main(["lint", str(cfg)]) == 0
+
+
+# -- status line ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("ids, shown", [
+    (["a"], "a"),
+    (["a", "b", "c"], "a,b,c"),
+    (["a", "b", "c", "d", "e"], "a,b,c,+2"),
+])
+def test_warning_names_are_capped(ids, shown):
+    assert _named(ids) == shown
+
+
+def test_status_line_names_the_warnings(tmp_path):
+    root = make_project(tmp_path / "w", leak=False)
+    prep = root / "steps" / "prep.py"
+    prep.write_text(prep.read_text().replace(
+        '    for name, df in frames.items():\n',
+        '    for name, df in frames.items():\n        df["f4"] = 1.0\n'))
+    res = run_pipeline(root)
+    assert res.returncode == 0, res.stdout
+    line = next(ln for ln in res.stdout.splitlines() if "verify" in ln and "checks=" in ln)
+    assert "warned=features.constant" in line
+
+
+def test_status_line_has_no_warned_key_without_warnings(tmp_path):
+    root = make_project(tmp_path / "c", leak=False)
+    res = run_pipeline(root)
+    assert "warnings=0" in res.stdout and "warned=" not in res.stdout
+
+
+# -- versions ---------------------------------------------------------------------------------
+
+def test_package_version_matches_the_code():
+    """The runner fingerprints the distribution version, and __version__ reaches reports."""
+    pyproject = Path(__file__).parent.parent / "pyproject.toml"
+    assert tomllib.loads(pyproject.read_text())["project"]["version"] == data_verify.__version__

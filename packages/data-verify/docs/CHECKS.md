@@ -204,7 +204,7 @@ Options: `min_unique = 0.98`
 
 #### `preprocessing.global_scaling` (error)
 
-**Scalers were fitted on the training split only.** Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over train plus evaluation rows together while the training rows alone are not: the scaler was fitted on data the model is later scored on. Every union of splits that contains train is tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the signature, so it is also tested without repeated rows and, when params.source is set, on the rows found in the source only.
+**Scalers were fitted on the training split only.** Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over train plus evaluation rows together while the training rows alone are not: the scaler was fitted on data the model is later scored on. Every union of splits that contains train is tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the signature, so it is also tested without repeated rows and, when params.source is set, on the rows found in the source only. On large data a match must also be far closer than sampling noise, so data that is already roughly standard is not mistaken for scaled.
 
 Options: `tol_mean = 0.0001`, `tol_std = 0.001`
 

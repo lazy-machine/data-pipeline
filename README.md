@@ -12,8 +12,11 @@ A thin orchestrator walks the steps one at a time. For every step it:
    fresh interpreter, so steps share no memory, globals or loaded modules.
 4. **Verifies and records** the outputs, then prints a one-line status.
 
-Before any model runs, a **data gate** checks the splits for leakage and poisoning and
-halts the pipeline if it finds any. The gate is an ordinary step,
+Before any model runs, a **data gate** checks the splits. It halts the pipeline on the
+leaks it can prove, such as rows or entities shared between splits, and warns about signs
+of poisoning, which it can rarely prove. It only sees what you declare, and
+[some faults it can't see](packages/data-verify/README.md#what-it-cannot-see). The gate is an
+ordinary step,
 [data-verify](packages/data-verify/README.md) (`function = "data_verify:verify"`), shipped in
 this repository as a second package so that the runner itself stays dependency-free.
 
@@ -25,7 +28,7 @@ and the pipeline keeps going (their dependents get skipped). A critical failure 
 ▶ iris · 7 steps · examples/iris/pipeline.toml
 [1/7] clean     ↷ cached            rows=149 dropped=1 classes=3
 [2/7] split     ↷ cached            train=111 test=38
-[3/7] verify    ↷ cached            checks=27 passed=26 warnings=1 skipped=24
+[3/7] verify    ↷ cached            checks=27 passed=26 warnings=1 skipped=24 warned=drift.features
 [4/7] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
 ┌─ eda: exit code 1 ─ analysis:explore
 Traceback (most recent call last):

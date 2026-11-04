@@ -8,6 +8,8 @@ import pandas as pd
 import pytest
 from conftest import bucket, time_split
 
+from data_verify.checks.target import _standardized
+
 TIME = {"time": "date", "label_time": "label_date", "time_order": "train < test",
         "time_bounds": {"train": {"max": "2023-03-31"}, "test": {"min": "2023-05-01"}}}
 
@@ -336,6 +338,31 @@ def test_train_only_standardisation_passes(case, splits):
     for d in splits.values():
         d[["f1", "f2", "f3", "f4"]] = (d[["f1", "f2", "f3", "f4"]] - mu) / sd
     assert not case.run(splits).failed("preprocessing.global_scaling")
+
+
+def test_chance_near_standard_data_is_not_scaling():
+    """Roughly standard data misses mean 0 and std 1 by its sampling noise. At this size
+    that noise is inside the option defaults, so they alone would call it scaled."""
+    n = 200_000
+    tol = dict(tol_mean=1e-4, tol_std=1e-3)
+    mean, std = 5e-5, 1 + 5e-4  # well within the noise of N(0, 1) at this size
+    assert not _standardized(n, mean * n, (std**2 + mean**2) * n, **tol)
+
+
+@pytest.mark.parametrize("rows", [300, 200_000, 2_000_000])
+@pytest.mark.parametrize("decimals", [None, 3])
+def test_scaled_data_is_still_recognised_at_any_size(rows, decimals):
+    x = np.random.default_rng(0).normal(5, 3, rows)
+    x = (x - x.mean()) / x.std()
+    if decimals is not None:  # a CSV keeps only so many digits
+        x = np.round(x, decimals)
+    assert _standardized(len(x), x.sum(), (x**2).sum(), tol_mean=1e-4, tol_std=1e-3)
+
+
+def test_float32_scaled_data_is_still_recognised():
+    x = np.random.default_rng(0).normal(5, 3, 2_000_000)
+    x = ((x - x.mean()) / x.std()).astype("float32").astype("float64")
+    assert _standardized(len(x), x.sum(), (x**2).sum(), tol_mean=1e-4, tol_std=1e-3)
 
 
 def test_global_minmax_on_train_plus_val(case, splits):

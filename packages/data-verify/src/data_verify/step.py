@@ -318,6 +318,12 @@ def prepare_outputs(outputs: dict[str, Path]) -> None:
         p.unlink(missing_ok=True)
 
 
+def _named(ids: list[str], limit: int = 3) -> str:
+    """Warning ids for the status line: a bare count looks like an ordinary success."""
+    extra = len(ids) - limit
+    return ",".join(ids[:limit]) + (f",+{extra}" if extra > 0 else "")
+
+
 def verify(ctx) -> dict[str, Any]:
     """data-pipeline step: verify the step's inputs, write `report` (JSON) and `summary`
     (Markdown) if declared, and raise VerificationFailed when a blocking check fails."""
@@ -337,5 +343,8 @@ def verify(ctx) -> dict[str, Any]:
         where = _rel(outputs["report"], getattr(ctx, "workdir", None)) if "report" in outputs \
             else None
         raise VerificationFailed(failure_message(report, where))
-    return {"checks": c["pass"] + c["fail"] + c["error"], "passed": c["pass"],
-            "warnings": len(report["warnings"]), "skipped": c["skip"]}
+    summary = {"checks": c["pass"] + c["fail"] + c["error"], "passed": c["pass"],
+               "warnings": len(report["warnings"]), "skipped": c["skip"]}
+    if report["warnings"]:
+        summary["warned"] = _named(report["warnings"])
+    return summary

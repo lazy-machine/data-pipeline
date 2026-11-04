@@ -257,6 +257,9 @@ def _short_text(s: pd.Series) -> bool:
 
 # -- preprocessing leakage -----------------------------------------------------------------
 
+_CHANCE_MARGIN = 0.003  # fraction of the sampling noise a match must beat to count as scaled
+
+
 def _moments(x: np.ndarray):
     x = x[~np.isnan(x)]
     return len(x), float(x.sum()), float((x ** 2).sum()), \
@@ -264,8 +267,16 @@ def _moments(x: np.ndarray):
 
 
 def _standardized(n, s, ss, tol_mean, tol_std):
+    """Mean 0 and std 1 within tolerance, and too exactly to be chance at this row count.
+
+    A scaler leaves only rounding error. Unscaled data that is roughly standard already
+    misses by its sampling noise, about 1/sqrt(n) for the mean and 1/sqrt(2n) for the std,
+    which falls inside any fixed tolerance once there are enough rows.
+    """
     if n < 3:
         return False
+    tol_mean = min(tol_mean, _CHANCE_MARGIN / np.sqrt(n))
+    tol_std = min(tol_std, _CHANCE_MARGIN / np.sqrt(2 * n))
     mean = s / n
     var0 = max(ss / n - mean ** 2, 0.0)
     var1 = var0 * n / (n - 1)
@@ -292,7 +303,8 @@ def global_scaling(v, opt):
     fitted on data the model is later scored on. Every union of splits that contains train is
     tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the
     signature, so it is also tested without repeated rows and, when params.source is set,
-    on the rows found in the source only."""
+    on the rows found in the source only. On large data a match must also be far closer
+    than sampling noise, so data that is already roughly standard is not mistaken for scaled."""
     if len(v.splits) < 2:
         return skipped("one split only")
     names = list(v.splits)
