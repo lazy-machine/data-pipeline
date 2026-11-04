@@ -442,6 +442,8 @@ status line (`warnings=1`). Read them before you trust a result.
 | a file listed in `watch` (data, SQL, templates, dynamic imports) | that step reruns (`code changed`) |
 | delete or edit an output | that step reruns (`output missing` / `output modified`) |
 | upgrade a step package whose `__version__` changed (e.g. data-verify) | its steps rerun (`code changed`) |
+| upgrade a package listed in the step's `requires` | that step reruns (`packages changed: duckdb 1.5.0 → 2.0.0`) |
+| a variable listed in the step's `env` | that step reruns (`env changed: <name>`) |
 | edit an installed step package without bumping its version | nothing; use `-r STEP` (§11) |
 | the `description` or `critical` flag | nothing; these don't affect results |
 | file timestamps only (`touch`) | nothing; caching compares content |
@@ -500,6 +502,10 @@ uv run data-pipeline -r fetch_prices          # rerun only that step (later step
 ```
 
 Or give it a parameter that you change on purpose, such as `params = { snapshot = "2026-10" }`.
+
+Environment variables are ignored unless declared. List the ones that change a step's
+results in `env`, such as `env = ["API_REGION"]`, and leave out those that only affect
+resources, such as a thread count. Only a hash of the value is stored in the checkpoint.
 
 ### Resetting
 

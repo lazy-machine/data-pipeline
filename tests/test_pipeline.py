@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from data_pipeline import config
+from data_pipeline import checkpoint, config
 from data_pipeline.cli import main
 from data_pipeline.orchestrator import Orchestrator
 from data_pipeline.report import Reporter
@@ -390,6 +390,7 @@ def test_dependency_order_inferred_from_files(tmp_path):
      "dependency cycle"),
     ('[[steps]]\nname = "a"\nfunction = "m:f"\noutputs = {o = "x"}\n'
      '[[steps]]\nname = "b"\nfunction = "m:f"\noutputs = {o = "x"}\n', "produced by both"),
+    ('[[steps]]\nname = "a"\nfunction = "m:f"\nenv = "X"\n', "env must be a list of strings"),
 ])
 def test_config_validation(tmp_path, steps, msg):
     cfg = make(tmp_path, steps)
@@ -830,3 +831,118 @@ outputs = { dst = "out/o.txt" }
     result, _ = run(cfg)
     assert result.halted_by == "a"
     assert result.outcomes["a"].detail == "worker exited without reporting a result"
+
+
+# -- package versions and declared environment variables ------------------------------------
+
+PINNED = """
+[[steps]]
+name = "a"
+function = "fns:copy"
+inputs = { src = "in.txt" }
+outputs = { dst = "out/o.txt" }
+requires = ["packaging>=20", "pytest"]
+env = ["DP_TEST_SECRET"]
+"""
+
+
+def fake_versions(monkeypatch, **versions):
+    real = checkpoint.installed_version
+    monkeypatch.setattr(checkpoint, "installed_version",
+                        lambda name: versions.get(name) or real(name))
+
+
+def state_of(tmp_path: Path) -> dict:
+    return json.loads((tmp_path / ".pipeline" / "state.json").read_text())
+
+
+def test_package_version_change_reruns(tmp_path, monkeypatch):
+    cfg = make(tmp_path, PINNED)
+    fake_versions(monkeypatch, packaging="1.0")
+    run(cfg)
+    result, _ = run(cfg)
+    assert statuses(result) == {"a": "cached"}
+
+    fake_versions(monkeypatch, packaging="2.0")
+    result, _ = run(cfg, dry_run=True)
+    assert result.outcomes["a"].detail == "packages changed: packaging 1.0 → 2.0"
+    result, _ = run(cfg)
+    assert result.outcomes["a"].reason == "packages changed: packaging 1.0 → 2.0"
+
+
+def test_many_package_changes_are_shortened(tmp_path, monkeypatch):
+    cfg = make(tmp_path, PINNED.replace('["packaging>=20", "pytest"]', '["p1", "p2", "p3", "p4"]'))
+    versions = {f"p{i}": "1" for i in range(1, 5)}
+    monkeypatch.setattr(checkpoint, "installed_version", lambda name: versions[name])
+    monkeypatch.setattr("data_pipeline.orchestrator._check_requirement", lambda spec: None)
+    run(cfg)
+    versions.update({k: "2" for k in versions})
+    result, _ = run(cfg)
+    assert result.outcomes["a"].reason == "packages changed: p1 1 → 2, p2 1 → 2, p3 1 → 2, …"
+
+
+def test_adding_a_requirement_reruns_and_names_it(tmp_path):
+    cfg = make(tmp_path, PINNED.replace('"pytest"', '"packaging"'))
+    run(cfg)
+    cfg.write_text(cfg.read_text().replace('["packaging>=20", "packaging"]',
+                                           '["packaging>=20", "pytest"]'))
+    result, _ = run(cfg)
+    assert result.outcomes["a"].reason.startswith("packages changed: pytest none → ")
+
+
+def test_import_name_is_recorded_as_import_only(tmp_path):
+    cfg = make(tmp_path, PINNED.replace('"pytest"', '"sqlite3"'))
+    run(cfg)
+    assert state_of(tmp_path)["steps"]["a"]["packages"]["sqlite3"] == "import-only"
+
+
+def test_env_change_reruns_and_value_not_stored(tmp_path, monkeypatch):
+    monkeypatch.setenv("DP_TEST_SECRET", "s3cr3t")
+    cfg = make(tmp_path, PINNED)
+    run(cfg)
+    result, _ = run(cfg)
+    assert statuses(result) == {"a": "cached"}
+
+    monkeypatch.setenv("DP_TEST_SECRET", "other")
+    result, _ = run(cfg)
+    assert result.outcomes["a"].reason == "env changed: DP_TEST_SECRET"
+    state = (tmp_path / ".pipeline" / "state.json").read_text()
+    assert "s3cr3t" not in state and "other" not in state
+
+    monkeypatch.delenv("DP_TEST_SECRET")
+    result, _ = run(cfg)
+    assert result.outcomes["a"].reason == "env changed: DP_TEST_SECRET"
+    assert state_of(tmp_path)["steps"]["a"]["env"]["DP_TEST_SECRET"] == "unset"
+
+
+def test_empty_env_var_is_not_the_same_as_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("DP_TEST_SECRET", raising=False)
+    cfg = make(tmp_path, PINNED)
+    run(cfg)
+    monkeypatch.setenv("DP_TEST_SECRET", "")
+    result, _ = run(cfg)
+    assert result.outcomes["a"].reason == "env changed: DP_TEST_SECRET"
+
+
+def test_undeclared_env_is_ignored(tmp_path, monkeypatch):
+    cfg = make(tmp_path, PINNED)
+    monkeypatch.setenv("DP_TEST_OTHER", "1")
+    run(cfg)
+    monkeypatch.setenv("DP_TEST_OTHER", "2")
+    result, _ = run(cfg)
+    assert statuses(result) == {"a": "cached"}
+
+
+@pytest.mark.parametrize("key", ["packages", "env"])
+def test_old_checkpoint_without_packages_or_env_is_backfilled(tmp_path, monkeypatch, key):
+    monkeypatch.setenv("DP_TEST_SECRET", "s3cr3t")
+    cfg = make(tmp_path, PINNED)
+    run(cfg)
+    path = tmp_path / ".pipeline" / "state.json"
+    state = json.loads(path.read_text())
+    expected = state["steps"]["a"].pop(key)
+    path.write_text(json.dumps(state))
+
+    result, _ = run(cfg)
+    assert statuses(result) == {"a": "cached"}
+    assert state_of(tmp_path)["steps"]["a"][key] == expected
