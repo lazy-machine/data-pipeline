@@ -1,7 +1,11 @@
 import io
 import json
 import os
+import signal
+import subprocess
+import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -49,6 +53,43 @@ def hello(ctx):
 def start_then_hang(ctx):
     print("started", flush=True)
     time.sleep(10)
+
+def gate(ctx):
+    if "BAD" in ctx.inputs["src"].read_text():
+        raise RuntimeError("gate blocked")
+    ctx.outputs["report"].write_text("ok")
+
+def make_dir(ctx):
+    ctx.outputs["d"].mkdir(exist_ok=True)
+    (ctx.outputs["d"] / "a.txt").write_text(ctx.params["v"])
+
+def read_dir(ctx):
+    files = sorted(ctx.inputs["d"].glob("*"))
+    ctx.outputs["o"].write_text("".join(f.read_text() for f in files))
+
+def write_param(ctx):
+    ctx.outputs["o"].write_text(ctx.params["v"])
+
+def edit_input_then_read(ctx):
+    ctx.inputs["src"].write_text("edited during the run")
+    ctx.outputs["dst"].write_text(ctx.inputs["src"].read_text())
+
+def fail_on_flag(ctx):
+    if (ctx.workdir / "flag").exists():
+        raise RuntimeError("flag set")
+    ctx.outputs["dst"].write_text("done")
+
+def exit_zero_early(ctx):
+    ctx.outputs["dst"].write_text("partial")
+    sys.stdout.flush()
+    os._exit(0)
+
+def spawn_child_then_hang(ctx):
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    (ctx.workdir / "child.pid").write_text(str(child.pid))
+    print("started", flush=True)
+    time.sleep(60)
 '''
 
 
@@ -407,3 +448,318 @@ def test_follow_streams_before_step_ends(tmp_path, stream):
     assert "(output above)" in out and "log: " in out
     if stream is FakeTTY:  # the "… running" placeholder is erased before the first line
         assert "running\r\033[K[1/1] hang\n    │ started\n" in out
+
+
+# -- --only and the steps it leaves out ---------------------------------------------------
+
+GATED = """
+[[steps]]
+name = "split"
+function = "fns:copy"
+inputs = { src = "in.txt" }
+outputs = { dst = "out/split.txt" }
+
+[[steps]]
+name = "verify"
+function = "fns:gate"
+inputs = { src = "out/split.txt" }
+outputs = { report = "out/report.txt" }
+
+[[steps]]
+name = "train"
+function = "fns:count"
+inputs = { src = "out/split.txt" }
+outputs = { n = "out/model.txt" }
+depends_on = ["verify"]
+"""
+
+
+def test_only_warns_when_a_blocked_gate_is_left_out(tmp_path):
+    cfg = make(tmp_path, GATED)
+    run(cfg)
+    (tmp_path / "in.txt").write_text("bad")
+    result, _ = run(cfg)
+    assert result.halted_by == "verify"
+
+    result, out = run(cfg, only=["train"])
+    assert result.ok
+    assert "--only left out 'verify', which is not up to date (no checkpoint)" in out
+    assert "'train' depends on it" in out
+    assert "completed with warnings" in out
+
+
+def test_only_warns_when_a_selected_step_makes_the_gate_stale(tmp_path):
+    cfg = make(tmp_path, GATED)
+    run(cfg)
+    (tmp_path / "in.txt").write_text("changed")  # 'verify' is current until 'split' reruns
+
+    _, out = run(cfg, only=["split", "train"])
+    assert "--only left out 'verify', which is not up to date (inputs changed: src)" in out
+
+    run(cfg)
+    (tmp_path / "in.txt").write_text("changed again")
+    result, out = run(cfg, only=["split", "train"], dry_run=True)
+    assert "--only left out 'verify', which is not up to date (after split)" in out
+    assert result.outcomes["split"].status == "would run"
+    assert "dry run complete with warnings" in out
+
+
+def test_only_is_quiet_when_left_out_steps_are_current(tmp_path):
+    cfg = make(tmp_path, GATED)
+    run(cfg)
+    result, out = run(cfg, only=["train"], rerun=["train"])
+    assert statuses(result) == {"train": "ran"}
+    assert not result.warnings and "left out" not in out
+
+
+def test_only_warns_once_per_left_out_step(tmp_path):
+    cfg = make(tmp_path, GATED + """
+[[steps]]
+name = "evaluate"
+function = "fns:count"
+inputs = { src = "out/model.txt" }
+outputs = { n = "out/metrics.txt" }
+depends_on = ["verify"]
+""")
+    run(cfg)
+    (tmp_path / "out" / "report.txt").unlink()
+    result, _ = run(cfg, only=["train", "evaluate"])
+    assert len(result.warnings) == 1
+
+
+def test_a_short_step_name_inside_an_earlier_warning_is_still_warned_about(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "gate_a"
+function = "fns:gate"
+inputs = { src = "in.txt" }
+outputs = { report = "out/gate.txt" }
+
+[[steps]]
+name = "a"
+function = "fns:copy"
+inputs = { src = "in.txt" }
+outputs = { dst = "out/a.txt" }
+
+[[steps]]
+name = "train"
+function = "fns:count"
+inputs = { src = "out/a.txt" }
+outputs = { n = "out/n.txt" }
+depends_on = ["gate_a"]
+""")
+    run(cfg)
+    (tmp_path / "in.txt").write_text("changed")
+    result, _ = run(cfg, only=["train"])
+    assert [w.split("'")[1] for w in result.warnings] == ["gate_a", "a"]
+
+
+# -- dependencies through directories -----------------------------------------------------
+
+def test_input_inside_a_directory_output_runs_after_it(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "use"
+function = "fns:copy"
+inputs = { src = "out/parts/a.txt" }
+outputs = { dst = "out/final.txt" }
+
+[[steps]]
+name = "produce"
+function = "fns:make_dir"
+outputs = { d = "out/parts" }
+params = { v = "old" }
+""")
+    result, _ = run(cfg)  # preflight must accept a file a directory output will hold
+    assert list(result.outcomes) == ["produce", "use"]
+    assert (tmp_path / "out" / "final.txt").read_text() == "OLD"
+
+    cfg.write_text(cfg.read_text().replace('"old"', '"new"'))
+    result, _ = run(cfg)
+    assert statuses(result) == {"produce": "ran", "use": "ran"}
+    assert (tmp_path / "out" / "final.txt").read_text() == "NEW"
+
+
+def test_directory_input_runs_after_a_step_writing_into_it(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "use"
+function = "fns:read_dir"
+inputs = { d = "out/parts" }
+outputs = { o = "out/final.txt" }
+
+[[steps]]
+name = "produce"
+function = "fns:write_param"
+outputs = { o = "out/parts/a.txt" }
+params = { v = "old" }
+""")
+    result, _ = run(cfg)
+    assert list(result.outcomes) == ["produce", "use"]
+    assert (tmp_path / "out" / "final.txt").read_text() == "old"
+
+
+def test_failed_directory_producer_blocks_the_reader_of_a_file_inside(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "produce"
+function = "fns:boom"
+outputs = { d = "out/parts" }
+critical = false
+
+[[steps]]
+name = "use"
+function = "fns:copy"
+inputs = { src = "out/parts/a.txt" }
+outputs = { dst = "out/final.txt" }
+critical = false
+""")
+    (tmp_path / "out" / "parts").mkdir(parents=True)
+    (tmp_path / "out" / "parts" / "a.txt").write_text("stale")
+    result, _ = run(cfg)
+    assert statuses(result) == {"produce": "warned", "use": "skipped"}
+
+
+@pytest.mark.parametrize("steps, msg", [
+    ("""
+[[steps]]
+name = "a"
+function = "fns:no_output"
+outputs = { o = "out/x" }
+[[steps]]
+name = "b"
+function = "fns:no_output"
+outputs = { o = "out/x/y.csv" }
+""", "outputs overlap: 'out/x' of 'a' and 'out/x/y.csv' of 'b'"),
+    ("""
+[[steps]]
+name = "a"
+function = "fns:no_output"
+inputs = { i = "out/x/y.csv" }
+outputs = { o = "out/x" }
+""", "consumes its own output"),
+    ("""
+[[steps]]
+name = "a"
+function = "fns:no_output"
+inputs = { i = "out" }
+outputs = { o = "out/x" }
+""", "consumes its own output"),
+])
+def test_overlapping_paths_are_rejected(tmp_path, steps, msg):
+    with pytest.raises(config.ConfigError, match=msg):
+        config.load(make(tmp_path, steps))
+
+
+def test_one_step_may_declare_a_directory_and_a_file_inside_it(tmp_path):
+    config.load(make(tmp_path, """
+[[steps]]
+name = "a"
+function = "fns:no_output"
+outputs = { d = "out/x", f = "out/x/y.csv" }
+"""))
+
+
+# -- stopping a step stops what it started --------------------------------------------------
+
+needs_groups = pytest.mark.skipif(not hasattr(os, "killpg"), reason="needs process groups")
+
+SPAWNER = """
+[[steps]]
+name = "spawn"
+function = "fns:spawn_child_then_hang"
+outputs = { o = "out/o.txt" }
+"""
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")  # a killed child stays a zombie until it is reaped
+    return not (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+
+
+def wait_until(condition, seconds: float = 10) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@needs_groups
+def test_timeout_kills_the_steps_children(tmp_path):
+    cfg = make(tmp_path, SPAWNER + "timeout = 1\n")
+    result, _ = run(cfg)
+    assert "timed out" in result.outcomes["spawn"].detail
+    child = int((tmp_path / "child.pid").read_text())
+    assert wait_until(lambda: not alive(child))
+
+
+@needs_groups
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_interrupting_the_runner_stops_the_step_and_keeps_its_traceback(tmp_path, sig):
+    cfg = make(tmp_path, SPAWNER)
+    proc = subprocess.Popen([sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"],
+                            stdout=subprocess.PIPE, text=True)
+    pid_file = tmp_path / "child.pid"
+    log = tmp_path / ".pipeline" / "logs" / "spawn.log"
+    try:
+        assert wait_until(lambda: pid_file.exists() and pid_file.read_text()
+                          and log.exists() and "started" in log.read_text())
+        child = int(pid_file.read_text())
+        proc.send_signal(sig)
+        out, _ = proc.communicate(timeout=15)
+    finally:
+        proc.kill()
+    assert proc.returncode == 130
+    assert "interrupted" in out
+    assert wait_until(lambda: not alive(child))
+    assert "KeyboardInterrupt" in log.read_text()
+
+
+# -- guarantees a checkpoint depends on -----------------------------------------------------
+
+def test_input_edited_during_the_run_is_not_checkpointed(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "a"
+function = "fns:edit_input_then_read"
+inputs = { src = "in.txt" }
+outputs = { dst = "out/o.txt" }
+""")
+    run(cfg)  # the output came from the edited text, not from what was fingerprinted
+    (tmp_path / "in.txt").write_text("hello")
+    result, _ = run(cfg)
+    assert statuses(result) == {"a": "ran"}
+
+
+def test_failed_rerun_does_not_leave_the_old_checkpoint_valid(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "a"
+function = "fns:fail_on_flag"
+outputs = { dst = "out/o.txt" }
+""")
+    run(cfg)
+    (tmp_path / "flag").touch()
+    result, _ = run(cfg, rerun=["a"])
+    assert result.halted_by == "a"
+    (tmp_path / "flag").unlink()
+    result, _ = run(cfg)
+    assert statuses(result) == {"a": "ran"}
+
+
+def test_worker_that_exits_zero_without_a_result_fails(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "a"
+function = "fns:exit_zero_early"
+outputs = { dst = "out/o.txt" }
+""")
+    result, _ = run(cfg)
+    assert result.halted_by == "a"
+    assert result.outcomes["a"].detail == "worker exited without reporting a result"

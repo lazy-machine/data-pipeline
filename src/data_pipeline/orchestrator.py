@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,10 +23,11 @@ from pathlib import Path
 from packaging.requirements import InvalidRequirement, Requirement
 
 from . import checkpoint
-from .config import Pipeline, Step
+from .config import Pipeline, Step, overlaps
 from .report import Reporter
 
 _PKG_ROOT = str(Path(__file__).resolve().parent.parent)
+_INTERRUPT_GRACE = 2.0  # seconds a step gets to print where it was before it is killed
 
 
 @dataclass
@@ -43,6 +45,7 @@ class RunResult:
     outcomes: dict[str, Outcome] = field(default_factory=dict)
     halted_by: str | None = None
     elapsed: float = 0.0
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -79,7 +82,7 @@ def preflight(pipeline: Pipeline) -> dict[str, list[str]]:
         found += [e for r in step.requires if (e := _check_requirement(r))]
         for key, rel in step.inputs.items():
             p = pipeline.resolve(rel)
-            if p not in produced and not p.exists():
+            if not p.exists() and not any(overlaps(p, o) for o in produced):
                 found.append(f"input '{key}' not found: {rel}")
         for rel in step.watch:
             if not pipeline.resolve(rel).exists():
@@ -96,11 +99,32 @@ def _missing_inputs(pipeline: Pipeline, step: Step) -> list[str]:
 
 # -- execution ----------------------------------------------------------------------------
 
-def _stop(proc: subprocess.Popen, reader: threading.Thread, forwarding: threading.Event) -> None:
-    proc.kill()
-    proc.wait()
-    reader.join(timeout=5)
-    forwarding.clear()
+def _kill_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the worker and whatever it started; the worker leads its own process group."""
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _stop(proc: subprocess.Popen, reader: threading.Thread, forwarding: threading.Event,
+          grace: float = 0.0) -> None:
+    """Kill the step. With ``grace``, first interrupt it so its traceback reaches the log."""
+    groups = hasattr(os, "killpg")  # POSIX only; elsewhere just the worker is killed
+    try:
+        if grace and groups:
+            _kill_group(proc, signal.SIGINT)
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if groups:
+            _kill_group(proc, signal.SIGKILL)
+        proc.kill()
+        proc.wait()
+        reader.join(timeout=5)
+        forwarding.clear()
 
 
 def _run_worker(pipeline: Pipeline, step: Step, log_path: Path,
@@ -139,6 +163,7 @@ def _run_worker(pipeline: Pipeline, step: Step, log_path: Path,
             proc = subprocess.Popen(
                 cmd, cwd=pipeline.workdir, env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                start_new_session=True,  # own process group, so children can be killed with it
             )
         except BaseException:
             fh.close()
@@ -164,7 +189,7 @@ def _run_worker(pipeline: Pipeline, step: Step, log_path: Path,
             _stop(proc, reader, forwarding)
             return False, f"timed out after {step.timeout:g}s", b"".join(chunks).decode(errors="replace")
         except KeyboardInterrupt:
-            _stop(proc, reader, forwarding)
+            _stop(proc, reader, forwarding, grace=_INTERRUPT_GRACE)
             raise
         forwarding.clear()  # late lines still reach the log, but not this step's outcome
 
@@ -205,7 +230,11 @@ class Orchestrator:
             result.halted_by = next(iter(blocking))
             return result
 
+        selected = {s.name for s in steps}
+        flagged: set[str] = set()
         for idx, step in enumerate(steps, 1):
+            if only:
+                self._warn_outside(step, selected, flagged, result, dry_run)
             self.report.begin(idx, len(steps), step)
             outcome = self._step(step, issues.get(step.name, []), result,
                                  force or step.name in forced, dry_run)
@@ -219,6 +248,36 @@ class Orchestrator:
         result.elapsed = time.perf_counter() - start
         self.report.footer(result, dry_run)
         return result
+
+    def _warn_outside(self, step: Step, selected: set[str], flagged: set[str],
+                      result: RunResult, dry_run: bool) -> None:
+        """Say when ``--only`` leaves out an upstream step, such as a gate, that isn't current.
+
+        Checked before each step, not once at the start: a selected step that just ran can
+        be what made the step left out go stale.
+        """
+        p = self.pipeline
+        ancestors: set[str] = set()
+        queue = [step.name]
+        while queue:
+            new = [u for u in p.upstream[queue.pop()] if u not in ancestors]
+            ancestors.update(new)
+            queue += new
+        for other in p.steps:
+            if other.name not in ancestors or other.name in selected | flagged:
+                continue
+            fp = checkpoint.fingerprint(p, other, self.state)
+            reason = checkpoint.stale_reason(p, other, self.state, fp)
+            pending = [u for u in p.upstream[other.name]
+                       if (o := result.outcomes.get(u)) and o.status == "would run"]
+            if reason is None and dry_run and pending:
+                reason = f"after {', '.join(pending)}"
+            if reason:
+                flagged.add(other.name)
+                text = (f"--only left out '{other.name}', which is not up to date ({reason}): "
+                        f"'{step.name}' depends on it")
+                result.warnings.append(text)
+                self.report.warning(text)
 
     def _step(self, step: Step, issues: list[str], result: RunResult,
               forced: bool, dry_run: bool) -> Outcome:

@@ -307,8 +307,9 @@ affect caching: since B reads nothing from A, a rerun of A doesn't invalidate B.
 ### Rules the loader enforces
 
 When the file is loaded, the orchestrator rejects: dependency cycles, two steps writing the
-same path, a step reading its own output, duplicate step names, unknown `depends_on`
-targets, and misspelled keys (`colour = 1` is an error rather than being silently ignored).
+same path or overlapping paths (`build/x` and `build/x/y.csv`), a step reading its own output
+or a directory that holds it, duplicate step names, unknown `depends_on` targets, and
+misspelled keys (`colour = 1` is an error rather than being silently ignored).
 
 ---
 
@@ -536,8 +537,16 @@ A typical loop while developing one step:
 2. `data-pipeline -n` confirms that only `train` and `evaluate` would rerun.
 3. `data-pipeline` reruns just those; everything before them is skipped.
 
-`--only` doesn't consider any step outside the list. It won't run their upstream steps, but
-it won't block on them either. Use it once the upstream outputs exist.
+`--only` doesn't run any step outside the list, and it won't block on them either. Use it
+once the upstream outputs exist. When an upstream step left out isn't up to date, it prints
+a warning, and the run ends with `completed with warnings`:
+
+```
+⚠ --only left out 'verify', which is not up to date (no checkpoint): 'train' depends on it
+```
+
+Take this one seriously when the step named is the gate: the data has not passed it. The
+exit code stays `0`, so check for the warning if you script `--only`.
 
 ### Exit codes (for scripts and CI)
 
@@ -546,7 +555,7 @@ it won't block on them either. Use it once the upstream outputs exist.
 | `0` | success, **including** runs with non-critical warnings |
 | `1` | a critical step failed (or preflight failed) |
 | `2` | invalid config file or unknown step name in `-r`/`-o` |
-| `130` | interrupted with Ctrl-C |
+| `130` | interrupted (Ctrl-C, SIGTERM or SIGHUP) |
 
 In CI, `data-pipeline || exit 1` fails the build only on critical problems. If warnings
 should fail the build too, check the output for `completed with warnings`.
@@ -642,8 +651,8 @@ depends_on = ["check_schema"]
 ### Long-running steps
 
 Set a `timeout` (in seconds) on anything that could hang, such as network calls or big
-training jobs. When it's exceeded, the worker process is killed and the step is reported as
-`timed out after Ns`. This counts as a failure, so it halts the run or warns depending on
+training jobs. When it's exceeded, the worker and any processes it started are killed and the
+step is reported as `timed out after Ns`. This counts as a failure, so it halts the run or warns depending on
 `critical`. Whatever the step printed before it was killed is kept in the dump and the log.
 
 To watch a long step, run with `-F`, or follow its log from another terminal:
@@ -652,9 +661,14 @@ To watch a long step, run with `-F`, or follow its log from another terminal:
 tail -f .pipeline/logs/train.log
 ```
 
-If you press Ctrl-C, the worker is stopped, its log is kept, and the run ends with
-`■ interrupted · log: <path>`. The log shows the step's last output, and usually the
-traceback of where it was when you stopped it.
+If you press Ctrl-C, the step gets two seconds to stop, then it and any processes it started
+are killed. Its log is kept, and the run ends with `■ interrupted · log: <path>`. The log
+shows the step's last output, and usually the traceback of where it was when you stopped it.
+SIGTERM and SIGHUP (a cancelled CI job, a closed terminal) do the same.
+
+Each worker runs in its own process group. A step that means to leave a process running
+after it succeeds still can, but a process started by a step that times out or is interrupted
+does not survive, unless it moved itself to a new session.
 
 ### Running from Python
 
