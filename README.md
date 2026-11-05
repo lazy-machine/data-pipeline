@@ -86,12 +86,12 @@ data-pipeline [CONFIG] [-n] [-f] [-r STEP]... [-o STEP ...] [-v] [-F] [--no-colo
 | `-n`, `--dry-run` | verify and show what would run and why, without running anything |
 | `-f`, `--force` | ignore all checkpoints |
 | `-r`, `--rerun STEP` | ignore the checkpoint of one step (repeatable) |
-| `-o`, `--only STEP ...` | run only these steps; their inputs must already exist |
+| `-o`, `--only STEP ...` | run only these steps; their inputs must already exist. Warns when an upstream step left out is not up to date |
 | `-v`, `--verbose` | also show the captured output of successful steps |
 | `-F`, `--follow` | print each step's output live, as it runs |
 
 Exit codes: `0` success (warnings included), `1` a critical step failed, `2` bad config or
-arguments, `130` interrupted.
+arguments, `130` interrupted (Ctrl-C, SIGTERM or SIGHUP).
 
 ## Pipeline file
 
@@ -110,16 +110,18 @@ outputs = { model = "build/model.pkl" }       # files or directories
 params = { estimator = "random_forest", seed = 42 }
 requires = ["scikit-learn>=1.3", "joblib"]    # verified before anything runs
 critical = true                               # false: failure only warns
-timeout = 600                                 # seconds; the worker is killed after this
+timeout = 600                                 # seconds; the worker and its children are killed after this
 depends_on = []                               # extra ordering beyond file dependencies
 watch = ["sql/features.sql"]                  # non-Python files or dynamic imports that invalidate the step
 description = "Fit a classifier"
 ```
 
 Step order follows the file, except that a step always runs after the steps that produce
-its inputs (dependencies are inferred from paths) and after anything in `depends_on`.
-Cycles, duplicate names, two steps writing the same output and unknown keys are rejected
-when the file is loaded.
+its inputs and after anything in `depends_on`. Dependencies are inferred from paths: an
+input depends on a step when the paths match or one lies inside the other, as with a file
+in another step's directory output. Cycles, duplicate names, two steps writing the same or
+overlapping outputs, a step reading its own output and unknown keys are rejected when the
+file is loaded.
 
 ## Writing a step
 

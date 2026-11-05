@@ -145,15 +145,23 @@ def _parse_step(raw: Any, idx: int) -> Step:
     )
 
 
+def overlaps(a: Path, b: Path) -> bool:
+    """True when the paths are equal or one lies inside the other, as a file in a directory."""
+    return a.is_relative_to(b) or b.is_relative_to(a)
+
+
 def _build_graph(steps: list[Step], resolve) -> dict[str, list[str]]:
-    producers: dict[Path, str] = {}
+    producers: dict[Path, tuple[str, str]] = {}  # output path -> (step, path as written)
     for s in steps:
-        for key, rel in s.outputs.items():
+        for rel in s.outputs.values():
             p = resolve(rel)
-            other = producers.get(p)
-            _expect(other is None,
-                    f"output '{rel}' is produced by both '{other}' and '{s.name}'")
-            producers[p] = s.name
+            for out, (other, other_rel) in producers.items():
+                _expect(p != out,
+                        f"output '{rel}' is produced by both '{other}' and '{s.name}'")
+                # the outer step's hash would include the inner step's file
+                _expect(other == s.name or not overlaps(p, out),
+                        f"outputs overlap: '{other_rel}' of '{other}' and '{rel}' of '{s.name}'")
+            producers[p] = (s.name, rel)
 
     names = {s.name for s in steps}
     upstream: dict[str, list[str]] = {}
@@ -165,10 +173,13 @@ def _build_graph(steps: list[Step], resolve) -> dict[str, list[str]]:
             if d not in deps:
                 deps.append(d)
         for rel in s.inputs.values():
-            prod = producers.get(resolve(rel))
-            _expect(prod != s.name, f"step '{s.name}' consumes its own output '{rel}'")
-            if prod and prod not in deps:
-                deps.append(prod)
+            p = resolve(rel)
+            for out, (prod, _) in producers.items():
+                if not overlaps(p, out):
+                    continue
+                _expect(prod != s.name, f"step '{s.name}' consumes its own output '{rel}'")
+                if prod not in deps:
+                    deps.append(prod)
         upstream[s.name] = deps
     return upstream
 

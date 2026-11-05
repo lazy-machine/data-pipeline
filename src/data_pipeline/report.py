@@ -67,6 +67,9 @@ class Reporter:
             for e in errs:
                 self._print(f"  {name}: {e}")
 
+    def warning(self, text: str) -> None:
+        self._print(self._c(f"⚠ {text}", "33"))
+
     def begin(self, idx: int, total: int, step: Step) -> None:
         self._current = self._prefix(idx, total, step)
         self._streamed = False
@@ -119,10 +122,10 @@ class Reporter:
                  "warned": "warning(s)", "skipped": "skipped", "failed": "failed"}
         parts = [f"{counts[k]} {v}" for k, v in names.items() if counts.get(k)]
         summary = " · ".join(parts + [f"{result.elapsed:.2f}s"])
+        done = "✓ dry run complete" if dry_run else "✓ completed"
         if result.halted_by:
             self._print(self._c(f"■ halted at '{result.halted_by}'", "31;1") + f" · {summary}")
-        elif counts.get("warned") or counts.get("skipped"):
-            self._print(self._c("✓ completed with warnings", "33;1") + f" · {summary}")
+        elif counts.get("warned") or counts.get("skipped") or result.warnings:
+            self._print(self._c(f"{done} with warnings", "33;1") + f" · {summary}")
         else:
-            self._print(self._c("✓ dry run complete" if dry_run else "✓ completed", "32;1")
-                        + f" · {summary}")
+            self._print(self._c(done, "32;1") + f" · {summary}")

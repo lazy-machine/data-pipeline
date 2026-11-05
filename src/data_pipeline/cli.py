@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import signal
 import sys
+import threading
+from collections.abc import Iterator
 
 from . import config
 from .orchestrator import Orchestrator
@@ -33,6 +37,31 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _interrupt(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def _stop_signals_interrupt() -> Iterator[None]:
+    """Treat SIGTERM and SIGHUP like Ctrl-C, unless the caller chose to ignore them.
+
+    Workers run in their own session, so a closed terminal or a cancelled CI job reaches
+    only this process, which has to stop the step itself. A signal already ignored stays
+    ignored, so that ``nohup data-pipeline`` keeps working after logout.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield  # signal handlers can only be set from the main thread
+        return
+    stops = [getattr(signal, n) for n in ("SIGTERM", "SIGHUP") if hasattr(signal, n)]
+    stops = [s for s in stops if signal.getsignal(s) is not signal.SIG_IGN]
+    previous = {s: signal.signal(s, _interrupt) for s in stops}
+    try:
+        yield
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -51,9 +80,10 @@ def main(argv: list[str] | None = None) -> int:
                         follow=args.follow)
     orchestrator = Orchestrator(pipeline, reporter)
     try:
-        result = orchestrator.run(
-            only=args.only, force=args.force, rerun=args.rerun,
-            dry_run=args.dry_run)
+        with _stop_signals_interrupt():
+            result = orchestrator.run(
+                only=args.only, force=args.force, rerun=args.rerun,
+                dry_run=args.dry_run)
     except KeyboardInterrupt:
         log = orchestrator.running_log
         print("\n■ interrupted" + (f" · log: {display_path(log)}" if log else ""))

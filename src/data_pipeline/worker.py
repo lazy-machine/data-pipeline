@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import signal
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -27,7 +31,26 @@ def _summarize(value: Any) -> str:
     return str(value)
 
 
+def _stop_with_runner() -> None:
+    """End the step, and what it started, if the runner dies.
+
+    A worker leads its own session, so a signal that ends the runner never reaches it, and
+    nothing else would stop it writing outputs that no checkpoint will record.
+    """
+    if not hasattr(os, "killpg"):
+        return
+    runner = os.getppid()
+
+    def watch() -> None:
+        while os.getppid() == runner:
+            time.sleep(0.5)
+        os.killpg(os.getpgid(0), signal.SIGKILL)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def main(argv: list[str]) -> int:
+    _stop_with_runner()
     spec_path, result_path = argv
     spec = json.loads(Path(spec_path).read_text())
 
