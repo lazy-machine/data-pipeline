@@ -191,7 +191,7 @@ def _digest(obj: Any) -> str:
 
 def installed_version(name: str) -> str:
     """The installed version; ``requires`` may also name an import, such as ``sklearn``,
-    which has no version to track."""
+    which has no version to track. _packages decides what a specifier on one means."""
     try:
         return metadata.version(name)
     except metadata.PackageNotFoundError:

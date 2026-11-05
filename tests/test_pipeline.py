@@ -6,6 +6,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -94,6 +95,10 @@ def ignore_interrupts_then_hang(ctx):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     print("started", flush=True)
     time.sleep(60)
+
+def finish_quietly(ctx):
+    time.sleep(0.5)
+    ctx.outputs["dst"].write_text("finished")
 
 def spawn_child_then_hang(ctx):
     import subprocess
@@ -697,8 +702,11 @@ def alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    stat = Path(f"/proc/{pid}/stat")  # a killed child stays a zombie until it is reaped
-    return not (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+    try:
+        # a killed child stays a zombie until it is reaped
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError):   # reaped between the two looks
+        return not Path("/proc/self").exists()  # unless there is no /proc: os.kill said alive
 
 
 def wait_until(condition, seconds: float = 30) -> bool:
@@ -710,13 +718,53 @@ def wait_until(condition, seconds: float = 30) -> bool:
     return False
 
 
+AFTER_SIGNAL = 10  # the watch polls twice a second; starting up is what can take long
+
+
+def default_signals(*keep_ignored: int) -> Callable[[], None]:
+    """For preexec_fn. A test run started as a shell background job ignores these, and that
+    would carry over to the runner, which is right for the runner but not for these tests."""
+    def reset() -> None:
+        for sig in (signal.SIGINT, signal.SIGQUIT):
+            signal.signal(sig, signal.SIG_DFL)
+        for sig in keep_ignored:
+            signal.signal(sig, signal.SIG_IGN)
+    return reset
+
+
+@pytest.mark.skipif(not Path("/proc/self").exists(), reason="needs /proc")
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError])
+def test_alive_survives_a_process_reaped_between_its_two_looks(monkeypatch, error):
+    def reaped(self, *args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(Path, "read_text", reaped)
+    assert alive(os.getpid()) is False
+
+
+@needs_groups
+@pytest.mark.parametrize("sig, code", [(signal.SIGINT, 130), (signal.SIGQUIT, -signal.SIGQUIT)])
+def test_a_test_run_that_ignores_signals_can_still_reach_the_runner(tmp_path, sig, code):
+    """As in a shell background job: without the reset this hangs until the timeout."""
+    cfg = make(tmp_path, SPAWNER)
+    previous = signal.signal(sig, signal.SIG_IGN)
+    try:
+        proc = start_runner(tmp_path, cfg)
+        proc.send_signal(sig)
+        proc.communicate(timeout=15)
+    finally:
+        signal.signal(sig, previous)
+        proc.kill()
+    assert proc.returncode == code
+
+
 @needs_groups
 def test_timeout_kills_the_steps_children(tmp_path):
     cfg = make(tmp_path, SPAWNER + "timeout = 3\n")
     result, _ = run(cfg)
     assert "timed out" in result.outcomes["spawn"].detail
     child = int((tmp_path / "child.pid").read_text())
-    assert wait_until(lambda: not alive(child))
+    assert wait_until(lambda: not alive(child), AFTER_SIGNAL)
 
 
 @needs_groups
@@ -724,7 +772,7 @@ def test_timeout_kills_the_steps_children(tmp_path):
 def test_interrupting_the_runner_stops_the_step_and_keeps_its_traceback(tmp_path, sig):
     cfg = make(tmp_path, SPAWNER)
     proc = subprocess.Popen([sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"],
-                            stdout=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, text=True, preexec_fn=default_signals())
     pid_file = tmp_path / "child.pid"
     log = tmp_path / ".pipeline" / "logs" / "spawn.log"
     try:
@@ -737,13 +785,14 @@ def test_interrupting_the_runner_stops_the_step_and_keeps_its_traceback(tmp_path
         proc.kill()
     assert proc.returncode == 130
     assert "interrupted" in out
-    assert wait_until(lambda: not alive(child))
+    assert wait_until(lambda: not alive(child), AFTER_SIGNAL)
     assert "KeyboardInterrupt" in log.read_text()
 
 
-def start_runner(tmp_path: Path, cfg: Path, **popen) -> subprocess.Popen:
+def start_runner(tmp_path: Path, cfg: Path, *keep_ignored: int) -> subprocess.Popen:
     proc = subprocess.Popen([sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"],
-                            stdout=subprocess.PIPE, text=True, **popen)
+                            stdout=subprocess.PIPE, text=True,
+                            preexec_fn=default_signals(*keep_ignored))
     log = tmp_path / ".pipeline" / "logs" / "spawn.log"
     assert wait_until(lambda: log.exists() and "started" in log.read_text())
     return proc
@@ -759,7 +808,7 @@ name = "spawn"
 function = "fns:start_then_finish"
 outputs = { dst = "out/o.txt" }
 """)
-    proc = start_runner(tmp_path, cfg, preexec_fn=lambda: signal.signal(sig, signal.SIG_IGN))
+    proc = start_runner(tmp_path, cfg, sig)
     try:
         proc.send_signal(sig)
         out, _ = proc.communicate(timeout=15)
@@ -780,7 +829,7 @@ def test_a_step_does_not_outlive_a_killed_runner(tmp_path, sig):
         proc.wait(timeout=15)
     finally:
         proc.kill()
-    assert wait_until(lambda: not alive(child))
+    assert wait_until(lambda: not alive(child), AFTER_SIGNAL)
 
 
 @needs_groups
@@ -791,7 +840,8 @@ def test_a_step_does_not_outlive_a_python_caller(tmp_path, sig):
     code = ("import sys; from data_pipeline import config; "
             "from data_pipeline.orchestrator import Orchestrator; "
             "Orchestrator(config.load(sys.argv[1])).run()")
-    proc = subprocess.Popen([sys.executable, "-c", code, str(cfg)], stdout=subprocess.DEVNULL)
+    proc = subprocess.Popen([sys.executable, "-c", code, str(cfg)], stdout=subprocess.DEVNULL,
+                            preexec_fn=default_signals())
     pid_file = tmp_path / "child.pid"
     try:
         assert wait_until(lambda: pid_file.exists() and pid_file.read_text())
@@ -800,7 +850,7 @@ def test_a_step_does_not_outlive_a_python_caller(tmp_path, sig):
         proc.wait(timeout=15)
     finally:
         proc.kill()
-    assert wait_until(lambda: not alive(child))
+    assert wait_until(lambda: not alive(child), AFTER_SIGNAL)
 
 
 @needs_groups
@@ -846,29 +896,43 @@ def test_any_exception_in_the_runner_stops_the_step(tmp_path):
         assert wait_until(lambda: pid_file.exists() and pid_file.read_text())
         child = int(pid_file.read_text())
         proc.send_signal(signal.SIGTERM)
-        assert wait_until(lambda: not alive(child))
+        assert wait_until(lambda: not alive(child), AFTER_SIGNAL)
         assert proc.poll() is None   # the caller is still going
     finally:
         proc.kill()
 
 
 @needs_groups
-def test_a_worker_whose_runner_is_already_gone_stops(tmp_path):
-    """The runner can die before the worker reaches its watch, so the worker must be told who
-    it was, not read its parent then. Here the spec names a process that isn't the parent."""
-    fns = tmp_path / "fns.py"
-    fns.write_text("import time\ndef go(ctx):\n    time.sleep(60)\n")
-    spec = tmp_path / "spec.json"
-    spec.write_text(json.dumps({
-        "name": "s", "module": "fns", "attr": "go", "inputs": {}, "outputs": {}, "params": {},
-        "workdir": str(tmp_path), "python_path": [str(tmp_path)], "runner": os.getpid() + 10**6,
-    }))
-    proc = subprocess.Popen([sys.executable, "-m", "data_pipeline.worker", str(spec),
-                             str(tmp_path / "result.json")], start_new_session=True)
+def test_a_runner_that_dies_while_the_worker_starts_stops_the_step(tmp_path):
+    """The worker is still starting when the runner goes, so the step must never run."""
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(textwrap.dedent("""
+        import sys, time
+        if "data_pipeline.worker" in " ".join(sys.orig_argv):
+            time.sleep(1.5)
+    """))
+    # quiet, because printing to a dead runner would fail the step whatever the watch did
+    cfg = make(tmp_path, """
+[[steps]]
+name = "spawn"
+function = "fns:finish_quietly"
+outputs = { dst = "out/o.txt" }
+""")
+    (tmp_path / "out").mkdir()
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        filter(None, [str(site), os.environ.get("PYTHONPATH")])))
+    proc = subprocess.Popen([sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"],
+                            stdout=subprocess.DEVNULL, env=env, preexec_fn=default_signals())
+    log = tmp_path / ".pipeline" / "logs" / "spawn.log"
     try:
-        assert proc.wait(timeout=20) == -signal.SIGKILL
+        assert wait_until(log.exists)   # the runner has opened the log: the worker is starting
+        proc.kill()
+        proc.wait(timeout=15)
     finally:
         proc.kill()
+    time.sleep(4)   # long enough for the step to start and finish if it were allowed to
+    assert not (tmp_path / "out" / "o.txt").exists()
 
 
 # -- guarantees a checkpoint depends on -----------------------------------------------------

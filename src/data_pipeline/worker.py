@@ -35,7 +35,9 @@ def _stop_with_runner(runner: int) -> None:
     """End the step, and what it started, if the runner dies.
 
     A worker leads its own session, so a signal that ends the runner never reaches it, and
-    nothing else would stop it writing outputs that no checkpoint will record.
+    nothing else would stop it writing outputs that no checkpoint will record. This relies on
+    the worker being the runner's direct child: a launcher that forks would look like a
+    runner that died.
     """
     if not hasattr(os, "killpg"):
         return
