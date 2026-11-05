@@ -43,15 +43,17 @@ def _interrupt(signum: int, frame: object) -> None:
 
 @contextlib.contextmanager
 def _stop_signals_interrupt() -> Iterator[None]:
-    """Treat SIGTERM and SIGHUP like Ctrl-C.
+    """Treat SIGTERM and SIGHUP like Ctrl-C, unless the caller chose to ignore them.
 
     Workers run in their own session, so a closed terminal or a cancelled CI job reaches
-    only this process. It has to stop the step itself.
+    only this process, which has to stop the step itself. A signal already ignored stays
+    ignored, so that ``nohup data-pipeline`` keeps working after logout.
     """
     if threading.current_thread() is not threading.main_thread():
         yield  # signal handlers can only be set from the main thread
         return
     stops = [getattr(signal, n) for n in ("SIGTERM", "SIGHUP") if hasattr(signal, n)]
+    stops = [s for s in stops if signal.getsignal(s) is not signal.SIG_IGN]
     previous = {s: signal.signal(s, _interrupt) for s in stops}
     try:
         yield

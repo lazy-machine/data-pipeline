@@ -84,6 +84,11 @@ def exit_zero_early(ctx):
     sys.stdout.flush()
     os._exit(0)
 
+def start_then_finish(ctx):
+    print("started", flush=True)
+    time.sleep(1.5)
+    ctx.outputs["dst"].write_text("finished")
+
 def spawn_child_then_hang(ctx):
     import subprocess
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -692,7 +697,7 @@ def wait_until(condition, seconds: float = 10) -> bool:
 
 @needs_groups
 def test_timeout_kills_the_steps_children(tmp_path):
-    cfg = make(tmp_path, SPAWNER + "timeout = 1\n")
+    cfg = make(tmp_path, SPAWNER + "timeout = 3\n")
     result, _ = run(cfg)
     assert "timed out" in result.outcomes["spawn"].detail
     child = int((tmp_path / "child.pid").read_text())
@@ -719,6 +724,68 @@ def test_interrupting_the_runner_stops_the_step_and_keeps_its_traceback(tmp_path
     assert "interrupted" in out
     assert wait_until(lambda: not alive(child))
     assert "KeyboardInterrupt" in log.read_text()
+
+
+def start_runner(tmp_path: Path, cfg: Path, **popen) -> subprocess.Popen:
+    proc = subprocess.Popen([sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"],
+                            stdout=subprocess.PIPE, text=True, **popen)
+    log = tmp_path / ".pipeline" / "logs" / "spawn.log"
+    assert wait_until(lambda: log.exists() and "started" in log.read_text())
+    return proc
+
+
+@needs_groups
+@pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGTERM])
+def test_a_signal_the_caller_ignores_stays_ignored(tmp_path, sig):
+    """`nohup data-pipeline` must survive logout: an inherited SIG_IGN is the caller's choice."""
+    cfg = make(tmp_path, """
+[[steps]]
+name = "spawn"
+function = "fns:start_then_finish"
+outputs = { dst = "out/o.txt" }
+""")
+    proc = start_runner(tmp_path, cfg, preexec_fn=lambda: signal.signal(sig, signal.SIG_IGN))
+    try:
+        proc.send_signal(sig)
+        out, _ = proc.communicate(timeout=15)
+    finally:
+        proc.kill()
+    assert proc.returncode == 0, out
+    assert (tmp_path / "out" / "o.txt").read_text() == "finished"
+
+
+@needs_groups
+@pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGQUIT])
+def test_a_step_does_not_outlive_a_killed_runner(tmp_path, sig):
+    cfg = make(tmp_path, SPAWNER)
+    proc = start_runner(tmp_path, cfg)
+    child = int((tmp_path / "child.pid").read_text())
+    try:
+        proc.send_signal(sig)
+        proc.wait(timeout=15)
+    finally:
+        proc.kill()
+    assert wait_until(lambda: not alive(child))
+
+
+@needs_groups
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_a_step_does_not_outlive_a_python_caller(tmp_path, sig):
+    """Only the CLI turns these signals into an interrupt; a Python caller just dies."""
+    cfg = make(tmp_path, SPAWNER)
+    code = ("import sys; from data_pipeline import config; "
+            "from data_pipeline.orchestrator import Orchestrator; "
+            "Orchestrator(config.load(sys.argv[1])).run()")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(cfg)], stdout=subprocess.DEVNULL)
+    pid_file = tmp_path / "child.pid"
+    try:
+        assert wait_until(lambda: pid_file.exists() and pid_file.read_text())
+        child = int(pid_file.read_text())
+        proc.send_signal(sig)
+        proc.wait(timeout=15)
+    finally:
+        proc.kill()
+    assert wait_until(lambda: not alive(child))
 
 
 # -- guarantees a checkpoint depends on -----------------------------------------------------

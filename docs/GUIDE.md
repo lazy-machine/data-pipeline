@@ -558,7 +558,8 @@ exit code stays `0`, so check for the warning if you script `--only`.
 | `130` | interrupted (Ctrl-C, SIGTERM or SIGHUP) |
 
 In CI, `data-pipeline || exit 1` fails the build only on critical problems. If warnings
-should fail the build too, check the output for `completed with warnings`.
+should fail the build too, check the output for `with warnings`. A real run ends with
+`completed with warnings`, and a dry run with `dry run complete with warnings`.
 
 ---
 
@@ -664,11 +665,14 @@ tail -f .pipeline/logs/train.log
 If you press Ctrl-C, the step gets two seconds to stop, then it and any processes it started
 are killed. Its log is kept, and the run ends with `■ interrupted · log: <path>`. The log
 shows the step's last output, and usually the traceback of where it was when you stopped it.
-SIGTERM and SIGHUP (a cancelled CI job, a closed terminal) do the same.
+SIGTERM and SIGHUP (a cancelled CI job, a closed terminal) do the same, unless they were
+already being ignored, so `nohup data-pipeline` keeps running after you log out.
 
 Each worker runs in its own process group. A step that means to leave a process running
 after it succeeds still can, but a process started by a step that times out or is interrupted
-does not survive, unless it moved itself to a new session.
+does not survive, unless it moved itself to a new session. If the runner itself dies, for
+example from `kill -9`, the worker notices within a second and stops the same way, so nothing
+goes on writing outputs that no checkpoint will record.
 
 ### Running from Python
 
@@ -683,7 +687,12 @@ for name, outcome in result.outcomes.items():
 ```
 
 `run()` accepts `only=`, `force=`, `rerun=` and `dry_run=`, the same as the command-line
-options.
+options. `result.warnings` lists what the run warned about, such as a step `only=` left out
+that isn't up to date, and `result.ok` stays true, as the exit code does on the command line.
+
+Only the command line turns SIGTERM and SIGHUP into an interrupt. In your own program they do
+whatever you've set up. If they end the process, the worker stops itself as described above,
+without the two seconds for a traceback.
 
 ---
 
