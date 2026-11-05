@@ -204,7 +204,13 @@ Options: `min_unique = 0.98`
 
 #### `preprocessing.global_scaling` (error)
 
-**Scalers were fitted on the training split only.** Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over train plus evaluation rows together while the training rows alone are not: the scaler was fitted on data the model is later scored on. Every union of splits that contains train is tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the signature, so it is also tested without repeated rows and, when params.source is set, on the rows found in the source only. On large data a match must also be far closer than sampling noise, so data that is already roughly standard is not mistaken for scaled.
+**Scalers were fitted on the training split only.** Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over train plus evaluation rows together while the training rows alone are not: the scaler was fitted on data the model is later scored on. Every union of splits that contains train is tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the signature, so it is also tested without repeated rows and, when params.source is set, on the rows found in the source only. `tol_mean` and `tol_std` are the widest gap allowed. On large data a match must also be closer than `chance_margin` of the sampling noise, plus what the values' rounding explains, so data that is already roughly standard doesn't block. Raise `chance_margin` to loosen this. preprocessing.global_scaling_near warns about the matches this leaves out.
+
+Options: `tol_mean = 0.0001`, `tol_std = 0.001`, `chance_margin = 0.003`
+
+#### `preprocessing.global_scaling_near` (warn)
+
+**No feature is almost scaled over evaluation rows.** Features within `tol_mean` and `tol_std` of mean 0 and std 1 over train plus evaluation rows, but not close enough to rule out chance, so preprocessing.global_scaling doesn't block them. Either a scaler fitted on evaluation rows was followed by rows being added or dropped, or the feature is roughly standard by nature, which on large data is common.
 
 Options: `tol_mean = 0.0001`, `tol_std = 0.001`
 

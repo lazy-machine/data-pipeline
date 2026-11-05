@@ -104,8 +104,8 @@ def _overlap(a: Path, b: Path) -> bool:
 def _ungated_steps(path: Path, gate_name: str | None, params, inputs, workdir) -> list[str]:
     """One line for each step that reads a split the gate checks but can run without it.
 
-    Steps upstream of the gate are left out: they can't depend on it, and what they read
-    isn't the data the model sees until the gate has run.
+    Steps whose outputs feed the gate are left out: they can't depend on it. A step the
+    gate merely runs after is not, because then it read the split unchecked.
     """
     steps = tomllib.loads(path.read_text()).get("steps")
     if not steps:
@@ -116,7 +116,7 @@ def _ungated_steps(path: Path, gate_name: str | None, params, inputs, workdir) -
     def paths(step, key):
         return [(workdir / p).resolve() for p in step.get(key, {}).values()]
 
-    def ancestors(step) -> set[str]:
+    def ancestors(step, ordering: bool = True) -> set[str]:
         seen: set[str] = set()
         queue = [step]
         while queue:
@@ -125,16 +125,17 @@ def _ungated_steps(path: Path, gate_name: str | None, params, inputs, workdir) -
             for other in steps:
                 name = other.get("name")
                 wrote = any(_overlap(i, o) for i in reads for o in paths(other, "outputs"))
-                if (wrote or name in current.get("depends_on", [])) and name not in seen:
+                ordered = ordering and name in current.get("depends_on", [])
+                if (wrote or ordered) and name not in seen:
                     seen.add(name)
                     queue.append(other)
         return seen
 
     split_files = [inputs[n] for n in split_input_names(params, inputs)]
-    before_gate = ancestors(gate)
+    feeds_gate = ancestors(gate, ordering=False)
     found = []
     for step in steps:
-        if step in gates or step.get("name") in before_gate:
+        if step in gates or step.get("name") in feeds_gate:
             continue
         read = [f for f in split_files if any(_overlap(f, i) for i in paths(step, "inputs"))]
         if read and gate.get("name") not in ancestors(step):

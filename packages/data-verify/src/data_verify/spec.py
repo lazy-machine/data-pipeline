@@ -282,8 +282,15 @@ def is_data_input(path: Path) -> bool:
 
 
 def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[str]:
-    """The inputs holding split data, without reading them. Follows the layout rules of
-    ``parse`` but never raises: this also runs before the inputs exist."""
+    """The inputs holding split data, for lint. An approximation of the layout rules of
+    ``parse`` that tolerates what parse rejects, because data inputs may not exist yet. A
+    ``spec`` input is read when it is there, as its params count like the step's."""
+    spec_file = inputs.get("spec")
+    if spec_file is not None and spec_file.is_file():
+        base = read_config_file(spec_file)
+        if isinstance(base, dict):
+            params = {**(base["params"] if isinstance(base.get("params"), dict) else base),
+                      **params}
     source = params.get("source")
     data = [n for n, path in inputs.items() if is_data_input(path) and n not in ("spec", source)]
     splits = params.get("splits")

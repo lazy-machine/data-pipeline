@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from conftest import bucket, time_split
 
-from data_verify.checks.target import _standardized
+from data_verify.checks.target import _rounding_step, _standardized
 
 TIME = {"time": "date", "label_time": "label_date", "time_order": "train < test",
         "time_bounds": {"train": {"max": "2023-03-31"}, "test": {"min": "2023-05-01"}}}
@@ -340,29 +340,91 @@ def test_train_only_standardisation_passes(case, splits):
     assert not case.run(splits).failed("preprocessing.global_scaling")
 
 
-def test_chance_near_standard_data_is_not_scaling():
-    """Roughly standard data misses mean 0 and std 1 by its sampling noise. At this size
-    that noise is inside the option defaults, so they alone would call it scaled."""
-    n = 200_000
-    tol = dict(tol_mean=1e-4, tol_std=1e-3)
-    mean, std = 5e-5, 1 + 5e-4  # well within the noise of N(0, 1) at this size
-    assert not _standardized(n, mean * n, (std**2 + mean**2) * n, **tol)
+LOOSE = dict(tol_mean=1e-4, tol_std=1e-3)
+ONE_FEATURE = {"group": [], "weight": None, "features": ["f1"], "forbidden": []}
 
 
-@pytest.mark.parametrize("rows", [300, 200_000, 2_000_000])
-@pytest.mark.parametrize("decimals", [None, 3])
-def test_scaled_data_is_still_recognised_at_any_size(rows, decimals):
+def _one_feature(x: np.ndarray) -> dict[str, pd.DataFrame]:
+    d = pd.DataFrame({"row_id": np.arange(len(x)), "f1": x,
+                      "y": np.random.default_rng(1).integers(0, 2, len(x))})
+    return {"train": d.iloc[: len(x) * 3 // 4], "test": d.iloc[len(x) * 3 // 4:]}
+
+
+def _scaled(rows: int) -> np.ndarray:
     x = np.random.default_rng(0).normal(5, 3, rows)
+    return (x - x.mean()) / x.std()
+
+
+def test_large_data_standard_by_chance_warns_but_does_not_block(case):
+    """Mean 5e-5 and std 1.0005 are well within the noise of N(0, 1) at this size, but inside
+    the fixed tolerances that blocked here before."""
+    r = case.run(_one_feature(_scaled(200_000) * (1 + 5e-4) + 5e-5), ONE_FEATURE)
+    assert not r.failed("preprocessing.global_scaling")
+    assert r.failed("preprocessing.global_scaling_near")
+    assert r["passed"]
+
+
+def test_raising_chance_margin_restores_the_block(case):
+    r = case.run(_one_feature(_scaled(200_000) * (1 + 5e-4) + 5e-5), {
+        **ONE_FEATURE, "checks": {"preprocessing.global_scaling": {"chance_margin": 1.0}}})
+    assert r.failed("preprocessing.global_scaling")
+
+
+def test_widening_the_tolerances_is_honoured_while_the_margin_is_raised(case):
+    x = _scaled(200_000)
+    x[:150_000] += 0.1   # train alone stays far from standard at any of these tolerances
+    x[150_000:] -= 0.3
     x = (x - x.mean()) / x.std()
+    frames = _one_feature(x * (1 + 5e-3) + 5e-4)   # outside the default tolerances
+    assert not case.run(frames, {**ONE_FEATURE, "checks": {"preprocessing.global_scaling": {
+        "chance_margin": 100.0}}}).failed("preprocessing.global_scaling")
+    assert case.run(frames, {**ONE_FEATURE, "checks": {"preprocessing.global_scaling": {
+        "chance_margin": 100.0, "tol_mean": 1e-2, "tol_std": 1e-2}}}
+    ).failed("preprocessing.global_scaling")
+
+
+def test_scaler_on_a_csv_with_two_decimals_blocks_on_large_data(case):
+    r = case.run(_one_feature(np.round(_scaled(200_000), 2)), ONE_FEATURE)
+    assert r.failed("preprocessing.global_scaling")
+
+
+def test_rows_dropped_after_scaling_still_warn(case):
+    frames = _one_feature(_scaled(200_000))
+    frames["train"] = frames["train"].iloc[100:]
+    r = case.run(frames, ONE_FEATURE)
+    assert r.failed("preprocessing.global_scaling_near")
+
+
+def test_near_check_does_not_repeat_what_blocks(case):
+    r = case.run(_one_feature(_scaled(200_000)), ONE_FEATURE)
+    assert r.failed("preprocessing.global_scaling")
+    assert not r.failed("preprocessing.global_scaling_near")
+
+
+@pytest.mark.parametrize("rows, decimals", [
+    (300, None), (300, 3), (200_000, None), (200_000, 3), (2_000_000, None), (2_000_000, 3),
+    (20_000, 2), (200_000, 2), (2_000_000, 2), (20_000_000, 2),
+])
+def test_scaled_data_is_still_recognised_at_any_size(rows, decimals):
+    x = _scaled(rows)
     if decimals is not None:  # a CSV keeps only so many digits
         x = np.round(x, decimals)
-    assert _standardized(len(x), x.sum(), (x**2).sum(), tol_mean=1e-4, tol_std=1e-3)
+    assert _standardized(len(x), x.sum(), (x**2).sum(), **LOOSE, margin=0.003,
+                         step=_rounding_step(x))
 
 
 def test_float32_scaled_data_is_still_recognised():
-    x = np.random.default_rng(0).normal(5, 3, 2_000_000)
-    x = ((x - x.mean()) / x.std()).astype("float32").astype("float64")
-    assert _standardized(len(x), x.sum(), (x**2).sum(), tol_mean=1e-4, tol_std=1e-3)
+    x = _scaled(2_000_000).astype("float32").astype("float64")
+    assert _standardized(len(x), x.sum(), (x**2).sum(), **LOOSE, margin=0.003,
+                         step=_rounding_step(x))
+
+
+@pytest.mark.parametrize("values, step", [
+    ([1.25, 2.5, 3.75], 0.01), ([1.0, 2.0], 1.0), ([0.123456, 0.5], 1e-6),
+    ([np.pi, np.e], 0.0), ([], 0.0), ([1.25, np.inf, -np.inf], 0.01),
+])
+def test_rounding_step(values, step):
+    assert _rounding_step(np.array(values)) == pytest.approx(step)
 
 
 def test_global_minmax_on_train_plus_val(case, splits):

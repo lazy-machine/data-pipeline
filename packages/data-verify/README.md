@@ -396,7 +396,10 @@ A pass means that no blocking check fired, not that the data is clean.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves no signature.** Standardisation and min-max scaling fitted on
-  evaluation rows are detected. Target encoding and imputation fitted on them are not.
+  evaluation rows block when the signature is exact. If rows were added or dropped after
+  scaling, a match can't be told from chance on large data, so it only warns
+  (`preprocessing.global_scaling_near`). That warning also fires on features that are roughly
+  standard by nature. Target encoding and imputation leave no signature at all.
 
 To be stricter, set `checks = { "poisoning.*" = "error" }`, or `fail_on = "warn"` to block on
 every warning. Expect false alarms on heavy-tailed data. Fit preprocessing inside a
@@ -404,7 +407,7 @@ pipeline after the split, since the gate can't confirm that from the data.
 
 ## What it checks
 
-51 built-in checks. `data-verify checks` lists them with their options, and
+52 built-in checks. `data-verify checks` lists them with their options, and
 [docs/CHECKS.md](docs/CHECKS.md) describes each one. By area:
 
 **split**

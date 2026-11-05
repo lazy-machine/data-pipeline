@@ -13,6 +13,8 @@ import pytest
 
 import data_verify
 from data_verify.cli import main
+from data_verify.core import REGISTRY
+from data_verify.spec import parse, split_input_names
 from data_verify.step import _named
 
 PREP = '''
@@ -246,16 +248,10 @@ depends_on = ["verify"]
     assert main(["lint", str(toml)]) == 0
 
 
-def test_lint_allows_steps_that_feed_the_gate_or_read_only_the_source(tmp_path):
+def test_lint_allows_a_step_that_feeds_the_gate(tmp_path):
     toml = _lint_project(tmp_path / "p", lambda t: t.replace(
         'test = "build/test.parquet" }\noutputs = { report',
         'test = "build/test.parquet", stats = "build/stats.json" }\noutputs = { report') + """
-[[steps]]
-name = "overview"
-function = "prep:train"
-inputs = { raw = "build/source.parquet" }
-outputs = { model = "build/overview.txt" }
-
 [[steps]]
 name = "stats"
 function = "prep:train"
@@ -263,6 +259,85 @@ inputs = { train = "build/train.parquet" }
 outputs = { model = "build/stats.json" }
 """)
     assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_flags_a_model_the_gate_merely_runs_after(tmp_path, capsys):
+    """Ordering the gate after a step doesn't check what that step read."""
+    toml = _lint_project(tmp_path / "p", lambda t: _ungated(t).replace(
+        'name = "verify"\n', 'name = "verify"\ndepends_on = ["train"]\n'))
+    assert main(["lint", str(toml)]) == 1
+    assert "'train' reads" in capsys.readouterr().out
+
+
+# one table named nothing special, so only `source` tells it from the raw data
+SOURCE_ONLY = """
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = {{ rows = "build/rows.parquet", {extra} }}
+params = {{ label = "y"{params} }}
+
+[[steps]]
+name = "overview"
+function = "m:f"
+inputs = {{ raw = "build/raw.parquet" }}
+outputs = {{ o = "build/o.txt" }}
+"""
+
+
+def test_lint_allows_a_step_reading_only_the_source(tmp_path):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(SOURCE_ONLY.format(extra='raw = "build/raw.parquet"',
+                                       params=', source = "raw"'))
+    assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_reads_the_source_from_a_spec_input(tmp_path):
+    (tmp_path / "gate.toml").write_text('source = "raw"\n')
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(SOURCE_ONLY.format(extra='raw = "build/raw.parquet", spec = "gate.toml"',
+                                       params=""))
+    assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_flags_a_split_named_only_in_a_spec_input(tmp_path, capsys):
+    (tmp_path / "gate.toml").write_text('label = "y"\nsplits = ["a", "b"]\n')
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { a = "build/a.parquet", b = "build/b.parquet", spec = "gate.toml" }
+
+[[steps]]
+name = "train"
+function = "m:f"
+inputs = { a = "build/a.parquet" }
+outputs = { o = "build/o.txt" }
+""")
+    assert main(["lint", str(toml)]) == 1
+    assert "'train' reads build/a.parquet" in capsys.readouterr().out
+
+
+def test_the_iris_example_passes_lint():
+    assert main(["lint", str(Path(__file__).parents[3] / "examples/iris/pipeline.toml")]) == 0
+
+
+@pytest.mark.parametrize("params, names, expected", [
+    ({"label": "y"}, ["train", "test", "aux"], ["train", "test"]),
+    ({"label": "y", "source": "raw"}, ["train", "test", "raw"], ["train", "test"]),
+    ({"label": "y", "splits": ["a", "b"]}, ["a", "b", "aux"], ["a", "b"]),
+    ({"label": "y", "splits": {"train": "a", "test": "b"}}, ["a", "b"], ["a", "b"]),
+    ({"label": "y", "split_column": "s", "table": "t", "splits": ["train", "test"]},
+     ["t", "aux"], ["t"]),
+    ({"label": "y", "split_column": "s", "splits": ["train", "test"]}, ["t"], ["t"]),
+    ({"label": "y"}, ["only"], ["only"]),
+])
+def test_lint_layout_agrees_with_the_real_parser(tmp_path, params, names, expected):
+    inputs = {n: tmp_path / f"{n}.parquet" for n in names}
+    spec = parse(params, inputs, REGISTRY)
+    assert split_input_names(params, inputs) == expected
+    assert set(expected) == ({spec.table} if spec.table else set(spec.split_inputs.values()))
 
 
 def test_lint_covers_a_table_holding_every_split(tmp_path, capsys):
