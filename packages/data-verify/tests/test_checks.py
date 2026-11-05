@@ -1127,6 +1127,20 @@ def test_flips_are_found_despite_a_shift_in_class_balance(case):
     assert case.run(frames, NUMERIC_ONLY).failed("poisoning.label_consistency")
 
 
+def test_features_that_vary_more_in_evaluation_fire_and_the_warning_says_why(case):
+    """A known false alarm: clean labels are easier to predict where the features vary more."""
+    def frame(n, seed, spread):
+        rng = np.random.default_rng(seed)
+        x = rng.normal(0, spread, (n, 2))
+        logit = 1.2 * x[:, 0] - 0.8 * x[:, 1] + rng.normal(scale=1.5, size=n)
+        return pd.DataFrame({"y": (rng.random(n) < 1 / (1 + np.exp(-logit))).astype("int64"),
+                             "f1": x[:, 0], "f2": x[:, 1]})
+    r = case.run({"train": frame(4200, 1, 1.0), "test": frame(1800, 2, 2.0)}, NUMERIC_ONLY)
+    c = r.check("poisoning.label_consistency")
+    assert c["status"] == "fail"
+    assert "features vary more in one split" in c["hint"]
+
+
 def test_a_split_name_with_a_space_warns_rather_than_crashing(case, splits):
     splits = _strong(splits)
     _flip(splits["train"], splits["train"].sample(frac=0.3, random_state=0).index)

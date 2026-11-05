@@ -355,6 +355,11 @@ never show them, promote them:
 
 Or set `fail_on = "warn"` to block on every warning.
 
+Don't promote `poisoning.label_consistency`, alone or through `"poisoning.*" = "error"`, unless
+your splits are drawn from the same distribution. It also fires on clean data when the
+features vary more in an evaluation split than in train (a covariate shift, such as a wider
+spread of values), and it would then block a run that has nothing wrong with its labels.
+
 ### Unlabeled test split
 
 ```toml
