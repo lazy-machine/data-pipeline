@@ -8,15 +8,14 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from ..core import check, failed, frac, numeric_values, passed, row_hashes, skipped
-from ..stats import spearman
+from ..core import check, failed, frac, passed, row_hashes, skipped
 from .splits import _ENTITY_NAME
 
 # Without keys, a match needs more evidence than a match on every column does.
 _RARE_VALUE = 5  # training rows that may share a value for a match on it to mean something
-_FINE_BITS = 14  # about 4 significant digits; at 3, correlated columns collide by themselves
-_TIED = 0.99  # rank correlation at which one column adds nothing to a match on the other
-_MIN_SHARE = 0.005  # correlated columns still meet now and then, and shuffling can't show it
+_FINE_BITS = 32  # about 10 significant digits: the share of rows that match by chance on a number
+# is about rows * 2**-bits, however the columns relate, so it stays below _MIN_SHARE to ~10**7 rows
+_MIN_SHARE = 0.005  # coarse columns that depend on each other still meet now and then
 
 
 def _is_key(v, col: str, key_share: float) -> bool:
@@ -38,33 +37,6 @@ def _is_key(v, col: str, key_share: float) -> bool:
     whole = kind == "int" or (kind == "float" and bool((s == s.round()).all()))
     return whole and ((values >= 20 and share >= 0.98) or
                       (values >= 50 and share >= key_share and bool(_ENTITY_NAME.search(col))))
-
-
-def _tied(v, a: str, b: str) -> bool:
-    """Whether a match on ``a`` is a match on ``b`` too. Numbers: rank correlation of at least
-    _TIED. Anything else: ``a`` fixes ``b`` or the other way round."""
-    train = v.train
-    if v.kind(a) in ("int", "float") and v.kind(b) in ("int", "float"):
-        x, y = numeric_values(train[a])[:2000], numeric_values(train[b])[:2000]
-        ok = ~(np.isnan(x) | np.isnan(y))
-        return int(ok.sum()) >= 20 and abs(spearman(x[ok], y[ok])) >= _TIED
-    ha, hb = (v.hashes(v.train_name, c, True, _FINE_BITS) for c in ((a,), (b,)))
-    joint = len(np.unique(v.hashes(v.train_name, (a, b), True, _FINE_BITS)))
-    return joint == max(len(np.unique(ha)), len(np.unique(hb)))
-
-
-def _untied(v, cols: tuple[str, ...]) -> list[str]:
-    """``cols`` without those that repeat an earlier column. Two such columns match together
-    exactly as often as one alone, which shuffling them separately would not show: the chance
-    it measures collapses and a clean dataset then looks copied."""
-    kept: list[str] = []
-    for c in cols:
-        try:
-            if not any(_tied(v, k, c) for k in kept):
-                kept.append(c)
-        except TypeError:   # lists and other unhashable cells
-            kept.append(c)
-    return kept
 
 
 def _anchors(v, cols: tuple[str, ...]) -> list[str]:
@@ -175,11 +147,9 @@ def _cross(v, opt, near: bool):
         # a second look, not a replacement: a copy under a new key doesn't match on all columns
         keys = [c for c in cols if _is_key(v, c, opt["key_share"])]
         rest = tuple(c for c in cols if c not in keys)
-        rest = tuple(_untied(v, rest)) if keys else rest
         anchors = _anchors(v, rest)
         if keys:
             details["ignored_keys"] = keys
-            details["ignored_repeats"] = [c for c in cols if c not in keys and c not in rest]
         if keys and anchors:
             found, share = _matches(v, rest, cols, near, _FINE_BITS, anchors)
             chance = _chance_share(v, rest, anchors) if opt["baseline"] else 0.0
@@ -226,14 +196,14 @@ def near_cross_split(v, opt):
     matches: whole numbers distinct on almost every row, and short text, single tokens such
     as hashes, or entity-named whole numbers with at least 50 values, distinct on at least
     `key_share` of rows. The report lists them in `ignored_keys`. Without them rows can match
-    by chance, so this second comparison asks for more: about 4 significant digits, and a
-    value at most 5 training rows have in a column where at least half the values are
-    distinct. A column that repeats another (rank correlation of 0.99 or more for numbers,
-    one fixing the other for the rest) is left out, listed in `ignored_repeats`: shuffling
-    the two apart would forget they move together. With `baseline` on it allows 0.5% of
-    rows, or `ratio` times the share that matches when each training column is shuffled on
-    its own. So under a new key, it doesn't find copies in data with only coarse columns,
-    in data whose columns are all repeats of one, copies of common values, a row copied more
+    by chance, so this second comparison asks for more: numbers equal to about 10 significant
+    digits, and a value at most 5 training rows have in a column where at least half the values
+    are distinct. With `baseline` on it allows 0.5% of rows, or `ratio` times the share that
+    matches when each training column is shuffled on its own. So under a new key, a copy must
+    carry the same numbers: one with jittered or rounded values is not found, unless the keys
+    are declared (`params.id` and `params.group`), which leaves only the comparison at `bits`.
+    It doesn't find copies in data with only coarse columns, such as values rounded to 4
+    decimals with another column derived from them, copies of common values, a row copied more
     than 5 times, or a copy given a fresh timestamp or other per-row value, unless `columns`
     leaves that column out."""
     return _cross(v, opt, near=True)

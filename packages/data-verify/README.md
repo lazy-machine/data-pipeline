@@ -413,11 +413,15 @@ A pass means that no blocking check fired, not that the data is clean.
   more in an evaluation split can, with either kind of label, so read it as a prompt to
   compare labels with their source, not as proof. Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
-- **Near-copies under a new key.** These need a column with mostly distinct values to go on,
-  and they warn at best. Copies are missed in data with only coarse columns, in data whose
-  columns, key aside, are all repeats of one (columns that repeat another are left out of
-  this comparison), or when a row was copied more than 5 times or given a fresh timestamp or
-  other per-row value.
+- **Near-copies under a new key.** With a unique key column that isn't declared as `id`, the
+  check also compares the other columns, but only numbers equal to about 10 significant
+  digits (it must be that fine, or columns that depend on each other match by chance), and
+  it needs a column with mostly distinct values to go on. So a copy whose numbers were
+  jittered, rounded or re-measured is missed unless you declare the keys (`id`, `group`), and it warns
+  at best. Also missed: data with only coarse columns, a row copied more than 5 times, and
+  a copy given a fresh timestamp or other per-row value. Values rounded to about 4 decimals
+  with a column derived from them, and nothing else beside the key, can raise a false
+  alarm; turn the check off for such data.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling

@@ -961,11 +961,12 @@ LABEL_ONLY = {"id": [], "group": [], "weight": None, "features": "auto", "forbid
               "checks": {"temporal.undeclared_time": "off"}}
 
 
-def _near_copies(splits, rows=100):
+def _near_copies(splits, rows=100, jitter=0.0):
+    """Rows of test copied into train under a new id and customer, numbers optionally jittered."""
     copies = splits["test"].head(rows).copy()
     copies["row_id"] += 10**7
     copies["customer"] = "N" + copies["row_id"].astype(str)
-    copies[["f1", "f2", "f3", "f4"]] *= 1 + 1e-5
+    copies[["f1", "f2", "f3", "f4"]] *= 1 + jitter
     splits["train"] = pd.concat([splits["train"], copies], ignore_index=True)
     for d in splits.values():
         d.drop(columns=["date", "label_date", "weight"], inplace=True)
@@ -975,17 +976,6 @@ def _near_copies(splits, rows=100):
 def test_near_copies_under_undeclared_keys_are_found(case, splits):
     r = case.run(_near_copies(splits), LABEL_ONLY)
     assert r.failed("duplicates.near_cross_split")
-
-
-def test_exact_copies_under_undeclared_keys_are_found_by_the_near_check(case, splits):
-    """Not the same on every column, so duplicates.cross_split can't see them either."""
-    copies = splits["test"].head(100).copy()
-    copies["row_id"] += 10**7
-    copies["customer"] = "N" + copies["row_id"].astype(str)
-    splits["train"] = pd.concat([splits["train"], copies], ignore_index=True)
-    for d in splits.values():
-        d.drop(columns=["date", "label_date", "weight"], inplace=True)
-    assert case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
 
 
 def test_columns_that_cannot_tell_rows_apart_stay_quiet_without_the_keys(case, splits):
@@ -1000,49 +990,98 @@ def test_clean_data_with_undeclared_keys_has_no_near_copies(case, splits):
     assert not case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
 
 
-def _repeated_columns(noise: float, n: int = 20000, seed: int = 1) -> dict:
-    """Clean rows with an undeclared unique key and a column that repeats another."""
+def _keyed(columns, n=20000, train=15000, seed=1):
+    """Clean rows with an undeclared unique string key, split train / test."""
     rng = np.random.default_rng(seed)
-    a = rng.normal(size=n)
-    d = pd.DataFrame({"sid": [f"s{i}" for i in range(n)], "a": a,
-                      "b": a + (rng.normal(0, noise, n) if noise else 0.0),
+    d = pd.DataFrame({"sid": [f"s{i}" for i in range(n)], **columns(rng, n),
                       "y": rng.integers(0, 2, n)})
-    k = n * 3 // 4
-    return {"train": d.iloc[:k], "test": d.iloc[k:]}
+    return {"train": d.iloc[:train].copy(), "test": d.iloc[train:].copy()}
+
+
+def _copy_into_train(frames, rows):
+    copies = frames["test"].head(rows).copy()
+    copies["sid"] = "N" + copies["sid"]
+    frames["train"] = pd.concat([frames["train"], copies], ignore_index=True)
+    return frames
+
+
+def _near_quiet(case, frames):
+    return not case.run(frames, LABEL_ONLY).failed("duplicates.near_cross_split")
+
+
+def _repeating(noise):
+    def columns(rng, n):
+        a = rng.normal(size=n)
+        return {"a": a, "b": a + (rng.normal(0, noise, n) if noise else 0.0)}
+    return columns
 
 
 @pytest.mark.parametrize("noise", [0.0, 0.0001, 0.0005, 0.002])
-def test_a_column_that_repeats_another_is_not_chance_evidence_of_copies(case, noise):
-    """Shuffling the two apart used to forget they move together, so any match looked rare."""
-    r = case.run(_repeated_columns(noise), {**LABEL_ONLY, "features": "auto"})
-    assert not r.failed("duplicates.near_cross_split")
-    assert r.check("duplicates.near_cross_split")["details"]["ignored_repeats"] == ["b"]
+def test_a_column_that_repeats_another_is_not_evidence_of_copies(case, noise):
+    """Two columns that move together match together, however finely the values are compared."""
+    assert _near_quiet(case, _keyed(_repeating(noise)))
 
 
-def test_copies_are_still_found_beside_a_column_that_repeats_another(case, splits):
+@pytest.mark.parametrize("make", [lambda a: a ** 2, np.abs, lambda a: np.sin(3 * a), np.cos],
+                         ids=["square", "abs", "sin", "cos"])
+def test_a_column_that_depends_on_another_without_being_monotone_is_not_evidence(case, make):
+    assert _near_quiet(case, _keyed(lambda rng, n: (lambda a: {"a": a, "b": make(a)})(
+        rng.normal(size=n))))
+
+
+@pytest.mark.parametrize("head", ["independent", "missing"])
+def test_the_start_of_train_does_not_decide_what_counts_as_chance(case, head):
+    def columns(rng, n):
+        a = rng.normal(size=n)
+        b = a.copy()
+        if head == "independent":
+            b[:2000] = rng.normal(size=2000)
+        else:
+            a[:2000] = np.nan
+        return {"a": a, "b": b}
+    assert _near_quiet(case, _keyed(columns))
+
+
+def test_chance_matches_stay_rare_on_a_large_train(case):
+    """The share that matches by chance grows with the rows, so the precision has to as well."""
+    assert _near_quiet(case, _keyed(_repeating(0.0), n=300_000, train=225_000))
+
+
+@pytest.mark.parametrize("coarse_first", [True, False], ids=["coarse-first", "fine-first"])
+def test_copies_are_found_whatever_the_order_of_columns(case, coarse_first):
+    def columns(rng, n):
+        f = rng.normal(size=n)
+        cols = {"c1": f.round(1), "f": f} if coarse_first else {"f": f, "c1": f.round(1)}
+        return {**cols, "h": rng.normal(size=n)}
+    assert _near_quiet(case, _keyed(columns))
+    assert not _near_quiet(case, _copy_into_train(_keyed(columns), 150))
+
+
+@pytest.mark.parametrize("constant", [False, True], ids=["text", "constant-then-text"])
+def test_independent_text_columns_do_not_hide_copies(case, constant):
+    vocab = np.array([f"w{i}" for i in range(2000)])
+
+    def columns(rng, n):
+        text = {f"t{i}": [" ".join(rng.choice(vocab, 10)) for _ in range(n)] for i in range(3)}
+        return {"k": "constant", **text} if constant else text
+    assert _near_quiet(case, _keyed(columns, n=4000, train=2800))
+    assert not _near_quiet(case, _copy_into_train(_keyed(columns, n=4000, train=2800), 150))
+
+
+def test_columns_that_repeat_another_do_not_hide_copies(case, splits):
     for d in splits.values():
         d["f5"] = d["f1"] + np.random.default_rng(3).normal(0, 0.0005, len(d))
-    r = case.run(_near_copies(splits), LABEL_ONLY)
-    assert r.failed("duplicates.near_cross_split")
-    assert r.check("duplicates.near_cross_split")["details"]["ignored_repeats"] == ["f5"]
-
-
-def test_a_text_column_that_repeats_another_is_dropped_too(case, splits):
-    for d in splits.values():
         d["plan2"] = d["plan"]
-    r = case.run(_near_copies(splits), LABEL_ONLY)
-    assert "plan2" in r.check("duplicates.near_cross_split")["details"]["ignored_repeats"]
-    assert r.failed("duplicates.near_cross_split")
+    assert case.run(_near_copies(splits), LABEL_ONLY).failed("duplicates.near_cross_split")
 
 
-def test_copies_are_missed_when_every_column_left_repeats_one_other(case):
-    """The limit: one column is all that remains, and one column can't tell copies from chance."""
-    frames = _repeated_columns(0.0, n=4000)
-    copies = frames["test"].head(200).copy()
-    copies["sid"] = "N" + copies["sid"]
-    frames["train"] = pd.concat([frames["train"], copies], ignore_index=True)
-    assert not case.run(frames, {**LABEL_ONLY, "features": "auto"}).failed(
-        "duplicates.near_cross_split")
+def test_a_copy_with_jittered_numbers_is_not_found_under_an_undeclared_key(case, splits):
+    """The limit: under a new key a copy must carry the same numbers. Declared keys (`id`,
+    `group`) leave only the comparison at `bits`, which sees them."""
+    jittered = _near_copies(splits, jitter=1e-5)
+    assert not case.run(jittered, LABEL_ONLY).failed("duplicates.near_cross_split")
+    declared = {**LABEL_ONLY, "id": "row_id", "group": "customer"}
+    assert case.run(jittered, declared).failed("duplicates.near_cross_split")
 
 
 def test_columns_option_is_not_second_guessed(case, splits):
@@ -1390,7 +1429,7 @@ def test_a_feature_that_looks_like_a_key_does_not_hide_copies(case):
 def test_baseline_off_means_no_allowance(case):
     rng = np.random.default_rng(0)
     d = pd.DataFrame({"rid": [f"r{i}" for i in range(8000)], "y": rng.integers(0, 2, 8000),
-                      "a": rng.normal(size=8000)})   # alone, rare values do meet by chance
+                      "a": rng.normal(size=8000).round(4)})   # alone, rare values do meet by chance
     frames = {"train": d.iloc[:6000], "test": d.iloc[6000:]}
     quiet = case.run(frames, LABEL_ONLY)
     assert not quiet.failed("duplicates.near_cross_split")
