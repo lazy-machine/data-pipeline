@@ -13,6 +13,7 @@ from ..core import (
     REGISTRY, check, examples, failed, fmt, is_numeric_kind, kind, matches, numeric_values, passed,
     resolve_check, skipped, value_text, value_texts,
 )
+from ..spec import SpecError
 from ..stats import feature_scores
 
 
@@ -384,6 +385,9 @@ def global_scaling(v, opt):
     values rounded more coarsely or to significant figures, in float32 with a large offset, or
     with rows added or dropped afterwards. preprocessing.global_scaling_near warns about what
     is left within `tol_mean` and `tol_std`."""
+    if opt["chance_margin"] <= 0:
+        raise SpecError("checks.preprocessing.global_scaling.chance_margin must be above 0: at "
+                        "0 nothing can block")
     if len(v.splits) < 2:
         return skipped("one split only")
     hits = _blocking_hits(v, opt["tol_mean"], opt["tol_std"], opt["chance_margin"])

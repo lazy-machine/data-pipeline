@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 from conftest import bucket, time_split
 
+from data_verify import SpecError
 from data_verify.checks.target import _rounding_step, _standardized
 
 TIME = {"time": "date", "label_time": "label_date", "time_order": "train < test",
@@ -362,6 +363,13 @@ def test_large_data_standard_by_chance_warns_but_does_not_block(case):
     assert not r.failed("preprocessing.global_scaling")
     assert r.failed("preprocessing.global_scaling_near")
     assert r["passed"]
+
+
+@pytest.mark.parametrize("margin", [0, -1.0])
+def test_a_margin_of_zero_is_a_config_error(case, margin):
+    with pytest.raises(SpecError, match="chance_margin"):
+        case.run(_one_feature(_scaled(1000)), {**ONE_FEATURE, "checks": {
+            "preprocessing.global_scaling": {"chance_margin": margin}}})
 
 
 def test_raising_chance_margin_restores_the_block(case):

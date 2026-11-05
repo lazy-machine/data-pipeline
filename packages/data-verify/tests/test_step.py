@@ -8,13 +8,14 @@ import sys
 import textwrap
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import data_verify
 from data_verify.cli import main
 from data_verify.core import REGISTRY
-from data_verify.spec import parse, split_input_names
+from data_verify.spec import SpecError, parse, read_config_file, split_input_names
 from data_verify.step import _named
 
 PREP = '''
@@ -471,7 +472,7 @@ outputs = { o = "build/o.txt" }
     assert main(["lint", str(toml)]) == 0
 
 
-def test_lint_survives_malformed_layouts(tmp_path):
+def test_lint_survives_malformed_layouts(tmp_path, capsys):
     toml = tmp_path / "pipeline.toml"
     toml.write_text("""
 [[steps]]
@@ -485,7 +486,8 @@ name = "odd"
 function = "m:f"
 inputs = ["build/a.parquet"]
 """)
-    assert main(["lint", str(toml)]) in (0, 2)
+    assert main(["lint", str(toml)]) == 0
+    assert "not checked" in capsys.readouterr().out
 
 
 def test_lint_sees_a_dotted_directory_split_that_is_not_built_yet(tmp_path, capsys):
@@ -588,6 +590,60 @@ def test_lint_has_nothing_to_compare_when_a_gate_has_only_a_source(tmp_path, cap
     assert "not checked" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("command", ["lint", "run"])
+def test_a_non_string_input_on_the_gate_is_a_config_error(tmp_path, capsys, command):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { train = 1 }
+params = { label = "y" }
+""")
+    assert main([command, str(toml)]) == 2
+    assert "inputs must be a table" in capsys.readouterr().err
+
+
+def test_yaml_that_cannot_be_parsed_is_a_config_error(tmp_path, monkeypatch):
+    class YAMLError(Exception):
+        pass
+
+    def safe_load(text):
+        raise YAMLError("bad")
+
+    monkeypatch.setitem(sys.modules, "yaml", SimpleNamespace(YAMLError=YAMLError,
+                                                             safe_load=safe_load))
+    path = tmp_path / "c.yaml"
+    path.write_text("a: [1")
+    with pytest.raises(SpecError, match="not valid YAML"):
+        read_config_file(path)
+
+
+@pytest.mark.parametrize("name, text, message", [
+    ("c.json", "{", "not valid JSON"),
+    ("c.toml", "a = = 1", "not valid TOML"),
+])
+def test_config_files_that_cannot_be_parsed_are_config_errors(tmp_path, name, text, message):
+    path = tmp_path / name
+    path.write_text(text)
+    with pytest.raises(SpecError, match=message):
+        read_config_file(path)
+
+
+def test_a_config_path_that_cannot_be_read_is_a_config_error(tmp_path):
+    folder = tmp_path / "c.toml"
+    folder.mkdir()
+    with pytest.raises(SpecError, match="cannot read c.toml"):
+        read_config_file(folder)
+
+
+def test_lint_says_to_move_a_gate_ordered_after_the_step(tmp_path, capsys):
+    toml = _lint_project(tmp_path / "p", lambda t: _ungated(t).replace(
+        'name = "verify"\n', 'name = "verify"\ndepends_on = ["train"]\n'))
+    assert main(["lint", str(toml)]) == 1
+    assert "move 'verify' before it" in capsys.readouterr().out
+
+
 def test_lint_survives_a_step_with_a_non_string_input(tmp_path):
     toml = tmp_path / "pipeline.toml"
     toml.write_text("""
@@ -602,7 +658,7 @@ name = "odd"
 function = "m:f"
 inputs = { t = 1 }
 """)
-    assert main(["lint", str(toml)]) in (0, 2)
+    assert main(["lint", str(toml)]) == 0
 
 
 def test_a_malformed_config_is_a_config_error(tmp_path, capsys):

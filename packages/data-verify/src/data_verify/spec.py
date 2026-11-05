@@ -80,7 +80,10 @@ def _expect(cond: bool, msg: str) -> None:
 
 def read_config_file(path: Path) -> Any:
     suffix = path.suffix.lower()
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        raise SpecError(f"cannot read {path.name}: {e}") from None
     try:
         if suffix == ".toml":
             return tomllib.loads(text)
@@ -93,7 +96,10 @@ def read_config_file(path: Path) -> Any:
             import yaml  # type: ignore[import-untyped]
         except ImportError:
             raise SpecError(f"{path.name}: reading YAML needs PyYAML installed") from None
-        return yaml.safe_load(text)
+        try:
+            return yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            raise SpecError(f"{path.name} is not valid YAML: {e}") from None
     raise SpecError(f"{path.name}: references can read .toml, .json or .yaml files")
 
 

@@ -81,6 +81,7 @@ tell which inputs hold the splits: a reference or `spec` isn't readable yet, a s
 isn't an input, an unbuilt path has an unknown suffix, or `source` is set with several other
 tables and no split names. With a config file listed first and `source` set, lint looks at
 the data table while the gate takes the config as the split and fails, so list the data first.
+In CI, treat `not checked` as a failure if you rely on this check: the exit code doesn't show it.
 
 ### Declare every role that exists in your data
 

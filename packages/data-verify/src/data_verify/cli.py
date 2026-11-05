@@ -30,6 +30,13 @@ exit codes: 0 passed, 1 blocked, 2 bad config
 """
 
 
+def _declared(step: dict, key: str, workdir: Path) -> dict[str, Path]:
+    table = step.get(key, {})
+    if not isinstance(table, dict) or not all(isinstance(p, str) for p in table.values()):
+        raise SpecError(f"{key} must be a table of name = \"path\"")
+    return {k: (workdir / p).resolve() for k, p in table.items()}
+
+
 def _load_target(path: Path, step_name: str | None, need_inputs: bool = True):
     try:
         data = tomllib.loads(path.read_text())
@@ -67,8 +74,7 @@ def _load_target(path: Path, step_name: str | None, need_inputs: bool = True):
         if unknown:
             raise SpecError(f"{path}: unknown key(s) {sorted(unknown)}; a standalone config has "
                             "inputs, outputs, params (and optional workdir, python_path)")
-    inputs = {k: (workdir / p).resolve() for k, p in step.get("inputs", {}).items()}
-    outputs = {k: (workdir / p).resolve() for k, p in step.get("outputs", {}).items()}
+    inputs, outputs = _declared(step, "inputs", workdir), _declared(step, "outputs", workdir)
     missing = [f"{k}: {p}" for k, p in inputs.items() if not p.exists()]
     if missing and need_inputs:
         raise SpecError("input(s) not found: " + "; ".join(missing))
@@ -140,6 +146,7 @@ def _ungated_steps(path: Path, gate_name: str | None, params, inputs,
         return None
     split_files = [inputs[n] for n in names]
     feeds_gate = ancestors(gate, ordering=False)
+    before_gate = ancestors(gate)
     found = []
     for step in steps:
         if step in gates or step.get("name") in feeds_gate:
@@ -147,8 +154,9 @@ def _ungated_steps(path: Path, gate_name: str | None, params, inputs,
         read = [f for f in split_files if any(_overlap(f, i) for i in paths(step, "inputs"))]
         if read and gate.get("name") not in ancestors(step):
             where = read[0].relative_to(workdir) if read[0].is_relative_to(workdir) else read[0]
-            found.append(f"step '{step.get('name')}' reads {where} without the gate: add "
-                         f"depends_on = [\"{gate.get('name')}\"]")
+            fix = f"move '{gate.get('name')}' before it" if step.get("name") in before_gate \
+                else f"add depends_on = [\"{gate.get('name')}\"]"
+            found.append(f"step '{step.get('name')}' reads {where} without the gate: {fix}")
     return found
 
 

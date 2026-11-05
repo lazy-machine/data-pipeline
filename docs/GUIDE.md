@@ -431,7 +431,8 @@ Warnings (drift, near-duplicates, suspicious names, most poisoning signs) don't 
 the status line names them (`warnings=1 warned=drift.features`), and the report explains
 them. Read them before you trust a result. A project that would rather stop can raise them:
 `checks = { "poisoning.*" = "error" }`, or `fail_on = "warn"` for every warning. Expect false
-alarms on heavy-tailed data.
+alarms on heavy-tailed data, and on large data with features that are roughly standard by
+nature, where `preprocessing.global_scaling_near` often fires: turn that one off there.
 
 ---
 
