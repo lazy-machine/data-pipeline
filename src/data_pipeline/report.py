@@ -120,12 +120,13 @@ class Reporter:
             counts[o.status] = counts.get(o.status, 0) + 1
         names = {"ran": "ran", "cached": "cached", "would run": "to run",
                  "warned": "warning(s)", "skipped": "skipped", "failed": "failed"}
+        counts["warned"] = counts.get("warned", 0) + len(result.warnings)
         parts = [f"{counts[k]} {v}" for k, v in names.items() if counts.get(k)]
         summary = " · ".join(parts + [f"{result.elapsed:.2f}s"])
         done = "✓ dry run complete" if dry_run else "✓ completed"
         if result.halted_by:
             self._print(self._c(f"■ halted at '{result.halted_by}'", "31;1") + f" · {summary}")
-        elif counts.get("warned") or counts.get("skipped") or result.warnings:
+        elif counts.get("warned") or counts.get("skipped"):
             self._print(self._c(f"{done} with warnings", "33;1") + f" · {summary}")
         else:
             self._print(self._c(done, "32;1") + f" · {summary}")

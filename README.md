@@ -153,8 +153,9 @@ A step's fingerprint combines:
 - **packages**: the installed version of each distribution in `requires`. List the
   distribution name (`scikit-learn`), because an import name (`sklearn`) has no version
   to track. Adding or removing an entry counts as a change,
-- **env**: a SHA-256 of each variable listed in `env`, never its value. Adding or removing
-  a name counts as a change.
+- **env**: an unsalted SHA-256 of the value of each variable listed in `env`, not the value
+  itself. A short or guessable secret could still be recovered from `state.json`, so don't
+  commit that file. Adding or removing a name counts as a change.
 
 After a successful run, the fingerprint and the output hashes go into
 `<state_dir>/state.json`. The next run skips the step only if the fingerprint matches and
@@ -167,7 +168,8 @@ The status line says why a step ran: `no checkpoint`, `code changed`, `config ch
 `inputs changed: <names>`, `output missing: <name>`, `output modified: <name>`, `forced`.
 
 Imports are found by reading the code, never by running it. A module is local when it is
-found under `python_path`; the standard library and installed packages are not tracked.
+found under `python_path`. The source of the standard library and of installed packages is
+not followed: list a package in `requires` to track its version.
 Modules loaded with `importlib.import_module` and non-Python files belong in `watch`.
 
 After upgrading from a version that didn't track imports, run with `-f` once if you edited

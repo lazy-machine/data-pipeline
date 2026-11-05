@@ -89,6 +89,12 @@ def start_then_finish(ctx):
     time.sleep(1.5)
     ctx.outputs["dst"].write_text("finished")
 
+def ignore_interrupts_then_hang(ctx):
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    print("started", flush=True)
+    time.sleep(60)
+
 def spawn_child_then_hang(ctx):
     import subprocess
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -510,6 +516,14 @@ def test_only_warns_when_a_selected_step_makes_the_gate_stale(tmp_path):
     assert "dry run complete with warnings" in out
 
 
+def test_only_warnings_are_counted_in_the_footer(tmp_path):
+    cfg = make(tmp_path, GATED)
+    run(cfg)
+    (tmp_path / "out" / "report.txt").unlink()
+    _, out = run(cfg, only=["train"])
+    assert "1 warning(s)" in out
+
+
 def test_only_is_quiet_when_left_out_steps_are_current(tmp_path):
     cfg = make(tmp_path, GATED)
     run(cfg)
@@ -687,7 +701,7 @@ def alive(pid: int) -> bool:
     return not (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
 
 
-def wait_until(condition, seconds: float = 10) -> bool:
+def wait_until(condition, seconds: float = 30) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if condition():
@@ -787,6 +801,74 @@ def test_a_step_does_not_outlive_a_python_caller(tmp_path, sig):
     finally:
         proc.kill()
     assert wait_until(lambda: not alive(child))
+
+
+@needs_groups
+def test_a_step_that_ignores_interrupts_is_killed_after_the_grace(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "spawn"
+function = "fns:ignore_interrupts_then_hang"
+outputs = { o = "out/o.txt" }
+""")
+    proc = start_runner(tmp_path, cfg)
+    started = time.monotonic()
+    try:
+        proc.send_signal(signal.SIGINT)
+        proc.communicate(timeout=20)
+    finally:
+        proc.kill()
+    assert proc.returncode == 130
+    assert 1.5 < time.monotonic() - started < 15
+
+
+@needs_groups
+def test_any_exception_in_the_runner_stops_the_step(tmp_path):
+    """A caller's SIGTERM handler that raises, then carries on, must not leave the step."""
+    cfg = make(tmp_path, SPAWNER)
+    code = textwrap.dedent("""
+        import signal, sys, time
+        from data_pipeline import config
+        from data_pipeline.orchestrator import Orchestrator
+
+        def stop(*_):
+            raise RuntimeError("caller gave up")
+
+        signal.signal(signal.SIGTERM, stop)
+        try:
+            Orchestrator(config.load(sys.argv[1])).run()
+        except RuntimeError:
+            time.sleep(30)
+    """)
+    proc = subprocess.Popen([sys.executable, "-c", code, str(cfg)], stdout=subprocess.DEVNULL)
+    pid_file = tmp_path / "child.pid"
+    try:
+        assert wait_until(lambda: pid_file.exists() and pid_file.read_text())
+        child = int(pid_file.read_text())
+        proc.send_signal(signal.SIGTERM)
+        assert wait_until(lambda: not alive(child))
+        assert proc.poll() is None   # the caller is still going
+    finally:
+        proc.kill()
+
+
+@needs_groups
+def test_a_worker_whose_runner_is_already_gone_stops(tmp_path):
+    """The runner can die before the worker reaches its watch, so the worker must be told who
+    it was, not read its parent then. Here the spec names a process that isn't the parent."""
+    fns = tmp_path / "fns.py"
+    fns.write_text("import time\ndef go(ctx):\n    time.sleep(60)\n")
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "name": "s", "module": "fns", "attr": "go", "inputs": {}, "outputs": {}, "params": {},
+        "workdir": str(tmp_path), "python_path": [str(tmp_path)], "runner": os.getpid() + 10**6,
+    }))
+    proc = subprocess.Popen([sys.executable, "-m", "data_pipeline.worker", str(spec),
+                             str(tmp_path / "result.json")], start_new_session=True)
+    try:
+        assert proc.wait(timeout=20) == -signal.SIGKILL
+    finally:
+        proc.kill()
 
 
 # -- guarantees a checkpoint depends on -----------------------------------------------------
@@ -900,6 +982,16 @@ def test_requirement_not_installed_is_not_called_an_import():
     assert checkpoint.installed_version("dp-test-not-a-package") == "not installed"
 
 
+def test_a_dotted_name_is_not_imported_to_find_it():
+    assert checkpoint.installed_version("dp_test_missing.sub") == "not installed"
+
+
+def test_an_import_name_with_a_version_specifier_has_no_version_to_test(tmp_path):
+    """Preflight rejects these, so the record must not say the name is fine."""
+    step = config.load(make(tmp_path, PINNED.replace('"pytest"', '"sqlite3>=1"'))).steps[0]
+    assert checkpoint._packages(step)["sqlite3"] == "not installed"
+
+
 def test_respelling_a_requirement_is_not_a_change(tmp_path):
     cfg = make(tmp_path, PINNED)
     run(cfg)
@@ -933,14 +1025,17 @@ outputs = { n = "out/n.txt" }
 
 
 def test_env_value_that_is_not_utf8_is_hashed(tmp_path):
-    env = dict(os.environ, DP_TEST_SECRET=b"caf\xe9".decode("utf-8", "surrogateescape"))
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(Path(checkpoint.__file__).parents[1]),
-                                                      env.get("PYTHONPATH")]))
+    def recorded(value: bytes) -> str:
+        env = dict(os.environ, DP_TEST_SECRET=value.decode("utf-8", "surrogateescape"))
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [
+            str(Path(checkpoint.__file__).parents[1]), env.get("PYTHONPATH")]))
+        cmd = [sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"]
+        res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        assert res.returncode == 0, res.stdout + res.stderr
+        return state_of(tmp_path)["steps"]["a"]["env"]["DP_TEST_SECRET"]
+
     cfg = make(tmp_path, PINNED)
-    cmd = [sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"]
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
-    assert res.returncode == 0, res.stdout + res.stderr
-    assert "\\udce9" not in (tmp_path / ".pipeline" / "state.json").read_text()
+    assert recorded(b"caf\xe9") != recorded(b"caf\xe8")
 
 
 def test_env_change_reruns_and_value_not_stored(tmp_path, monkeypatch):

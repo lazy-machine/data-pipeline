@@ -31,7 +31,7 @@ def _summarize(value: Any) -> str:
     return str(value)
 
 
-def _stop_with_runner() -> None:
+def _stop_with_runner(runner: int) -> None:
     """End the step, and what it started, if the runner dies.
 
     A worker leads its own session, so a signal that ends the runner never reaches it, and
@@ -39,7 +39,6 @@ def _stop_with_runner() -> None:
     """
     if not hasattr(os, "killpg"):
         return
-    runner = os.getppid()
 
     def watch() -> None:
         while os.getppid() == runner:
@@ -50,9 +49,9 @@ def _stop_with_runner() -> None:
 
 
 def main(argv: list[str]) -> int:
-    _stop_with_runner()
     spec_path, result_path = argv
     spec = json.loads(Path(spec_path).read_text())
+    _stop_with_runner(spec["runner"])  # from the runner: it may die before this line runs
 
     for p in reversed(spec["python_path"]):
         if p not in sys.path:
