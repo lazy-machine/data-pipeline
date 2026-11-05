@@ -896,6 +896,53 @@ def test_import_name_is_recorded_as_import_only(tmp_path):
     assert state_of(tmp_path)["steps"]["a"]["packages"]["sqlite3"] == "import-only"
 
 
+def test_requirement_not_installed_is_not_called_an_import():
+    assert checkpoint.installed_version("dp-test-not-a-package") == "not installed"
+
+
+def test_respelling_a_requirement_is_not_a_change(tmp_path):
+    cfg = make(tmp_path, PINNED)
+    run(cfg)
+    cfg.write_text(cfg.read_text().replace('"packaging>=20"', '"Packaging>=20"'))
+    result, _ = run(cfg)
+    assert statuses(result) == {"a": "cached"}
+
+
+def test_invalid_requirement_does_not_break_fingerprinting(tmp_path):
+    """--only fingerprints steps it leaves out, and preflight reports them only if selected."""
+    cfg = make(tmp_path, """
+[[steps]]
+name = "broken"
+function = "fns:copy"
+inputs = { src = "in.txt" }
+outputs = { dst = "out/a.txt" }
+requires = ["not a requirement!!"]
+critical = false
+
+[[steps]]
+name = "next"
+function = "fns:count"
+inputs = { src = "out/a.txt" }
+outputs = { n = "out/n.txt" }
+""")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "a.txt").write_text("x")
+    result, out = run(cfg, only=["next"])
+    assert statuses(result) == {"next": "ran"}
+    assert "--only left out 'broken'" in out
+
+
+def test_env_value_that_is_not_utf8_is_hashed(tmp_path):
+    env = dict(os.environ, DP_TEST_SECRET=b"caf\xe9".decode("utf-8", "surrogateescape"))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(Path(checkpoint.__file__).parents[1]),
+                                                      env.get("PYTHONPATH")]))
+    cfg = make(tmp_path, PINNED)
+    cmd = [sys.executable, "-m", "data_pipeline.cli", str(cfg), "--no-color"]
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "\\udce9" not in (tmp_path / ".pipeline" / "state.json").read_text()
+
+
 def test_env_change_reruns_and_value_not_stored(tmp_path, monkeypatch):
     monkeypatch.setenv("DP_TEST_SECRET", "s3cr3t")
     cfg = make(tmp_path, PINNED)

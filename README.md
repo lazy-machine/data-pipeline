@@ -150,8 +150,11 @@ A step's fingerprint combines:
   or through other local modules), and any `watch` files,
 - **config**: `function`, `params`, `inputs` and `outputs`,
 - **inputs**: the SHA-256 of every input's content (directories are hashed recursively),
-- **packages**: the installed version of everything in `requires`,
-- **env**: a SHA-256 of each variable listed in `env`, never its value.
+- **packages**: the installed version of each distribution in `requires`. List the
+  distribution name (`scikit-learn`), because an import name (`sklearn`) has no version
+  to track. Adding or removing an entry counts as a change,
+- **env**: a SHA-256 of each variable listed in `env`, never its value. Adding or removing
+  a name counts as a change.
 
 After a successful run, the fingerprint and the output hashes go into
 `<state_dir>/state.json`. The next run skips the step only if the fingerprint matches and

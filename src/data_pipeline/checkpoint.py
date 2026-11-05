@@ -1,9 +1,9 @@
 """Content-addressed checkpoints.
 
-A step is up to date when its fingerprint (code + config + input contents) matches the
-one recorded after its last successful run *and* every output still exists with the
-content it had then. File hashes are cached by (size, mtime) so unchanged large files
-are not re-read on every run.
+A step is up to date when its fingerprint (code, config, input contents, package versions
+and declared environment variables) matches the one recorded after its last successful
+run *and* every output still exists with the content it had then. File hashes are cached
+by (size, mtime) so unchanged large files are not re-read on every run.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 
 from .config import Pipeline, Step
 
@@ -189,11 +190,13 @@ def _digest(obj: Any) -> str:
 
 
 def installed_version(name: str) -> str:
-    """The installed version; ``requires`` may also name an import, such as ``sklearn``."""
+    """The installed version; ``requires`` may also name an import, such as ``sklearn``,
+    which has no version to track."""
     try:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
-        return "import-only"
+        found = "." not in name and importlib.util.find_spec(name)
+        return "import-only" if found else "not installed"
 
 
 def _packages(step: Step) -> dict[str, str]:
@@ -203,14 +206,14 @@ def _packages(step: Step) -> dict[str, str]:
             name = Requirement(spec).name
         except InvalidRequirement:
             continue  # reported by preflight
-        found[name] = installed_version(name)
+        found[canonicalize_name(name)] = installed_version(name)
     return dict(sorted(found.items()))
 
 
 def _env(step: Step) -> dict[str, str]:
     """Hashes, never values: variables often hold secrets, and state.json is a plain file."""
     values = {name: os.environ.get(name) for name in step.env}
-    return {name: "unset" if v is None else hashlib.sha256(v.encode()).hexdigest()
+    return {name: "unset" if v is None else hashlib.sha256(os.fsencode(v)).hexdigest()
             for name, v in sorted(values.items())}
 
 
