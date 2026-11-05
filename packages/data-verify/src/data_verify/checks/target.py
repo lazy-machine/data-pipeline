@@ -10,9 +10,10 @@ import numpy as np
 import pandas as pd
 
 from ..core import (
-    check, examples, failed, fmt, is_numeric_kind, kind, matches, numeric_values, passed, skipped,
-    value_text, value_texts,
+    REGISTRY, check, examples, failed, fmt, is_numeric_kind, kind, matches, numeric_values, passed,
+    resolve_check, skipped, value_text, value_texts,
 )
+from ..spec import SpecError
 from ..stats import feature_scores
 
 
@@ -257,15 +258,45 @@ def _short_text(s: pd.Series) -> bool:
 
 # -- preprocessing leakage -----------------------------------------------------------------
 
+_CHANCE_MARGIN = 0.003  # fraction of the sampling noise a match must beat to count as scaled
+_COARSEST_STEP = 0.01  # beyond this, rounding hides as much as sampling noise does
+
+
+def _rounding_step(x: np.ndarray) -> float:
+    """The decimal grid values sit on, or 0: a CSV keeps only so many digits. Read from the
+    first values, which is enough for a column written one way."""
+    sample = x[np.isfinite(x)][:1000]
+    if len(sample):
+        for decimals in range(7):
+            scaled = sample * 10.0 ** decimals
+            if np.abs(scaled - np.rint(scaled)).max() < 1e-4:
+                return 10.0 ** -decimals
+    return 0.0
+
+
 def _moments(x: np.ndarray):
     x = x[~np.isnan(x)]
     return len(x), float(x.sum()), float((x ** 2).sum()), \
-        (float(x.min()) if len(x) else np.nan), (float(x.max()) if len(x) else np.nan)
+        (float(x.min()) if len(x) else np.nan), (float(x.max()) if len(x) else np.nan), \
+        _rounding_step(x)
 
 
-def _standardized(n, s, ss, tol_mean, tol_std):
+def _standardized(n, s, ss, tol_mean, tol_std, margin=None, step=0.0):
+    """Mean 0 and std 1 within tolerance. With ``margin``, also too exactly to be chance.
+
+    A scaler leaves only rounding error. Unscaled data that is roughly standard already
+    misses by its sampling noise, about 1/sqrt(n) for the mean and 1/sqrt(2n) for the std,
+    which falls inside any fixed tolerance once there are enough rows. So the tolerance
+    shrinks with n, down to what rounding to ``step`` can explain. On a coarser grid than
+    _COARSEST_STEP rounding can explain a chance match too, so no allowance is made.
+    """
     if n < 3:
         return False
+    if margin is not None:
+        step = step if step <= _COARSEST_STEP else 0.0
+        rounding = 4 * step / np.sqrt(12 * n)
+        tol_mean = min(tol_mean, margin / np.sqrt(n) + rounding)
+        tol_std = min(tol_std, margin / np.sqrt(2 * n) + rounding + step ** 2 / 24)
     mean = s / n
     var0 = max(ss / n - mean ** 2, 0.0)
     var1 = var0 * n / (n - 1)
@@ -284,20 +315,17 @@ def _minmax_shape(v, f, union) -> bool:
     return (x == 0).sum() <= cap and (x == 1).sum() <= cap
 
 
-@check("preprocessing.global_scaling", "preprocessing", "error",
-       "Scalers were fitted on the training split only", tol_mean=1e-4, tol_std=1e-3)
-def global_scaling(v, opt):
-    """Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over
-    train plus evaluation rows together while the training rows alone are not: the scaler was
-    fitted on data the model is later scored on. Every union of splits that contains train is
-    tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the
-    signature, so it is also tested without repeated rows and, when params.source is set,
-    on the rows found in the source only."""
-    if len(v.splits) < 2:
-        return skipped("one split only")
+def _more_than_two_values(v, f: str) -> bool:
+    """Two values can balance to mean 0 and std 1 by themselves: a +1/-1 flag is no evidence."""
+    x = np.concatenate([numeric_values(d[f]) for d in v.splits.values()])
+    return len(np.unique(x[~np.isnan(x)])) > 2
+
+
+def _scaling_hits(v, tol_mean, tol_std, margin, minmax: bool) -> dict[str, str]:
+    """Features that look scaled over train plus evaluation rows, but not over train alone."""
     names = list(v.splits)
-    hits = {}
-    feats = v.numeric_features()
+    hits: dict[str, str] = {}
+    feats = [f for f in v.numeric_features() if _more_than_two_values(v, f)]
     # row subsets to test: all rows; without repeats; without repeats and rows absent from
     # params.source. Rows injected after scaling would otherwise hide the signature.
     unique = {n: ~pd.Series(v.hashes(n, tuple(v.features))).duplicated().to_numpy()
@@ -313,7 +341,7 @@ def global_scaling(v, opt):
         tr = m[v.train_name]
         if tr[0] < 3:
             continue
-        tr_std = _standardized(*tr[:3], opt["tol_mean"], opt["tol_std"])
+        tr_std = _standardized(*tr[:3], tol_mean, tol_std, margin, tr[5])
         tr_unit = tr[3] == 0 and tr[4] == 1
         others = [n for n in names if n != v.train_name]
         for r in range(1, len(others) + 1):
@@ -322,15 +350,47 @@ def global_scaling(v, opt):
                 n_, s_, ss_ = (sum(p[i] for p in parts) for i in range(3))
                 lo = np.nanmin([p[3] for p in parts])
                 hi = np.nanmax([p[4] for p in parts])
+                step = max(p[5] for p in parts)
                 union = "+".join([v.train_name, *combo])
-                if not tr_std and _standardized(n_, s_, ss_, opt["tol_mean"], opt["tol_std"]):
+                if not tr_std and _standardized(n_, s_, ss_, tol_mean, tol_std, margin, step):
                     hits[f] = f"standardised over {union}, not over {v.train_name}"
-                elif not tr_unit and lo == 0 and hi == 1 and _minmax_shape(v, f, union):
+                elif minmax and not tr_unit and lo == 0 and hi == 1 and \
+                        _minmax_shape(v, f, union):
                     hits[f] = f"min-max scaled over {union}, not over {v.train_name}"
                 if f in hits:
                     break
             if f in hits:
                 break
+    return hits
+
+
+def _blocking_hits(v, tol_mean, tol_std, margin) -> dict[str, str]:
+    return v.cached(("global_scaling", tol_mean, tol_std, margin),
+                    lambda: _scaling_hits(v, tol_mean, tol_std, margin, minmax=True))
+
+
+@check("preprocessing.global_scaling", "preprocessing", "error",
+       "Scalers were fitted on the training split only", tol_mean=1e-4, tol_std=1e-3,
+       chance_margin=_CHANCE_MARGIN)
+def global_scaling(v, opt):
+    """Detects features standardised (mean 0, std 1) or min-max scaled (exactly 0..1) over
+    train plus evaluation rows together while the training rows alone are not: the scaler was
+    fitted on data the model is later scored on. Every union of splits that contains train is
+    tried, so 'fitted on train+val' is caught too. Rows added after scaling would hide the
+    signature, so it is also tested without repeated rows and, when params.source is set,
+    on the rows found in the source only. `tol_mean` and `tol_std` are the widest gap allowed.
+    On large data a match must also be closer than `chance_margin` of the sampling noise, plus
+    what rounding to 2 or more decimals explains, so data that is already roughly standard
+    doesn't block. Raise `chance_margin` to loosen this. A real scaler can miss that bar: on
+    values rounded more coarsely or to significant figures, in float32 with a large offset, or
+    with rows added or dropped afterwards. preprocessing.global_scaling_near warns about what
+    is left within `tol_mean` and `tol_std`."""
+    if opt["chance_margin"] <= 0:
+        raise SpecError("checks.preprocessing.global_scaling.chance_margin must be above 0: at "
+                        "0 nothing can block")
+    if len(v.splits) < 2:
+        return skipped("one split only")
+    hits = _blocking_hits(v, opt["tol_mean"], opt["tol_std"], opt["chance_margin"])
     if hits:
         return failed(f"{len(hits)} feature(s) scaled with statistics of evaluation data: "
                       + ", ".join(f"{k} ({x})" for k, x in list(hits.items())[:6]),
@@ -338,6 +398,33 @@ def global_scaling(v, opt):
                       "others), e.g. inside a sklearn Pipeline after the split.", features=hits)
     return passed(f"no feature is standardised or min-max scaled over evaluation rows "
                   f"({len(v.numeric_features())} numeric features tested)")
+
+
+@check("preprocessing.global_scaling_near", "preprocessing", "warn",
+       "No feature is almost scaled over evaluation rows", tol_mean=1e-4, tol_std=1e-3)
+def global_scaling_near(v, opt):
+    """Features within `tol_mean` and `tol_std`, or those of preprocessing.global_scaling if
+    wider, of mean 0 and std 1 over train plus evaluation rows that it doesn't block, because
+    chance can't be ruled out.
+    Either a scaler was fitted on evaluation rows and the result lost precision or changed
+    rows afterwards, or the feature is roughly standard by nature, which on large data with
+    many such features is common."""
+    if len(v.splits) < 2:
+        return skipped("one split only")
+    definition = REGISTRY["preprocessing.global_scaling"]
+    severity, blocking = resolve_check("preprocessing.global_scaling", v.spec,
+                                       definition.severity, definition.options)
+    exact = {} if severity == "off" else _blocking_hits(
+        v, blocking["tol_mean"], blocking["tol_std"], blocking["chance_margin"])
+    near = _scaling_hits(v, max(opt["tol_mean"], blocking["tol_mean"]),
+                         max(opt["tol_std"], blocking["tol_std"]), None, minmax=False)
+    hits = {f: x for f, x in near.items() if f not in exact}
+    if hits:
+        return failed(f"{len(hits)} feature(s) nearly standardised over evaluation rows: "
+                      + ", ".join(list(hits)[:6]),
+                      "If a step scales these features, fit it on the training split only. If "
+                      "they are roughly standard by nature, turn this check off.", features=hits)
+    return passed("no feature is nearly standardised over evaluation rows")
 
 
 @check("preprocessing.fitted_levels", "preprocessing", "error",

@@ -67,6 +67,25 @@ def check(id: str, category: str, severity: str, title: str, **options):
 # -- loading -------------------------------------------------------------------------------
 
 
+def _specificity(pattern: str) -> int:
+    return sum(ch not in "*?[]" for ch in pattern)
+
+
+def resolve_check(cid: str, spec: Spec, default_sev: str, defaults: dict) -> tuple[str, dict]:
+    """An exact id beats every glob; among globs the most specific one (most non-wildcard
+    characters) wins, and on a tie the one written last."""
+    sev, opt = default_sev, dict(defaults)
+    globs = [(_specificity(p), i, o["severity"]) for i, (p, o) in enumerate(spec.checks.items())
+             if p != cid and fnmatch.fnmatchcase(cid, p) and "severity" in o]
+    if globs:
+        sev = max(globs)[2]
+    if cid in spec.checks:
+        o = spec.checks[cid]
+        sev = o.get("severity", sev)
+        opt.update({k: x for k, x in o.items() if k != "severity"})
+    return sev, opt
+
+
 def sha256_path(path: Path) -> str:
     """Content hash of a file, or of a directory (relative names and contents, sorted)."""
     h = hashlib.sha256()

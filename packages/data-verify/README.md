@@ -2,12 +2,15 @@
 
 A gate step for [data-pipeline](../../README.md) projects, shipped in the same repository
 (a uv workspace member). It reads the data your pipeline
-produced (the train/val/test splits, plus any source or auxiliary tables) and stops the
-pipeline when it finds:
+produced (the train/val/test splits, plus any source or auxiliary tables) and looks for:
 
 - **Data leakage**: anything that lets a model see the answers, or the future, of what it
   is scored on.
 - **Poisoning**: tampered, injected or corrupted training data.
+
+It stops the pipeline on what it can prove, which is most structural leakage once your
+columns are declared. Most poisoning signs only warn, because a statistic rarely proves
+tampering. See [What it cannot see](#what-it-cannot-see).
 
 Every check, passed or not, goes into a JSON report. Steps that `depends_on = ["verify"]`
 never run on data that failed the gate:
@@ -71,7 +74,14 @@ depends_on = ["verify"]        # nothing trains on data the gate has not passed
 
 **3. Check the params** with `data-verify lint`. It validates every data-verify step in
 `./pipeline.toml` without running anything. (The step itself only sees its params when its
-turn comes, after the upstream steps ran.)
+turn comes, after the upstream steps ran.) It also exits 1 if a step reads a split without
+the gate upstream of it, directly or through other steps. Steps that feed the gate, and
+steps that read only `source`, are allowed. It prints `not checked` and exits 0 when it can't
+tell which inputs hold the splits: a reference or `spec` isn't readable yet, a split name
+isn't an input, an unbuilt path has an unknown suffix, or `source` is set with several other
+tables and no split names. With a config file listed first and `source` set, lint looks at
+the data table while the gate takes the config as the split and fails, so list the data first.
+In CI, treat `not checked` as a failure if you rely on this check: the exit code doesn't show it.
 
 ### Declare every role that exists in your data
 
@@ -124,7 +134,7 @@ step fails, so you can always read why it blocked.
 ### Result
 
 **All blocking checks pass.** The step succeeds; the status line shows
-`checks=… passed=… warnings=… skipped=…`.
+`checks=… passed=… warnings=… skipped=…`, plus `warned=…` naming up to three warnings.
 
 **A blocking check fails.** The step raises `VerificationFailed` with each failure and its
 fix. data-pipeline marks the step failed, prints that message, and halts (the step is
@@ -149,7 +159,7 @@ previous run are deleted first, so a stale report never survives a failed run.
 
 ```jsonc
 {
-  "tool": "data-verify", "version": "0.1.0",
+  "tool": "data-verify", "version": "0.3.0",
   "passed": false,                       // false = the step failed
   "fail_on": "error",
   "blocking": ["split.group_overlap"],   // ids of the checks that blocked
@@ -379,9 +389,37 @@ A **custom check** is a function that takes the verifier and calls
 `v.splits`, `v.train`, `v.dataset(name)`, `v.sql(query)`, `v.var(name)`, `v.features` and
 `v.labels`. Put the check's file in the step's `watch` list so editing it reruns the gate.
 
+## What it cannot see
+
+A pass means that no blocking check fired, not that the data is clean.
+
+- **Undeclared roles.** Without `group` or `time`, leaks across entities or across time at
+  most warn. With `label` alone, a grouped dataset split by row passes with a warning.
+- **Poisoning.** Random or targeted label flips, and a backdoor with a rare trigger, can look
+  like ordinary noise. Other injected values and rows mostly warn. `schema.ranges`,
+  `schema.allowed` and `pins` block, so declare them when you know the valid values.
+- **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
+  0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
+- **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
+  fitted on evaluation rows block when the signature is exact: closer to mean 0 and std 1
+  than chance allows, with an allowance for rounding to 2 or more decimals. A standardising
+  scaler that misses that bar can't be told from chance on large data, so it warns at best
+  (`preprocessing.global_scaling_near`). That covers coarser rounding, values kept to
+  significant figures, and float32 data with a large offset. Features with only two values
+  are not tested, so a scaled flag goes unseen. In the other direction, a coarse feature with
+  a few values that happens to be exactly standard still blocks a clean pipeline, because
+  nothing tells it from a scaler. Rows added or dropped after
+  scaling often give no signal at all, and the more rows changed the less likely any signal
+  is. The warning also fires on features that are roughly standard by nature, so a project
+  with many of those will often see it. Target encoding and imputation leave no signature.
+
+To be stricter, set `checks = { "poisoning.*" = "error" }`, or `fail_on = "warn"` to block on
+every warning. Expect false alarms on heavy-tailed data. Fit preprocessing inside a
+pipeline after the split, since the gate can't confirm that from the data.
+
 ## What it checks
 
-51 built-in checks. `data-verify checks` lists them with their options, and
+52 built-in checks. `data-verify checks` lists them with their options, and
 [docs/CHECKS.md](docs/CHECKS.md) describes each one. By area:
 
 **split**
@@ -411,9 +449,10 @@ A **custom check** is a function that takes the verifier and calls
 
 **preprocessing**
 - Blocks: scaler fitted on train+evaluation data (standardised or min-max over the union
-  only, also tested without repeated rows and on rows found in `source`, so later
-  injections do not hide it); fitted vocabularies containing levels absent from training
-  data.
+  only, closer than chance allows, also tested without repeated rows and on rows found in
+  `source`, so later injections do not hide it); fitted vocabularies containing levels
+  absent from training data.
+- Warns: features nearly standardised over the union, where chance can't be ruled out.
 
 **labels**
 - Blocks: missing / out-of-domain labels, single-class train; evaluation classes absent
@@ -478,7 +517,7 @@ Declare `group`, `time` and `label_time` whenever they exist.
 ```
 data-verify run pipeline.toml [--step NAME]   run a data-verify step without the orchestrator
 data-verify run verify.toml                   standalone config: [inputs] [outputs] [params]
-data-verify lint [pipeline.toml] [--step N]   validate params without running anything
+data-verify lint [pipeline.toml] [--step N]   validate params, and that splits pass the gate
 data-verify explain REPORT.json [--all]       failed checks, details and fixes
 data-verify checks [--json | --markdown]      every check, severity and options
 data-verify params [--markdown]               every params key

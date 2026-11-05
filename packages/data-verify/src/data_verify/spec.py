@@ -80,17 +80,26 @@ def _expect(cond: bool, msg: str) -> None:
 
 def read_config_file(path: Path) -> Any:
     suffix = path.suffix.lower()
-    text = path.read_text()
-    if suffix == ".toml":
-        return tomllib.loads(text)
-    if suffix == ".json":
-        return json.loads(text)
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        raise SpecError(f"cannot read {path.name}: {e}") from None
+    try:
+        if suffix == ".toml":
+            return tomllib.loads(text)
+        if suffix == ".json":
+            return json.loads(text)
+    except ValueError as e:  # both parsers' errors
+        raise SpecError(f"{path.name} is not valid {suffix[1:].upper()}: {e}") from None
     if suffix in (".yaml", ".yml"):
         try:
             import yaml  # type: ignore[import-untyped]
         except ImportError:
             raise SpecError(f"{path.name}: reading YAML needs PyYAML installed") from None
-        return yaml.safe_load(text)
+        try:
+            return yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            raise SpecError(f"{path.name} is not valid YAML: {e}") from None
     raise SpecError(f"{path.name}: references can read .toml, .json or .yaml files")
 
 
@@ -279,6 +288,57 @@ class Spec:
 
 def is_data_input(path: Path) -> bool:
     return path.is_dir() or path.suffix.lower() in TABULAR_SUFFIXES
+
+
+def _reference_sources(value: Any) -> set[str]:
+    if _is_ref(value):
+        return {value["from"]}
+    children = value.values() if isinstance(value, dict) else \
+        value if isinstance(value, list) else []
+    return {name for child in children for name in _reference_sources(child)}
+
+
+def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[str] | None:
+    """The inputs holding split data, for lint, or None when that can't be told yet. Follows
+    the layout rules of ``parse``, but data inputs may not exist yet, and lint must not accuse
+    a step on a guess. Only the layout keys are resolved, so that a reference elsewhere that
+    isn't built yet doesn't stop the check."""
+    refs = Refs(inputs)
+    try:
+        if "spec" in inputs:
+            base = refs.doc("spec", "inputs.spec")
+            if isinstance(base, dict):
+                params = {**(base["params"] if isinstance(base.get("params"), dict) else base),
+                          **params}
+        layout = {k: refs.resolve(params.get(k), k)
+                  for k in ("source", "splits", "split_column", "table")}
+    except Exception:  # noqa: BLE001  unbuilt or invalid: parse reports that when it runs
+        return None
+    source, splits, table = layout["source"], layout["splits"], layout["table"]
+    if isinstance(splits, str):
+        splits = [splits]
+    config = _reference_sources(params) | {"spec"}
+
+    candidates = {n: path for n, path in inputs.items() if n != source and n not in config}
+    unbuilt = {n for n, path in candidates.items()
+               if not path.exists() and path.suffix.lower() not in CONFIG_SUFFIXES}
+    data = [n for n, path in candidates.items()
+            if is_data_input(path) or (n in unbuilt and not path.suffix)]   # a future directory
+    if layout["split_column"]:
+        return [table] if isinstance(table, str) and table in inputs else data
+    if isinstance(splits, dict):
+        splits = list(splits.values())
+    if isinstance(splits, list):
+        known = all(isinstance(n, str) and n in inputs for n in splits)
+        return splits if known else None    # parse reports the unknown name when it runs
+    named = [n for n in candidates if n.lower() in SPLIT_RANKS and (n in data or n in unbuilt)]
+    if named:
+        return named
+    if any(n in unbuilt and n not in data for n in candidates):
+        return None     # an unbuilt path with an odd suffix may be a directory or a side file
+    if not source or len(data) <= 1:
+        return data
+    return None         # parse takes the first, but that may be a lookup
 
 
 def _option_type(default: Any) -> str:
