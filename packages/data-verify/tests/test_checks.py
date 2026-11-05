@@ -961,8 +961,9 @@ LABEL_ONLY = {"id": [], "group": [], "weight": None, "features": "auto", "forbid
               "checks": {"temporal.undeclared_time": "off"}}
 
 
-def _near_copies(splits, rows=100, jitter=0.0):
-    """Rows of test copied into train under a new id and customer, numbers optionally jittered."""
+def _near_copies(splits, rows=100, jitter=1e-7):
+    """Rows of test copied into train under a new id and customer, numbers jittered by 1e-7
+    relative: the most this size of train still resolves (the tolerance tightens as it grows)."""
     copies = splits["test"].head(rows).copy()
     copies["row_id"] += 10**7
     copies["customer"] = "N" + copies["row_id"].astype(str)
@@ -975,6 +976,23 @@ def _near_copies(splits, rows=100, jitter=0.0):
 
 def test_near_copies_under_undeclared_keys_are_found(case, splits):
     r = case.run(_near_copies(splits), LABEL_ONLY)
+    assert r.failed("duplicates.near_cross_split")
+
+
+def test_near_duplicates_input_under_undeclared_keys_is_found(case, splits):
+    """#11: main's near-duplicate rows (200 of them, jittered by 1e-7, `plan` re-cased) with
+    the id and group left undeclared, which the comparison on all columns cannot see."""
+    stolen = splits["test"].head(200).copy()
+    stolen["row_id"] += 10_000_000
+    stolen["customer"] = "X" + stolen["customer"]
+    for f in ("f1", "f2", "f3", "f4"):
+        stolen[f] = stolen[f] * (1 + 1e-7)
+    stolen["plan"] = stolen["plan"].str.upper()
+    splits["train"] = pd.concat([splits["train"], stolen])
+    for d in splits.values():
+        d.drop(columns=["date", "label_date", "weight"], inplace=True)
+    r = case.run(splits, LABEL_ONLY)
+    assert not r.failed("duplicates.cross_split")
     assert r.failed("duplicates.near_cross_split")
 
 
@@ -998,9 +1016,13 @@ def _keyed(columns, n=20000, train=15000, seed=1):
     return {"train": d.iloc[:train].copy(), "test": d.iloc[train:].copy()}
 
 
-def _copy_into_train(frames, rows):
+def _copy_into_train(frames, rows, jitter=0.0):
     copies = frames["test"].head(rows).copy()
     copies["sid"] = "N" + copies["sid"]
+    if jitter:
+        for c in copies.columns:
+            if c not in ("sid", "y") and pd.api.types.is_numeric_dtype(copies[c]):
+                copies[c] = copies[c] * (1 + jitter)
     frames["train"] = pd.concat([frames["train"], copies], ignore_index=True)
     return frames
 
@@ -1047,6 +1069,13 @@ def test_chance_matches_stay_rare_on_a_large_train(case):
     assert _near_quiet(case, _keyed(_repeating(0.0), n=300_000, train=225_000))
 
 
+@pytest.mark.parametrize("n,train", [(2000, 1500), (200, 150)])
+def test_chance_collisions_stay_quiet_on_a_small_train(case, n, train):
+    """A few collisions are normal however small the split, so the coarse comparison needs both
+    a count and a margin over the train's own collision rate."""
+    assert _near_quiet(case, _keyed(_repeating(0.0), n=n, train=train))
+
+
 @pytest.mark.parametrize("coarse_first", [True, False], ids=["coarse-first", "fine-first"])
 def test_copies_are_found_whatever_the_order_of_columns(case, coarse_first):
     def columns(rng, n):
@@ -1075,13 +1104,20 @@ def test_columns_that_repeat_another_do_not_hide_copies(case, splits):
     assert case.run(_near_copies(splits), LABEL_ONLY).failed("duplicates.near_cross_split")
 
 
-def test_a_copy_with_jittered_numbers_is_not_found_under_an_undeclared_key(case, splits):
-    """The limit: under a new key a copy must carry the same numbers. Declared keys (`id`,
-    `group`) leave only the comparison at `bits`, which sees them."""
+def test_a_copy_jittered_past_the_fine_precision_is_found_by_the_coarse_one(case, splits):
+    """1e-5 relative is past the fine comparison at this size, but the coarse one, which asks
+    whether test collides with train more often than train collides with itself, still sees it."""
     jittered = _near_copies(splits, jitter=1e-5)
+    assert case.run(jittered, LABEL_ONLY).failed("duplicates.near_cross_split")
+
+
+def test_a_jittered_copy_is_missed_when_every_column_derives_from_one(case):
+    """The limit: with one independent column, at the precision that absorbs 1e-5 the train
+    collides with itself more often than the copies appear. Declared keys (`id`, `group`)
+    leave only the comparison at `bits`, which sees them."""
+    jittered = _copy_into_train(_keyed(_repeating(0.0)), 200, jitter=1e-5)
     assert not case.run(jittered, LABEL_ONLY).failed("duplicates.near_cross_split")
-    declared = {**LABEL_ONLY, "id": "row_id", "group": "customer"}
-    assert case.run(jittered, declared).failed("duplicates.near_cross_split")
+    assert case.run(jittered, {**LABEL_ONLY, "id": "sid"}).failed("duplicates.near_cross_split")
 
 
 def test_columns_option_is_not_second_guessed(case, splits):

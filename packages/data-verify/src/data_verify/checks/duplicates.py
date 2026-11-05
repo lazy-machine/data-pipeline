@@ -3,6 +3,7 @@ repetition or label conflicts inside the training data (injected copies, flipped
 
 from __future__ import annotations
 
+import math
 from itertools import combinations
 
 import numpy as np
@@ -13,8 +14,12 @@ from .splits import _ENTITY_NAME
 
 # Without keys, a match needs more evidence than a match on every column does.
 _RARE_VALUE = 5  # training rows that may share a value for a match on it to mean something
-_FINE_BITS = 32  # about 10 significant digits: the share of rows that match by chance on a number
-# is about rows * 2**-bits, however the columns relate, so it stays below _MIN_SHARE to ~10**7 rows
+_MARGIN = 7  # bits of mantissa above log2(rows): the share matching a number by chance is about
+# rows * 2**-bits however the columns relate, so following the rows keeps it near 2**-MARGIN
+# (about 0.15%, a third of _MIN_SHARE: a tighter margin false-alarms on dependent columns)
+_MIN_BITS, _MAX_BITS = 20, 48  # a small train is not compared too coarsely; float64 has 52 bits
+_COARSE_BITS = 14  # about 4 significant digits: a copy jittered past _fine_bits still matches
+_COARSE_ROWS, _COARSE_SIGMA = 10, 3.0  # a copy must beat the train's own collisions by both
 _MIN_SHARE = 0.005  # coarse columns that depend on each other still meet now and then
 
 
@@ -39,6 +44,14 @@ def _is_key(v, col: str, key_share: float) -> bool:
                       (values >= 50 and share >= key_share and bool(_ENTITY_NAME.search(col))))
 
 
+def _fine_bits(n: int) -> int:
+    """Bits of mantissa for the second look. The share of rows whose numbers match by chance
+    is about n * 2**-bits however the columns relate, so it follows the train size and stays
+    near 2**-_MARGIN: coarser would lose the jitter tolerance a small train can afford, finer
+    would let columns that depend on each other meet by themselves on a large one."""
+    return min(max(int(np.ceil(np.log2(max(n, 1)))) + _MARGIN, _MIN_BITS), _MAX_BITS)
+
+
 def _anchors(v, cols: tuple[str, ...]) -> list[str]:
     """Columns with enough distinct values for a match on one to mean something."""
     found = []
@@ -52,18 +65,18 @@ def _anchors(v, cols: tuple[str, ...]) -> list[str]:
     return found
 
 
-def _rare_rows(v, d: pd.DataFrame, anchors: list[str]) -> np.ndarray:
+def _rare_rows(v, d: pd.DataFrame, anchors: list[str], bits: int) -> np.ndarray:
     """Rows of ``d`` holding, in an anchor column, a value at most _RARE_VALUE training rows
     have. A common value recurring proves nothing, however the columns relate."""
     rare = np.zeros(len(d), dtype=bool)
     for c in anchors:
-        counts = pd.Series(v.hashes(v.train_name, (c,), True, _FINE_BITS)).value_counts()
-        seen = pd.Series(row_hashes(d, [c], True, _FINE_BITS)).map(counts).fillna(0).to_numpy()
+        counts = pd.Series(v.hashes(v.train_name, (c,), True, bits)).value_counts()
+        seen = pd.Series(row_hashes(d, [c], True, bits)).map(counts).fillna(0).to_numpy()
         rare |= seen <= _RARE_VALUE
     return rare
 
 
-def _chance_share(v, cols: tuple[str, ...], anchors: list[str]) -> float:
+def _chance_share(v, cols: tuple[str, ...], anchors: list[str], bits: int) -> float:
     """How often rare rows match by chance: the share of rows, built by shuffling each training
     column on its own, that have a rare value and match a real training row. Counting repeats
     in train would not do, because copies inflate that, and they are what this has to find."""
@@ -71,9 +84,19 @@ def _chance_share(v, cols: tuple[str, ...], anchors: list[str]) -> float:
     rng = np.random.default_rng(v.spec.seed)
     mixed = pd.DataFrame({c: train[c].iloc[rng.permutation(len(train))].reset_index(drop=True)
                           for c in cols})
-    match = np.isin(row_hashes(mixed, list(cols), True, _FINE_BITS),
-                    v.hashes(v.train_name, cols, True, _FINE_BITS))
-    return float((match & _rare_rows(v, mixed, anchors)).mean())
+    match = np.isin(row_hashes(mixed, list(cols), True, bits),
+                    v.hashes(v.train_name, cols, True, bits))
+    return float((match & _rare_rows(v, mixed, anchors, bits)).mean())
+
+
+def _collision_share(v, cols: tuple[str, ...], anchors: list[str], bits: int) -> float:
+    """How often rare training rows match each other at ``bits``. Real rows, so the count keeps
+    every relation between the columns, which shuffling them apart would forget: columns that
+    depend on each other collide here as often as they really do. A copy repeated inside train
+    raises it, which only makes the coarse comparison harder to fire."""
+    h = pd.Series(v.hashes(v.train_name, cols, True, bits))
+    seen = h.map(h.value_counts()).to_numpy()
+    return float(((seen > 1) & _rare_rows(v, v.train, anchors, bits)).mean())
 
 
 def _cross_group_rate(v, cols, near: bool, bits: int) -> float | None:
@@ -101,7 +124,7 @@ def _matches(v, cols, all_cols, near: bool, bits: int, anchors: list[str] | None
         if near:  # report only what the exact check does not already see
             hit &= ~np.isin(v.hashes(b, all_cols), v.hashes(a, all_cols))
         if anchors:
-            hit &= _rare_rows(v, v.splits[b], anchors)
+            hit &= _rare_rows(v, v.splits[b], anchors, bits)
         n = int(hit.sum())
         if n:
             worst = max(worst, n / len(hb))
@@ -151,8 +174,9 @@ def _cross(v, opt, near: bool):
         if keys:
             details["ignored_keys"] = keys
         if keys and anchors:
-            found, share = _matches(v, rest, cols, near, _FINE_BITS, anchors)
-            chance = _chance_share(v, rest, anchors) if opt["baseline"] else 0.0
+            fine = _fine_bits(len(v.train))
+            found, share = _matches(v, rest, cols, near, fine, anchors)
+            chance = _chance_share(v, rest, anchors, fine) if opt["baseline"] else 0.0
             limit = max(opt["max_fraction"], opt["ratio"] * chance,
                         _MIN_SHARE if opt["baseline"] else 0.0)
             details.update(pairs_without_keys=found, chance_without_keys=frac(chance, 1))
@@ -162,6 +186,26 @@ def _cross(v, opt, near: bool):
                 return failed(f"{kind} feature rows shared between splits: {text} (ignoring key "
                               f"column(s) {', '.join(keys)}); {chance:.3%} would match by chance",
                               hint, **details)
+            if opt["baseline"]:
+                # A copy jittered past `fine` still agrees to about 4 significant digits. At
+                # that precision columns that depend on each other collide by themselves, so
+                # this asks whether the test rows collide with train more often than the train
+                # collides with itself: same columns, same relations, no copy alignment.
+                found, share = _matches(v, rest, cols, near, _COARSE_BITS, anchors)
+                chance = _collision_share(v, rest, anchors, _COARSE_BITS)
+                limit = max(opt["max_fraction"], opt["ratio"] * chance, _MIN_SHARE)
+                hits = max((p["rows"] for p in found.values()), default=0)
+                expected = chance * max(len(d) for d in v.splits.values())
+                details.update(pairs_at_coarse_bits=found, chance_at_coarse_bits=frac(chance, 1))
+                if hits >= _COARSE_ROWS and share > limit \
+                        and hits > expected + _COARSE_SIGMA * math.sqrt(expected + 1):
+                    text = ", ".join(f"{k} {p['rows']} rows ({p['fraction']:.2%})"
+                                     for k, p in found.items())
+                    return failed(
+                        f"{kind} feature rows shared between splits: {text} (ignoring key "
+                        f"column(s) {', '.join(keys)}, within {_COARSE_BITS} bits of mantissa); "
+                        f"{chance:.3%} of {v.train_name} rows match each other",
+                        hint, **details)
     if pairs:
         reason = (f"no more than different {v.train_name} entities share by chance "
                   f"({base:.3%})" if base is not None else f"<= max_fraction {allowed:.3%}")
@@ -196,16 +240,31 @@ def near_cross_split(v, opt):
     matches: whole numbers distinct on almost every row, and short text, single tokens such
     as hashes, or entity-named whole numbers with at least 50 values, distinct on at least
     `key_share` of rows. The report lists them in `ignored_keys`. Without them rows can match
-    by chance, so this second comparison asks for more: numbers equal to about 10 significant
-    digits, and a value at most 5 training rows have in a column where at least half the values
-    are distinct. With `baseline` on it allows 0.5% of rows, or `ratio` times the share that
-    matches when each training column is shuffled on its own. So under a new key, a copy must
-    carry the same numbers: one with jittered or rounded values is not found, unless the keys
-    are declared (`params.id` and `params.group`), which leaves only the comparison at `bits`.
+    by chance, so this second comparison asks for more: numbers equal to ceil(log2(train
+    rows)) + 7 bits of mantissa, at least 20 and at most 48 (about 6 significant digits at
+    15,000 training rows, 8 at 150,000), and a value at most 5 training rows have in a column
+    where at least half the values are distinct. Following the train size keeps the share of
+    rows that match by chance near 0.15% however the columns relate, so the
+    tolerance tightens as the train grows: 1e-7 relative jitter is still found at 15,000
+    training rows and no longer at 150,000. With `baseline` on it allows 0.5% of rows, or
+    `ratio` times the share that matches when each training column is shuffled on its own.
+    A copy jittered past that still agrees to about 4 significant digits, so a second
+    comparison at 14 bits asks whether the test rows collide with train more often than the
+    training rows collide with each other: real rows, so that count keeps every relation
+    between the columns and stays high when they depend on each other, while copies add
+    collisions the train does not have on its own. It needs at least 10 matched rows and 3
+    standard deviations over the train's own rate, so a handful of coincidences on a small
+    split stays quiet. It catches jitter up to about 1e-5 relative on data with several
+    columns, and finds nothing extra when they all derive from one (`b = a`), where the train
+    collides with itself more often than a few copies appear.
+    So under a new key a copy must almost carry the same numbers, unless the keys are
+    declared (`params.id` and `params.group`), which leaves only the comparison at `bits`.
     It doesn't find copies in data with only coarse columns, such as values rounded to 4
-    decimals with another column derived from them, copies of common values, a row copied more
-    than 5 times, or a copy given a fresh timestamp or other per-row value, unless `columns`
-    leaves that column out."""
+    decimals with another column derived from them, copies of common values, a row copied
+    more than 5 times, or a copy given a fresh timestamp or other per-row value, unless
+    `columns` leaves that column out; and a copy repeated inside train raises the collision
+    count it is measured against, so pre-split duplication is left to
+    duplicates.within_split."""
     return _cross(v, opt, near=True)
 
 

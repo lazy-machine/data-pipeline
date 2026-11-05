@@ -414,14 +414,22 @@ A pass means that no blocking check fired, not that the data is clean.
   compare labels with their source, not as proof. Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
 - **Near-copies under a new key.** With a unique key column that isn't declared as `id`, the
-  check also compares the other columns, but only numbers equal to about 10 significant
-  digits (it must be that fine, or columns that depend on each other match by chance), and
-  it needs a column with mostly distinct values to go on. So a copy whose numbers were
-  jittered, rounded or re-measured is missed unless you declare the keys (`id`, `group`), and it warns
-  at best. Also missed: data with only coarse columns, a row copied more than 5 times, and
-  a copy given a fresh timestamp or other per-row value. Values rounded to about 4 decimals
-  with a column derived from them, and nothing else beside the key, can raise a false
-  alarm; turn the check off for such data.
+  check also compares the other columns, at two precisions, and it needs a column with mostly
+  distinct values to go on. The fine comparison follows the size of the training split:
+  numbers equal to `ceil(log2(train rows)) + 7` bits of mantissa, between 20 and 48 (about 6
+  significant digits at 15,000 training rows, 8 at 150,000), so the share that matches by
+  chance stays near 0.15% and the tolerance tightens as the train grows (1e-7 relative jitter
+  is found at 15,000 training rows, missed at 150,000). The coarse comparison
+  is at 14 bits and asks whether the test rows collide with train more often than the
+  training rows collide with each other (by at least 10 rows and 3 standard deviations),
+  which keeps every relation between columns: it finds a copy jittered by up to about 1e-5
+  relative on data with several columns, and adds nothing when they all derive from one
+  (`b = a`), because then the train collides with itself more often than the copies appear. A copy whose numbers were rounded or re-measured more is
+  missed unless you declare the keys (`id`, `group`), and it warns at best. Also missed: data
+  with only coarse columns, a row copied more than 5 times, a copy given a fresh timestamp or
+  other per-row value, and pre-split duplication (caught by `duplicates.within_split`).
+  Values rounded to about 4 decimals with a column derived from them, and nothing else beside
+  the key, can raise a false alarm; turn the check off for such data.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
