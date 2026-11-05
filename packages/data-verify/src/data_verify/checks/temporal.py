@@ -9,7 +9,9 @@ import pandas as pd
 from ..core import check, examples, failed, frac, jsonable, passed, skipped
 from ..spec import SpecError
 
-_DATE_TEXT = re.compile(r"^\s*(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})([T\s]|$)")
+_DATE_TEXT = re.compile(
+    r"\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
+    r"|[A-Za-z]{3,9}\.? \d{1,2},? \d{4}|\d{1,2} [A-Za-z]{3,9}\.? \d{4})([T\s]|$)")
 
 
 def _need_time(v):
@@ -298,10 +300,12 @@ def _date_like(v, col: str) -> bool:
 @check("temporal.undeclared_time", "temporal", "warn",
        "Date-like columns are declared as params.time", min_distinct=20)
 def undeclared_time(v, opt):
-    """Runs when params.time is not set. Looks for date columns (dates, or text written as
-    dates) with at least `min_distinct` values. Without params.time no temporal check runs,
-    so a random split of time-dependent data looks fine. Declaring the column turns on the
-    temporal checks; if the rows really don't depend on time, turn this check off."""
+    """Runs when params.time is not set. Looks for date columns with at least `min_distinct`
+    values: date types, and text such as 2024-01-31, 31/01/2024, 31.01.2024, Jan 31, 2024 or
+    31 Jan 2024. Numbers are not read as dates, so epoch times and 20240131 pass. Without
+    params.time no temporal check runs, so a random split of time-dependent data looks fine.
+    Declaring the column turns on the temporal checks; if the rows really don't depend on
+    time, turn this check off."""
     if v.spec.time:
         return skipped("params.time is set")
     if len(v.splits) < 2:
@@ -310,9 +314,8 @@ def undeclared_time(v, opt):
     found = [c for c in v.common_columns() if c not in roles and _date_like(v, c)
              and v.train[c].nunique() >= opt["min_distinct"]]
     if found:
-        return failed(f"date-like column(s) {found} but params.time is not set",
+        return failed(f"date-like column(s) {', '.join(found)} but params.time is not set",
                       "Set params.time to the row's timestamp, and declare time_order or "
                       "time_bounds, so the gate can check that no split sees the future of "
                       "another.", columns=found)
     return passed("no undeclared date-like columns")
-

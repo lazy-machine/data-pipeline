@@ -128,7 +128,7 @@ Options: `allow_equal = True`
 
 #### `temporal.undeclared_time` (warn)
 
-**Date-like columns are declared as params.time.** Runs when params.time is not set. Looks for date columns (dates, or text written as dates) with at least `min_distinct` values. Without params.time no temporal check runs, so a random split of time-dependent data looks fine. Declaring the column turns on the temporal checks; if the rows really don't depend on time, turn this check off.
+**Date-like columns are declared as params.time.** Runs when params.time is not set. Looks for date columns with at least `min_distinct` values: date types, and text such as 2024-01-31, 31/01/2024, 31.01.2024, Jan 31, 2024 or 31 Jan 2024. Numbers are not read as dates, so epoch times and 20240131 pass. Without params.time no temporal check runs, so a random split of time-dependent data looks fine. Declaring the column turns on the temporal checks; if the rows really don't depend on time, turn this check off.
 
 Options: `min_distinct = 20`
 
@@ -142,7 +142,7 @@ Options: `max_fraction = 0.0`, `include_label = False`, `baseline = True`, `rati
 
 #### `duplicates.near_cross_split` (warn)
 
-**No near-copy of an example appears in two splits.** Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is about 3 significant digits) and normalising text (case, punctuation, spacing). Catches copies that went through a lossy round trip, re-encoding or light editing. Exact copies are not counted again. Same group baseline as duplicates.cross_split. Columns acting as keys are left out, so a copy with a new id still matches: integers distinct on almost every row, and short text or entity-named integers with at least 50 values, distinct on at least `key_share` of rows. They stay when the other columns cannot tell rows apart.
+**No near-copy of an example appears in two splits.** Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is about 3 significant digits) and normalising text (case, punctuation, spacing). Catches copies that went through a lossy round trip, re-encoding or light editing. Exact copies are not counted again. Same group baseline as duplicates.cross_split. Columns acting as keys are left out, so a copy with a new id still matches: whole numbers distinct on almost every row, and short text, single tokens such as hashes, or entity-named whole numbers with at least 50 values, distinct on at least `key_share` of rows. The report lists them in `ignored_keys`. Without them rows can match by chance, so the allowance is then `ratio` times the share of training rows that match each other, which also keeps this quiet when the other columns cannot tell rows apart. A copy given a fresh timestamp or other per-row value is not found, unless `columns` leaves that column out.
 
 Options: `max_fraction = 0.0`, `bits = 10`, `baseline = True`, `ratio = 2.0`, `columns = []`, `key_share = 0.02`
 
@@ -274,7 +274,7 @@ Options: `min_support = 20`, `purity = 0.98`, `max_coverage = 0.2`, `min_drop = 
 
 #### `poisoning.label_consistency` (warn)
 
-**Training labels fit the features as well as evaluation labels.** Fits one linear model on half of the training rows, then compares how well it predicts the other half with how well it predicts each evaluation split. Corrupted training labels weaken that relationship in train only, so evaluation labels fit better than held-out training labels by at least `min_gap` and `z` standard errors. Also fires when the model predicts evaluation labels backwards. Needs a binary or regression label and numeric features that predict it (rank correlation of at least `min_signal`). Sees label noise of about 15% and above on a few thousand rows, and targeted flips of a subgroup; not small flip rates or a backdoor with a rare trigger.
+**Training labels fit the features as well as evaluation labels.** Fits one linear model on half of the training rows, then compares how well it predicts the other half with how well it predicts each evaluation split. Corrupted training labels weaken that relationship in train only, so evaluation labels fit better than held-out training labels by at least `min_gap` and `z` standard errors. Also fires when the model predicts evaluation labels backwards. Needs a binary or regression label and numeric features that predict it (at least `min_signal` on a 0-1 scale: 2 * AUC - 1 for a binary label, rank correlation for regression). Sees label noise of about 15% and above on a few thousand rows, and targeted flips of a subgroup; not small flip rates or a backdoor with a rare trigger. A shift in class balance doesn't fire it. For a regression label, features that vary more in an evaluation split than in train do, because the label is then easier to predict.
 
 Options: `z = 3.0`, `min_gap = 0.05`, `min_signal = 0.1`, `min_rows = 100`
 

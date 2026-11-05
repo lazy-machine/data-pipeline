@@ -3,6 +3,8 @@ right check; the clean data must pass."""
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -986,7 +988,7 @@ def test_exact_copies_under_undeclared_keys_are_found_by_the_near_check(case, sp
     assert case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
 
 
-def test_undeclared_keys_stay_when_the_rest_cannot_tell_rows_apart(case, splits):
+def test_columns_that_cannot_tell_rows_apart_stay_quiet_without_the_keys(case, splits):
     for d in splits.values():
         d.drop(columns=["date", "label_date", "weight", "f1", "f2", "f3", "f4"], inplace=True)
     assert not case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
@@ -1099,3 +1101,106 @@ def test_small_train_split_is_skipped(case, splits):
 def test_label_consistency_decision(held, ev, z, expected):
     opt = {"z": 3.0, "min_gap": 0.05, "min_signal": 0.1}
     assert _inconsistent(held, ev, z, opt) is expected
+
+
+def _balanced_by_class(n: int, rate: float, seed: int) -> pd.DataFrame:
+    """Clean labels: features depend on the class only, so P(x | y) is the same everywhere."""
+    rng = np.random.default_rng(seed)
+    y = (rng.random(n) < rate).astype("int64")
+    return pd.DataFrame({"row_id": np.arange(n) + seed * 10**7, "y": y,
+                         "f1": rng.normal(y * 1.2, 1), "f2": rng.normal(0, 1, n)})
+
+
+NUMERIC_ONLY = {"group": [], "weight": None, "features": ["f1", "f2"], "forbidden": []}
+
+
+@pytest.mark.parametrize("train_rate, test_rate", [(0.05, 0.10), (0.10, 0.20), (0.20, 0.40)])
+def test_a_shift_in_class_balance_is_not_label_poisoning(case, train_rate, test_rate):
+    frames = {"train": _balanced_by_class(6000, train_rate, 1),
+              "test": _balanced_by_class(2000, test_rate, 2)}
+    assert case.run(frames, NUMERIC_ONLY).status("poisoning.label_consistency") == "pass"
+
+
+def test_flips_are_found_despite_a_shift_in_class_balance(case):
+    frames = {"train": _balanced_by_class(6000, 0.5, 1), "test": _balanced_by_class(2000, 0.1, 2)}
+    _flip(frames["train"], frames["train"].sample(frac=0.2, random_state=0).index)
+    assert case.run(frames, NUMERIC_ONLY).failed("poisoning.label_consistency")
+
+
+def test_a_split_name_with_a_space_warns_rather_than_crashing(case, splits):
+    splits = _strong(splits)
+    _flip(splits["train"], splits["train"].sample(frac=0.3, random_state=0).index)
+    r = case.run(splits, {"splits": {"train": "train", "held out": "val", "z": "test"}})
+    found = r.check("poisoning.label_consistency")
+    assert found["status"] == "fail" and r["passed"]
+    assert {c["split"] for c in found["details"]["comparisons"]} == {"held out", "z"}
+
+
+def test_a_split_missing_a_class_is_not_compared(case, splits):
+    splits = _strong(splits)
+    splits["val"] = splits["val"][splits["val"]["y"] == 1]
+    r = case.run(splits, {"checks": {"labels.*": "off"}})
+    assert r.status("poisoning.label_consistency") == "pass"
+
+
+@pytest.mark.parametrize("make_key", [
+    lambda i: i.astype("float64"),
+    lambda i: pd.Series(i, dtype="float64").where(i != i[0]).to_numpy(),   # an int id with a null
+    lambda i: [hashlib.sha256(str(x).encode()).hexdigest() for x in i],     # 64 characters
+    lambda i: [hashlib.md5(str(x).encode()).hexdigest() for x in i],
+], ids=["float", "int with null", "sha256", "md5"])
+def test_near_copies_are_found_under_any_shape_of_key(case, splits, make_key):
+    splits = _near_copies(splits)
+    for d in splits.values():
+        d["row_id"] = make_key(d["row_id"].to_numpy())
+    r = case.run(splits, LABEL_ONLY)
+    assert r.failed("duplicates.near_cross_split")
+    assert "row_id" in r.check("duplicates.near_cross_split")["details"]["ignored_keys"]
+
+
+def test_ignored_keys_are_named_in_the_message(case, splits):
+    r = case.run(_near_copies(splits), LABEL_ONLY)
+    found = r.check("duplicates.near_cross_split")
+    assert set(found["details"]["ignored_keys"]) == {"row_id", "customer"}
+    assert "ignoring key column(s) row_id, customer" in found["message"]
+
+
+def test_a_sentence_is_not_a_key(case, splits):
+    for d in splits.values():
+        d["note"] = [f"customer called about order number {i} last week and again today "
+                     f"about the same thing" for i in d["row_id"]]
+        d.drop(columns=["date", "label_date", "weight"], inplace=True)
+    r = case.run(splits, LABEL_ONLY)
+    assert "note" not in r.check("duplicates.near_cross_split")["details"].get("ignored_keys", [])
+
+
+def test_key_share_decides_what_counts_as_a_key(case, splits):
+    splits = _near_copies(splits)
+    r = case.run(splits, {**LABEL_ONLY, "checks": {
+        "temporal.undeclared_time": "off",
+        "duplicates.near_cross_split": {"key_share": 0.9}}})
+    assert r.check("duplicates.near_cross_split")["details"].get("ignored_keys") == ["row_id"]
+
+
+def test_chance_matches_without_keys_stay_quiet(case):
+    """With the id ignored, a few coarse columns repeat by chance, in train as across splits."""
+    rng = np.random.default_rng(0)
+    d = pd.DataFrame({"row_id": np.arange(20_000), "y": rng.integers(0, 2, 20_000),
+                      "a": rng.normal(size=20_000).round(1), "b": rng.normal(size=20_000).round(1),
+                      "c": rng.normal(size=20_000).round(1), "e": rng.normal(size=20_000).round(1)})
+    r = case.run({"train": d.iloc[:15_000], "test": d.iloc[15_000:]}, {
+        **LABEL_ONLY, "checks": {"temporal.undeclared_time": "off"}})
+    found = r.check("duplicates.near_cross_split")
+    assert found["details"]["ignored_keys"] == ["row_id"]
+    assert found["status"] == "pass"
+
+
+@pytest.mark.parametrize("fmt", ["%Y/%m/%d", "%d-%m-%Y", "%d.%m.%Y", "%b %d, %Y", "%d %b %Y",
+                                 "%Y-%m-%dT%H:%M:%S"])
+def test_more_date_formats_are_read_as_dates(case, splits, fmt):
+    for d in splits.values():
+        d["date"] = d["date"].dt.strftime(fmt)
+        d["label_date"] = d["label_date"].dt.strftime(fmt)
+    r = case.run(splits)
+    assert r.check("temporal.undeclared_time")["details"]["columns"] == ["date", "label_date"]
+    assert "date, label_date" in r.check("temporal.undeclared_time")["message"]

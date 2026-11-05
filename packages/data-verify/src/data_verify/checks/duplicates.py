@@ -11,29 +11,23 @@ import pandas as pd
 from ..core import check, failed, frac, passed, skipped
 from .splits import _ENTITY_NAME
 
-_MAX_REPEATS = 0.01  # share of repeated rows above which columns no longer tell rows apart
 
-
-def _without_keys(v, cols: tuple[str, ...], key_share: float, bits: int) -> tuple[str, ...]:
-    """Drop columns that act as row or entity keys, so that a copy under a new key still
-    matches. The columns stay when the rest cannot tell rows apart on their own."""
-    keys = set()
-    for c in cols:
-        s = v.train[c].dropna()
-        if s.empty:
-            continue
-        values = s.nunique()
-        share = values / len(s)
-        short_text = v.kind(c) == "string" and float(s.astype("string").str.len().mean()) <= 40
-        named_int = v.kind(c) == "int" and bool(_ENTITY_NAME.search(c))
-        if share >= 0.98 and v.kind(c) == "int" or \
-                values >= 50 and share >= key_share and (short_text or named_int):
-            keys.add(c)
-    rest = tuple(c for c in cols if c not in keys)
-    if not keys or not rest:
-        return cols
-    repeats = pd.Series(v.hashes(v.train_name, rest, True, bits)).duplicated().mean()
-    return rest if repeats <= _MAX_REPEATS else cols
+def _is_key(v, col: str, key_share: float) -> bool:
+    s = v.train[col].dropna()
+    if s.empty:
+        return False
+    kind = v.kind(col)
+    values = s.nunique()
+    share = values / len(s)
+    if kind == "string":
+        text = s.astype("string")
+        word = float(text.str.contains(r"\s").mean()) < 0.05   # a hash, not a sentence
+        return values >= 50 and share >= key_share and \
+            (word or float(text.str.len().mean()) <= 40)
+    # a null turns an integer column into floats
+    whole = kind == "int" or (kind == "float" and bool((s == s.round()).all()))
+    return whole and (share >= 0.98 or (values >= 50 and share >= key_share
+                                        and bool(_ENTITY_NAME.search(col))))
 
 
 def _cross_group_rate(v, cols, near: bool, bits: int) -> float | None:
@@ -68,7 +62,8 @@ def _cross(v, opt, near: bool):
     cols = tuple(c for c in cols if v.has(c))
     all_cols = cols
     if near and not opt.get("columns"):
-        cols = _without_keys(v, cols, opt["key_share"], bits)
+        # so that a copy under a new key still matches
+        cols = tuple(c for c in cols if not _is_key(v, c, opt["key_share"])) or cols
     pairs, worst = {}, 0.0
     for (a, _), (b, _) in combinations(v.splits.items(), 2):
         ha, hb = v.hashes(a, cols, near, bits), v.hashes(b, cols, near, bits)
@@ -82,16 +77,24 @@ def _cross(v, opt, near: bool):
                                  "example_rows_of_" + b: np.flatnonzero(hit)[:5].tolist()}
     kind = "near-duplicate" if near else "duplicate"
     base = _cross_group_rate(v, cols, near, bits) if opt["baseline"] else None
+    ignored = [c for c in all_cols if c not in cols]
+    if ignored:  # without the keys, rows can match by chance, so allow what train itself does
+        h = pd.Series(v.hashes(v.train_name, cols, near, bits))
+        base = max(base or 0.0, float(h.duplicated(keep=False).mean()))
     allowed = opt["max_fraction"]
     if base is not None:
         allowed = max(allowed, opt["ratio"] * base)
     details = {"pairs": pairs, "compared_columns": len(cols), "max_fraction": opt["max_fraction"]}
+    if ignored:
+        details["ignored_keys"] = ignored
     if base is not None:
         details.update(cross_group_rate_in_train=frac(base, 1), allowed=frac(allowed, 1))
     summary = ", ".join(f"{k} {p['rows']} rows ({p['fraction']:.2%})" for k, p in pairs.items())
+    if ignored:
+        summary += f" (ignoring key column(s) {', '.join(ignored)})"
     if pairs and worst > allowed:
-        why = (f"; different entities share a vector in only {base:.3%} of {v.train_name} rows, "
-               f"so this is more than chance" if base is not None else "")
+        why = (f"; only {base:.3%} of {v.train_name} rows match another by chance, "
+               f"so this is more" if base is not None else "")
         return failed(f"{kind} feature rows shared between splits: {summary}{why}",
                       "The model sees these evaluation examples during training. Deduplicate "
                       "before splitting, or split by a group key that keeps copies together "
@@ -100,7 +103,7 @@ def _cross(v, opt, near: bool):
                       f"{'near_cross_split' if near else 'cross_split'}\".max_fraction.",
                       **details)
     if pairs:
-        reason = (f"no more than different {v.train_name} entities share by chance "
+        reason = (f"no more than {v.train_name} rows share by chance "
                   f"({base:.3%})" if base is not None else f"<= max_fraction {allowed:.3%}")
         return passed(f"{kind}s within tolerance: {summary}; {reason}", **details)
     return passed(f"no {kind} feature rows across {len(v.splits)} splits", **details)
@@ -129,9 +132,13 @@ def near_cross_split(v, opt):
     about 3 significant digits) and normalising text (case, punctuation, spacing). Catches
     copies that went through a lossy round trip, re-encoding or light editing. Exact copies
     are not counted again. Same group baseline as duplicates.cross_split. Columns acting as
-    keys are left out, so a copy with a new id still matches: integers distinct on almost
-    every row, and short text or entity-named integers with at least 50 values, distinct on
-    at least `key_share` of rows. They stay when the other columns cannot tell rows apart."""
+    keys are left out, so a copy with a new id still matches: whole numbers distinct on almost
+    every row, and short text, single tokens such as hashes, or entity-named whole numbers
+    with at least 50 values, distinct on at least `key_share` of rows. The report lists them
+    in `ignored_keys`. Without them rows can match by chance, so the allowance is then `ratio`
+    times the share of training rows that match each other, which also keeps this quiet when
+    the other columns cannot tell rows apart. A copy given a fresh timestamp or other per-row
+    value is not found, unless `columns` leaves that column out."""
     return _cross(v, opt, near=True)
 
 

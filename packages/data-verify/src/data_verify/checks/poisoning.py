@@ -14,7 +14,7 @@ from ..core import (
     check, examples, failed, fmt, frac, jsonable, kind, numeric_values, passed, skipped, value_set,
     value_texts,
 )
-from ..stats import binned_counts, prepare_label, psi, robust_scale, robust_z, spearman
+from ..stats import auc, binned_counts, prepare_label, psi, robust_scale, robust_z, spearman
 
 # -- labels --------------------------------------------------------------------------------
 
@@ -355,7 +355,7 @@ def _token_rows(s: pd.Series) -> dict:
     return {k: np.asarray(x) for k, x in rows.items()}
 
 
-# -- drift ---------------------------------------------------------------------------------
+_SPEARMAN_SE = 1.03  # Fieller: a Fisher-transformed Spearman has variance about 1.06 / (n - 3)
 
 
 def _matrix(d: pd.DataFrame, feats: list[str], stats: dict[str, tuple[float, float]]):
@@ -366,8 +366,28 @@ def _matrix(d: pd.DataFrame, feats: list[str], stats: dict[str, tuple[float, flo
     return np.column_stack(cols)
 
 
-def _fisher(r: float) -> float:
-    return float(np.arctanh(np.clip(r, -0.999, 0.999)))
+def _agreement(pred: np.ndarray, y: np.ndarray, task: str):
+    """How well ``pred`` orders ``y``: (score, a value to compare, its standard error), or None.
+
+    The score is 0 for no signal and 1 for perfect. Binary labels use AUC (as 2 * AUC - 1),
+    because it doesn't depend on the share of positives, so a change in class balance
+    between splits is not mistaken for corrupted labels. A correlation does depend on it.
+    """
+    if task == "binary":
+        a = auc(pred, y)
+        if np.isnan(a):  # a class is missing
+            return None
+        pos = int(y.sum())
+        neg = len(y) - pos
+        q1, q2 = a / (2 - a), 2 * a ** 2 / (1 + a)   # Hanley and McNeil, 1982
+        var = (a * (1 - a) + (pos - 1) * (q1 - a ** 2) + (neg - 1) * (q2 - a ** 2)) / (pos * neg)
+        score = 2 * a - 1
+        return score, score, 2 * math.sqrt(max(var, 0.0))
+    r = spearman(pred, y)
+    if np.isnan(r):
+        return None
+    fisher = float(np.arctanh(np.clip(r, -0.999, 0.999)))
+    return r, fisher, _SPEARMAN_SE / math.sqrt(len(y) - 3)
 
 
 def _inconsistent(held: float, ev: float, z: float, opt: dict) -> bool:
@@ -386,22 +406,25 @@ def label_consistency(v, opt):
     weaken that relationship in train only, so evaluation labels fit better than held-out
     training labels by at least `min_gap` and `z` standard errors. Also fires when the model
     predicts evaluation labels backwards. Needs a binary or regression label and numeric
-    features that predict it (rank correlation of at least `min_signal`). Sees label noise
-    of about 15% and above on a few thousand rows, and targeted flips of a subgroup; not
-    small flip rates or a backdoor with a rare trigger."""
+    features that predict it (at least `min_signal` on a 0-1 scale: 2 * AUC - 1 for a binary
+    label, rank correlation for regression). Sees label noise of about 15% and above on a few
+    thousand rows, and targeted flips of a subgroup; not small flip rates or a backdoor with
+    a rare trigger. A shift in class balance doesn't fire it. For a regression label, features
+    that vary more in an evaluation split than in train do, because the label is then easier
+    to predict."""
     if not v.labels or len(v.splits) < 2:
         return skipped("needs a label and at least two splits")
     feats = v.numeric_features()
     if not feats:
         return skipped("no numeric features")
-    hits, compared = {}, []
+    hits, compared = [], 0
     for lbl in v.labels:
         if lbl not in v.train.columns or v.task(lbl) == "multiclass":
             continue
         task = v.task(lbl)
         train = v.sample(v.train_name)
         y, ok, _ = prepare_label(train[lbl], task)
-        train, y = train[ok], y[ok]
+        train, y = train[ok], y[ok].astype(float)
         if len(train) < 2 * opt["min_rows"]:
             continue
         stats = {f: robust_scale(numeric_values(train[f])) for f in feats}
@@ -409,9 +432,10 @@ def label_consistency(v, opt):
                  for f, (c, s) in stats.items()}
         fit = np.random.default_rng(v.spec.seed).random(len(train)) < 0.5
         x = _matrix(train, feats, stats)
-        coef = np.linalg.lstsq(x[fit], y[fit].astype(float), rcond=None)[0]
-        held = spearman(x[~fit] @ coef, y[~fit].astype(float))
-        n_held = int((~fit).sum())
+        coef = np.linalg.lstsq(x[fit], y[fit], rcond=None)[0]
+        held = _agreement(x[~fit] @ coef, y[~fit], task)
+        if held is None:
+            continue
         for name, d in v.others():
             if lbl not in d.columns:
                 continue
@@ -419,24 +443,29 @@ def label_consistency(v, opt):
             ye, oke, _ = prepare_label(d[lbl], task)
             if oke.sum() < opt["min_rows"]:
                 continue
-            ev = spearman(_matrix(d[oke], feats, stats) @ coef, ye[oke].astype(float))
-            if np.isnan(ev) or np.isnan(held):
+            ev = _agreement(_matrix(d[oke], feats, stats) @ coef, ye[oke].astype(float), task)
+            if ev is None:
                 continue
-            compared.append(f"{lbl} {name}")
-            se = 1.03 * math.sqrt(1 / (n_held - 3) + 1 / (int(oke.sum()) - 3))
-            z = (_fisher(ev) - _fisher(held)) / se
-            if _inconsistent(held, ev, z, opt):
-                hits[f"{lbl} {name}"] = {"held_out_train": fmt(held), name: fmt(ev), "z": fmt(z)}
+            compared += 1
+            se = math.hypot(held[2], ev[2])
+            if se and _inconsistent(held[0], ev[0], (ev[1] - held[1]) / se, opt):
+                hits.append({"label": lbl, "split": name, "held_out_train": fmt(held[0]),
+                             "evaluation": fmt(ev[0]), "z": fmt((ev[1] - held[1]) / se)})
     if not compared:
         return skipped("needs a binary or regression label and enough rows in each split")
     if hits:
         return failed("labels fit the features differently in train and evaluation: " + ", ".join(
-            f"{k} (train {x['held_out_train']}, {k.split()[-1]} {x[k.split()[-1]]})"
-            for k, x in hits.items()),
-            "Training labels may be corrupted or flipped. Compare them with their source. A "
-            "real change in the data between splits can also cause this.", comparisons=hits)
+            f"{h['label']}: train {h['held_out_train']}, {h['split']} {h['evaluation']}"
+            for h in hits),
+            "Training labels may be corrupted or flipped. Compare them with their source. For "
+            "a regression label, check first whether the features vary more in one split, "
+            "which also causes this.",
+            comparisons=hits)
     return passed(f"training labels fit the features as well as evaluation labels "
-                  f"({len(compared)} comparison(s))")
+                  f"({compared} comparison(s))")
+
+
+# -- drift ---------------------------------------------------------------------------------
 
 
 @check("drift.features", "drift", "warn", "Feature distributions are stable across splits",

@@ -398,7 +398,10 @@ A pass means that no blocking check fired, not that the data is clean.
 - **Poisoning.** `poisoning.label_consistency` warns about label noise of roughly 15% and up
   on a few thousand rows, and about targeted flips of a subgroup, when numeric features
   predict a binary or regression label. Lower flip rates and a backdoor with a rare trigger
-  look like ordinary noise. Other injected values and rows mostly warn. `schema.ranges`,
+  look like ordinary noise. A shift in class balance doesn't fire it, but with a regression
+  label, features that vary more in an evaluation split do, so read it as a prompt to compare
+  labels with their source, not as proof. Near-copies given a fresh timestamp or other per-row value are not found.
+  Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
