@@ -101,8 +101,10 @@ def _overlap(a: Path, b: Path) -> bool:
     return a.is_relative_to(b) or b.is_relative_to(a)
 
 
-def _ungated_steps(path: Path, gate_name: str | None, params, inputs, workdir) -> list[str]:
-    """One line for each step that reads a split the gate checks but can run without it.
+def _ungated_steps(path: Path, gate_name: str | None, params, inputs,
+                   workdir) -> list[str] | None:
+    """One line for each step that reads a split the gate checks but can run without it, or
+    None when the splits can't be told yet.
 
     Steps whose outputs feed the gate are left out: they can't depend on it. A step the
     gate merely runs after is not, because then it read the split unchecked.
@@ -114,7 +116,9 @@ def _ungated_steps(path: Path, gate_name: str | None, params, inputs, workdir) -
     gate = next(s for s in gates if gate_name in (None, s.get("name")))
 
     def paths(step, key):
-        return [(workdir / p).resolve() for p in step.get(key, {}).values()]
+        declared = step.get(key, {})
+        return [(workdir / p).resolve() for p in declared.values()] \
+            if isinstance(declared, dict) else []
 
     def ancestors(step, ordering: bool = True) -> set[str]:
         seen: set[str] = set()
@@ -131,7 +135,10 @@ def _ungated_steps(path: Path, gate_name: str | None, params, inputs, workdir) -
                     queue.append(other)
         return seen
 
-    split_files = [inputs[n] for n in split_input_names(params, inputs)]
+    names = split_input_names(params, inputs)
+    if names is None:
+        return None
+    split_files = [inputs[n] for n in names]
     feeds_gate = ancestors(gate, ordering=False)
     found = []
     for step in steps:
@@ -158,6 +165,10 @@ def cmd_lint(args) -> int:
         parse(params, inputs, REGISTRY)
         print("params OK (fully resolved against the inputs)")
     ungated = _ungated_steps(Path(args.config), args.step, params, inputs, workdir)
+    if ungated is None:
+        print("not checked: can't tell yet which inputs hold the splits, so no step was compared "
+              "with the gate")
+        return 0
     for line in ungated:
         print(f"x {line}")
     return 1 if ungated else 0

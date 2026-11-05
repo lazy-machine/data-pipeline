@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import importlib
 import json
 import string
@@ -12,7 +11,9 @@ from typing import Any
 import numpy as np
 
 from . import checks as _checks  # noqa: F401  (registers every check)
-from .core import REGISTRY, Outcome, Verifier, jsonable, path_size, sha256_path
+from .core import (
+    REGISTRY, Outcome, Verifier, jsonable, path_size, resolve_check, sha256_path,
+)
 from .spec import Spec, SpecError, parse, suggest
 
 OUTPUT_KEYS = {"report": ".json", "summary": ".md"}
@@ -31,25 +32,6 @@ def _clean(obj: Any) -> Any:
     if isinstance(obj, np.ndarray):
         return [_clean(x) for x in obj.tolist()]
     return jsonable(obj)
-
-
-def _specificity(pattern: str) -> int:
-    return sum(ch not in "*?[]" for ch in pattern)
-
-
-def resolve_check(cid: str, spec: Spec, default_sev: str, defaults: dict) -> tuple[str, dict]:
-    """An exact id beats every glob; among globs the most specific one (most non-wildcard
-    characters) wins, and on a tie the one written last."""
-    sev, opt = default_sev, dict(defaults)
-    globs = [(_specificity(p), i, o["severity"]) for i, (p, o) in enumerate(spec.checks.items())
-             if p != cid and fnmatch.fnmatchcase(cid, p) and "severity" in o]
-    if globs:
-        sev = max(globs)[2]
-    if cid in spec.checks:
-        o = spec.checks[cid]
-        sev = o.get("severity", sev)
-        opt.update({k: x for k, x in o.items() if k != "severity"})
-    return sev, opt
 
 
 def _entry(cid, category, severity, title, out: Outcome) -> dict[str, Any]:

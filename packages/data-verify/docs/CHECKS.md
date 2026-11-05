@@ -210,7 +210,7 @@ Options: `tol_mean = 0.0001`, `tol_std = 0.001`, `chance_margin = 0.003`
 
 #### `preprocessing.global_scaling_near` (warn)
 
-**No feature is almost scaled over evaluation rows.** Features within `tol_mean` and `tol_std` of mean 0 and std 1 over train plus evaluation rows that preprocessing.global_scaling doesn't block, because chance can't be ruled out. Either a scaler was fitted on evaluation rows and the result lost precision or changed rows afterwards, or the feature is roughly standard by nature, which on large data with many such features is common.
+**No feature is almost scaled over evaluation rows.** Features within `tol_mean` and `tol_std`, or those of preprocessing.global_scaling if wider, of mean 0 and std 1 over train plus evaluation rows that it doesn't block, because chance can't be ruled out. Either a scaler was fitted on evaluation rows and the result lost precision or changed rows afterwards, or the feature is roughly standard by nature, which on large data with many such features is common.
 
 Options: `tol_mean = 0.0001`, `tol_std = 0.001`
 

@@ -76,7 +76,9 @@ depends_on = ["verify"]        # nothing trains on data the gate has not passed
 `./pipeline.toml` without running anything. (The step itself only sees its params when its
 turn comes, after the upstream steps ran.) It also exits 1 if a step reads a split without
 the gate upstream of it, directly or through other steps. Steps that feed the gate, and
-steps that read only `source`, are allowed.
+steps that read only `source`, are allowed. It prints `not checked` and exits 0 when it can't
+tell which inputs hold the splits, because a reference or `spec` isn't readable yet, or
+because `source` is set with several other tables and no split names.
 
 ### Declare every role that exists in your data
 
@@ -400,9 +402,10 @@ A pass means that no blocking check fired, not that the data is clean.
   than chance allows, with an allowance for rounding to 2 or more decimals. A real scaler
   that misses that bar can't be told from chance on large data, so it warns at best
   (`preprocessing.global_scaling_near`). That covers coarser rounding, values kept to
-  significant figures, and float32 data with a large offset. In the other direction, a coarse
-  feature that is exactly standard by nature, such as a perfectly balanced +1/-1 column, still
-  blocks a clean pipeline, because nothing tells it from a scaler. Rows added or dropped after
+  significant figures, and float32 data with a large offset. Features with only two values
+  are not tested, so a scaled flag goes unseen. In the other direction, a coarse feature with
+  a few values that happens to be exactly standard still blocks a clean pipeline, because
+  nothing tells it from a scaler. Rows added or dropped after
   scaling often give no signal at all, and the more rows changed the less likely any signal
   is. The warning also fires on features that are roughly standard by nature, so a project
   with many of those will often see it. Target encoding and imputation leave no signature.
@@ -443,9 +446,10 @@ pipeline after the split, since the gate can't confirm that from the data.
 
 **preprocessing**
 - Blocks: scaler fitted on train+evaluation data (standardised or min-max over the union
-  only, also tested without repeated rows and on rows found in `source`, so later
-  injections do not hide it); fitted vocabularies containing levels absent from training
-  data.
+  only, closer than chance allows, also tested without repeated rows and on rows found in
+  `source`, so later injections do not hide it); fitted vocabularies containing levels
+  absent from training data.
+- Warns: features nearly standardised over the union, where chance can't be ruled out.
 
 **labels**
 - Blocks: missing / out-of-domain labels, single-class train; evaluation classes absent

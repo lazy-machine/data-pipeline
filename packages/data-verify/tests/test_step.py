@@ -335,6 +335,7 @@ def test_the_iris_example_passes_lint():
     ({"label": "y", "split_column": "s", "splits": ["train", "test"]}, ["t"], ["t"]),
     ({"label": "y"}, ["only"], ["only"]),
     ({"label": "y", "source": "raw"}, ["rows", "raw"], ["rows"]),
+    ({"label": "y", "splits": "a"}, ["a", "b"], ["a"]),
 ])
 def test_lint_layout_agrees_with_the_real_parser(tmp_path, params, names, expected):
     inputs = {n: tmp_path / f"{n}.parquet" for n in names}
@@ -411,13 +412,102 @@ def test_lint_flags_a_split_named_through_a_reference(tmp_path, capsys):
     assert "'overview' reads build/raw.parquet" in capsys.readouterr().out
 
 
-def test_lint_accuses_nobody_when_a_reference_is_not_built_yet(tmp_path):
+def test_lint_says_so_when_a_layout_reference_is_not_built_yet(tmp_path, capsys):
     toml = tmp_path / "pipeline.toml"
     toml.write_text(CONFIG_REFS.format(layout='source = { from = "config", key = "source" }'))
     assert main(["lint", str(toml)]) == 0
+    assert "not checked" in capsys.readouterr().out
 
 
-def test_lint_accuses_nobody_when_the_table_is_unclear(tmp_path):
+def test_lint_says_so_when_a_reference_is_malformed(tmp_path, capsys):
+    (tmp_path / "config.toml").write_text("not = = toml")
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(CONFIG_REFS.format(layout='source = { from = "config", key = "source" }'))
+    assert main(["lint", str(toml)]) == 0
+    assert "not checked" in capsys.readouterr().out
+
+
+def test_lint_says_so_when_a_spec_input_is_not_built_yet(tmp_path, capsys):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(SOURCE_ONLY.format(inputs=RAW_FIRST + ', spec = "build/gate.toml"', params=""))
+    assert main(["lint", str(toml)]) == 0
+    assert "not checked" in capsys.readouterr().out
+
+
+def test_an_unbuilt_reference_elsewhere_does_not_stop_the_check(tmp_path, capsys):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { train = "build/train.parquet", test = "build/test.parquet", meta = "build/meta.toml" }
+params = { label = { from = "meta", key = "label" } }
+
+[[steps]]
+name = "model"
+function = "m:f"
+inputs = { train = "build/train.parquet" }
+outputs = { o = "build/o.txt" }
+""")
+    assert main(["lint", str(toml)]) == 1
+    assert "'model' reads" in capsys.readouterr().out
+
+
+def test_lint_reads_a_single_split_name(tmp_path):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { a = "build/a.parquet", b = "build/b.parquet" }
+params = { label = "y", splits = "a" }
+
+[[steps]]
+name = "lookup"
+function = "m:f"
+inputs = { b = "build/b.parquet" }
+outputs = { o = "build/o.txt" }
+""")
+    assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_survives_malformed_layouts(tmp_path):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { a = "build/a.parquet" }
+params = { label = "y", splits = [{ a = 1 }] }
+
+[[steps]]
+name = "odd"
+function = "m:f"
+inputs = ["build/a.parquet"]
+""")
+    assert main(["lint", str(toml)]) in (0, 2)
+
+
+def test_lint_sees_a_dotted_directory_split_that_is_not_built_yet(tmp_path, capsys):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { train = "build/train.v2", test = "build/test.v2" }
+params = { label = "y" }
+
+[[steps]]
+name = "model"
+function = "m:f"
+inputs = { train = "build/train.v2" }
+outputs = { o = "build/o.txt" }
+""")
+    assert main(["lint", str(toml)]) == 1
+    assert "'model' reads" in capsys.readouterr().out
+
+
+def test_lint_says_so_when_the_table_is_unclear(tmp_path, capsys):
     """Listing a lookup first would make it the split, and a step reading it the offender."""
     toml = tmp_path / "pipeline.toml"
     toml.write_text(SOURCE_ONLY.format(
@@ -430,25 +520,7 @@ inputs = { aux = "build/aux.parquet" }
 outputs = { o = "build/l.txt" }
 """)
     assert main(["lint", str(toml)]) == 0
-
-
-def test_lint_does_not_take_a_config_file_for_data(tmp_path):
-    (tmp_path / "config.json").write_text('{"source": "raw"}')
-    toml = tmp_path / "pipeline.toml"
-    toml.write_text("""
-[[steps]]
-name = "verify"
-function = "data_verify:verify"
-inputs = { config = "config.json", raw = "build/raw.parquet", rows = "build/rows.parquet" }
-params = { label = "y", source = { from = "config", key = "source" } }
-
-[[steps]]
-name = "uses_config"
-function = "m:f"
-inputs = { config = "config.json" }
-outputs = { o = "build/o.txt" }
-""")
-    assert main(["lint", str(toml)]) == 0
+    assert "not checked" in capsys.readouterr().out
 
 
 def test_lint_finds_the_table_beside_a_config_file(tmp_path, capsys):

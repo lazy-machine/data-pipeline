@@ -281,40 +281,50 @@ def is_data_input(path: Path) -> bool:
     return path.is_dir() or path.suffix.lower() in TABULAR_SUFFIXES
 
 
-def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[str]:
-    """The inputs holding split data, for lint. Follows the layout rules of ``parse``, but
-    data inputs may not exist yet, and it must not accuse a step on a guess: when a reference
-    can't be read yet, or the layout leaves the table unclear, it returns nothing."""
+def _reference_sources(value: Any) -> set[str]:
+    if _is_ref(value):
+        return {value["from"]}
+    children = value.values() if isinstance(value, dict) else \
+        value if isinstance(value, list) else []
+    return {name for child in children for name in _reference_sources(child)}
+
+
+def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[str] | None:
+    """The inputs holding split data, for lint, or None when that can't be told yet. Follows
+    the layout rules of ``parse``, but data inputs may not exist yet, and lint must not accuse
+    a step on a guess. Only the layout keys are resolved, so that a reference elsewhere that
+    isn't built yet doesn't stop the check."""
     refs = Refs(inputs)
     try:
-        spec_file = inputs.get("spec")
-        if spec_file is not None and spec_file.is_file():
+        if "spec" in inputs:
             base = refs.doc("spec", "inputs.spec")
             if isinstance(base, dict):
                 params = {**(base["params"] if isinstance(base.get("params"), dict) else base),
                           **params}
-        params = refs.resolve(params, "params")
-    except (SpecError, OSError):
-        return []
-    source = params.get("source")
+        layout = {k: refs.resolve(params.get(k), k)
+                  for k in ("source", "splits", "split_column", "table")}
+    except Exception:  # noqa: BLE001  unbuilt or invalid: parse reports that when it runs
+        return None
+    source, splits, table = layout["source"], layout["splits"], layout["table"]
+    if isinstance(splits, str):
+        splits = [splits]
+    config = _reference_sources(params) | {"spec"}
 
     def is_data(path: Path) -> bool:
-        return is_data_input(path) or (not path.exists() and not path.suffix)  # a directory
+        return is_data_input(path) or \
+            (not path.exists() and path.suffix.lower() not in CONFIG_SUFFIXES)  # a directory
 
-    data = [n for n, path in inputs.items()
-            if is_data(path) and n not in ("spec", source) and n not in refs.used]
-    splits = params.get("splits")
-    if params.get("split_column"):
-        table = params.get("table")
-        return [table] if table in inputs else data
+    data = [n for n, path in inputs.items() if is_data(path) and n != source and n not in config]
+    if layout["split_column"]:
+        return [table] if isinstance(table, str) and table in inputs else data
     if isinstance(splits, dict):
-        return [n for n in splits.values() if n in inputs]
+        return [n for n in splits.values() if isinstance(n, str) and n in inputs]
     if isinstance(splits, list):
-        return [n for n in splits if n in inputs]
+        return [n for n in splits if isinstance(n, str) and n in inputs]
     named = [n for n in data if n.lower() in SPLIT_RANKS]
     if named or not source:
         return named or data
-    return data if len(data) == 1 else []   # parse takes the first, but that may be a lookup
+    return data if len(data) == 1 else None   # parse takes the first, but that may be a lookup
 
 
 def _option_type(default: Any) -> str:

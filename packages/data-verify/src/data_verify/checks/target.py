@@ -11,7 +11,7 @@ import pandas as pd
 
 from ..core import (
     REGISTRY, check, examples, failed, fmt, is_numeric_kind, kind, matches, numeric_values, passed,
-    skipped, value_text, value_texts,
+    resolve_check, skipped, value_text, value_texts,
 )
 from ..stats import feature_scores
 
@@ -318,7 +318,9 @@ def _scaling_hits(v, tol_mean, tol_std, margin, minmax: bool) -> dict[str, str]:
     """Features that look scaled over train plus evaluation rows, but not over train alone."""
     names = list(v.splits)
     hits: dict[str, str] = {}
-    feats = v.numeric_features()
+    # two values can balance to mean 0 and std 1 by themselves: a +1/-1 flag is no evidence
+    feats = [f for f in v.numeric_features()
+             if len(np.unique(np.concatenate([numeric_values(v.splits[n][f]) for n in names]))) > 2]
     # row subsets to test: all rows; without repeats; without repeats and rows absent from
     # params.source. Rows injected after scaling would otherwise hide the signature.
     unique = {n: ~pd.Series(v.hashes(n, tuple(v.features))).duplicated().to_numpy()
@@ -393,18 +395,21 @@ def global_scaling(v, opt):
 @check("preprocessing.global_scaling_near", "preprocessing", "warn",
        "No feature is almost scaled over evaluation rows", tol_mean=1e-4, tol_std=1e-3)
 def global_scaling_near(v, opt):
-    """Features within `tol_mean` and `tol_std` of mean 0 and std 1 over train plus evaluation
-    rows that preprocessing.global_scaling doesn't block, because chance can't be ruled out.
+    """Features within `tol_mean` and `tol_std`, or those of preprocessing.global_scaling if
+    wider, of mean 0 and std 1 over train plus evaluation rows that it doesn't block, because
+    chance can't be ruled out.
     Either a scaler was fitted on evaluation rows and the result lost precision or changed
     rows afterwards, or the feature is roughly standard by nature, which on large data with
     many such features is common."""
     if len(v.splits) < 2:
         return skipped("one split only")
-    blocking = {**REGISTRY["preprocessing.global_scaling"].options,
-                **v.spec.checks.get("preprocessing.global_scaling", {})}
-    exact = {} if blocking.get("severity") == "off" else _blocking_hits(
+    definition = REGISTRY["preprocessing.global_scaling"]
+    severity, blocking = resolve_check("preprocessing.global_scaling", v.spec,
+                                       definition.severity, definition.options)
+    exact = {} if severity == "off" else _blocking_hits(
         v, blocking["tol_mean"], blocking["tol_std"], blocking["chance_margin"])
-    near = _scaling_hits(v, opt["tol_mean"], opt["tol_std"], None, minmax=False)
+    near = _scaling_hits(v, max(opt["tol_mean"], blocking["tol_mean"]),
+                         max(opt["tol_std"], blocking["tol_std"]), None, minmax=False)
     hits = {f: x for f, x in near.items() if f not in exact}
     if hits:
         return failed(f"{len(hits)} feature(s) nearly standardised over evaluation rows: "

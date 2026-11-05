@@ -397,12 +397,42 @@ def test_scaler_on_a_coarser_grid_only_warns(case):
     assert r.failed("preprocessing.global_scaling_near")
 
 
-def test_whole_numbers_near_standard_do_not_block(case):
-    """A balanced +1/-1 feature, two rows off exact balance: inside the fixed tolerances."""
+@pytest.mark.parametrize("minus_ones", [99_999, 100_000], ids=["almost balanced", "balanced"])
+def test_two_values_prove_nothing(case, minus_ones):
+    """A +1/-1 flag that balances is mean 0 and std 1 by itself."""
     x = np.ones(200_000)
-    x[:99_999] = -1
+    x[:minus_ones] = -1
     r = case.run(_one_feature(np.random.default_rng(0).permutation(x)), ONE_FEATURE)
     assert not r.failed("preprocessing.global_scaling")
+    assert not r.failed("preprocessing.global_scaling_near")
+
+
+def test_rounding_also_widens_the_std_tolerance():
+    n, step = 200_000, 0.01
+    std = 1 + 0.003 / np.sqrt(2 * n) + 0.5 * 4 * step / np.sqrt(12 * n) + step**2 / 24
+    assert _standardized(n, 0.0, std**2 * n, **LOOSE, margin=0.003, step=step)
+    assert not _standardized(n, 0.0, std**2 * n, **LOOSE, margin=0.003, step=0.0)
+
+
+def test_rounding_in_one_split_covers_the_union(case):
+    x = _scaled(200_000)
+    train = np.round(x[:150_000], 2)
+    test = x[150_000:] + (8e-6 * 200_000 - train.sum() - x[150_000:].sum()) / 50_000
+    joined = np.concatenate([train, test])
+    assert abs(joined.mean()) > 0.003 / np.sqrt(len(joined))   # only rounding explains this
+    assert case.run(_one_feature(joined), ONE_FEATURE).failed("preprocessing.global_scaling")
+
+
+def test_rounding_also_excuses_a_train_only_scaler(case):
+    """Fitted on train alone and rounded: train is standard up to rounding, so no leak."""
+    n1, n2 = 150_000, 50_000
+    train = np.round(_scaled(n1, seed=10), 2)
+    assert abs(train.mean()) > 0.003 / np.sqrt(n1)
+    m1, s1 = train.mean(), train.std()
+    m2 = -n1 * m1 / n2
+    s2 = np.sqrt(((n1 + n2) - n1 * (s1**2 + m1**2)) / n2 - m2**2)
+    x = np.concatenate([train, _scaled(n2, seed=5) * s2 + m2])
+    assert not case.run(_one_feature(x), ONE_FEATURE).failed("preprocessing.global_scaling")
 
 
 def test_train_alone_must_beat_chance_too(case):
@@ -430,9 +460,20 @@ def test_the_warning_follows_the_blocking_settings(case):
     assert not loose.failed("preprocessing.global_scaling_near")
 
 
-def test_turning_off_the_block_leaves_the_warning(case):
-    r = case.run(_one_feature(_scaled(200_000)), {
-        **ONE_FEATURE, "checks": {"preprocessing.global_scaling": "off"}})
+@pytest.mark.parametrize("pattern", ["preprocessing.global_scaling", "*.global_scaling"])
+def test_turning_off_the_block_leaves_the_warning(case, pattern):
+    r = case.run(_one_feature(_scaled(200_000)), {**ONE_FEATURE, "checks": {pattern: "off"}})
+    assert r.failed("preprocessing.global_scaling_near")
+
+
+def test_the_warning_covers_tolerances_widened_on_the_block(case):
+    x = _scaled(200_000)
+    x[:150_000] += 0.1   # train alone stays far from standard at these tolerances
+    x[150_000:] -= 0.3
+    x = (x - x.mean()) / x.std()
+    r = case.run(_one_feature(x * 1.005 + 1e-3), {**ONE_FEATURE, "checks": {
+        "preprocessing.global_scaling": {"tol_mean": 1e-2, "tol_std": 1e-2}}})
+    assert not r.failed("preprocessing.global_scaling")
     assert r.failed("preprocessing.global_scaling_near")
 
 
