@@ -10,8 +10,11 @@ from ..core import check, examples, failed, frac, jsonable, passed, skipped
 from ..spec import SpecError
 
 _DATE_TEXT = re.compile(
-    r"\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
-    r"|[A-Za-z]{3,9}\.? \d{1,2},? \d{4}|\d{1,2} [A-Za-z]{3,9}\.? \d{4})([T\s]|$)")
+    r"\s*([A-Za-z]{3,9},? )?"                                    # a weekday
+    r"(\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?"                         # 2024-01-31, 2024-01
+    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\.\d{1,2}\.\d{4}"    # 31/01/2024, 31.01.2024
+    r"|[A-Za-z]{3,9}\.? (\d{1,2},? )?\d{4}"                       # Jan 31, 2024, Jan 2024
+    r"|\d{1,2}[- ][A-Za-z]{3,9}\.?,?[- ]\d{2,4})([T\s]|$)")        # 31 Jan 2024, 31-Jan-24
 
 
 def _need_time(v):
@@ -294,15 +297,20 @@ def _date_like(v, col: str) -> bool:
     if v.kind(col) != "string":
         return False
     text = v.train[col].dropna().astype("string").head(200)
-    return len(text) > 0 and bool(text.map(lambda x: bool(_DATE_TEXT.match(x))).mean() >= 0.95)
+    if not len(text) or text.map(lambda x: bool(_DATE_TEXT.match(x))).mean() < 0.95:
+        return False
+    # the pattern only looks like a date: Unit 6 1005 and 55-5-1005 fit it too
+    parsed = pd.to_datetime(text, errors="coerce", format="mixed", utc=True)
+    return bool(parsed.dt.year.between(1900, 2100).mean() >= 0.95)
 
 
 @check("temporal.undeclared_time", "temporal", "warn",
        "Date-like columns are declared as params.time", min_distinct=20)
 def undeclared_time(v, opt):
     """Runs when params.time is not set. Looks for date columns with at least `min_distinct`
-    values: date types, and text such as 2024-01-31, 31/01/2024, 31.01.2024, Jan 31, 2024 or
-    31 Jan 2024. Numbers are not read as dates, so epoch times and 20240131 pass. Without
+    values: date types, and text such as 2024-01-31, 2024-01, 31/01/2024, 31.01.2024,
+    Jan 31, 2024, Jan 2024, 31 Jan 2024, 31-Jan-24 or Wed, 31 Jan 2024, with a year from 1900
+    to 2100. Numbers are not read as dates, so epoch times and 20240131 pass. Without
     params.time no temporal check runs, so a random split of time-dependent data looks fine.
     Declaring the column turns on the temporal checks; if the rows really don't depend on
     time, turn this check off."""

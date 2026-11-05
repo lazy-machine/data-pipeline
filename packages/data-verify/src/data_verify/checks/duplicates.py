@@ -8,8 +8,13 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from ..core import check, failed, frac, passed, skipped
+from ..core import check, failed, frac, passed, row_hashes, skipped
 from .splits import _ENTITY_NAME
+
+# Without keys, a match needs more evidence than a match on every column does.
+_RARE_VALUE = 5  # training rows that may share a value for a match on it to mean something
+_FINE_BITS = 14  # about 4 significant digits; at 3, correlated columns collide by themselves
+_MIN_SHARE = 0.005  # correlated columns still meet now and then, and shuffling can't show it
 
 
 def _is_key(v, col: str, key_share: float) -> bool:
@@ -17,7 +22,10 @@ def _is_key(v, col: str, key_share: float) -> bool:
     if s.empty:
         return False
     kind = v.kind(col)
-    values = s.nunique()
+    try:
+        values = s.nunique()
+    except TypeError:  # lists and other unhashable cells
+        return False
     share = values / len(s)
     if kind == "string":
         text = s.astype("string")
@@ -26,8 +34,45 @@ def _is_key(v, col: str, key_share: float) -> bool:
             (word or float(text.str.len().mean()) <= 40)
     # a null turns an integer column into floats
     whole = kind == "int" or (kind == "float" and bool((s == s.round()).all()))
-    return whole and (share >= 0.98 or (values >= 50 and share >= key_share
-                                        and bool(_ENTITY_NAME.search(col))))
+    return whole and ((values >= 20 and share >= 0.98) or
+                      (values >= 50 and share >= key_share and bool(_ENTITY_NAME.search(col))))
+
+
+def _anchors(v, cols: tuple[str, ...]) -> list[str]:
+    """Columns with enough distinct values for a match on one to mean something."""
+    found = []
+    for c in cols:
+        s = v.train[c].dropna()
+        try:
+            if len(s) and s.nunique() / len(s) >= 0.5:
+                found.append(c)
+        except TypeError:   # lists and other unhashable cells
+            continue
+    return found
+
+
+def _rare_rows(v, d: pd.DataFrame, anchors: list[str]) -> np.ndarray:
+    """Rows of ``d`` holding, in an anchor column, a value at most _RARE_VALUE training rows
+    have. A common value recurring proves nothing, however the columns relate."""
+    rare = np.zeros(len(d), dtype=bool)
+    for c in anchors:
+        counts = pd.Series(v.hashes(v.train_name, (c,), True, _FINE_BITS)).value_counts()
+        seen = pd.Series(row_hashes(d, [c], True, _FINE_BITS)).map(counts).fillna(0).to_numpy()
+        rare |= seen <= _RARE_VALUE
+    return rare
+
+
+def _chance_share(v, cols: tuple[str, ...], anchors: list[str]) -> float:
+    """How often rare rows match by chance: the share of rows, built by shuffling each training
+    column on its own, that have a rare value and match a real training row. Counting repeats
+    in train would not do, because copies inflate that, and they are what this has to find."""
+    train = v.train
+    rng = np.random.default_rng(v.spec.seed)
+    mixed = pd.DataFrame({c: train[c].iloc[rng.permutation(len(train))].reset_index(drop=True)
+                          for c in cols})
+    match = np.isin(row_hashes(mixed, list(cols), True, _FINE_BITS),
+                    v.hashes(v.train_name, cols, True, _FINE_BITS))
+    return float((match & _rare_rows(v, mixed, anchors)).mean())
 
 
 def _cross_group_rate(v, cols, near: bool, bits: int) -> float | None:
@@ -46,6 +91,24 @@ def _cross_group_rate(v, cols, near: bool, bits: int) -> float | None:
     return float(df["h"].isin(groups.index[groups > 1]).mean()) if len(df) else 0.0
 
 
+def _matches(v, cols, all_cols, near: bool, bits: int, anchors: list[str] | None = None):
+    """Rows of each later split that match an earlier split on ``cols``, and the worst share."""
+    pairs, worst = {}, 0.0
+    for (a, _), (b, _) in combinations(v.splits.items(), 2):
+        ha, hb = v.hashes(a, cols, near, bits), v.hashes(b, cols, near, bits)
+        hit = np.isin(hb, ha)
+        if near:  # report only what the exact check does not already see
+            hit &= ~np.isin(v.hashes(b, all_cols), v.hashes(a, all_cols))
+        if anchors:
+            hit &= _rare_rows(v, v.splits[b], anchors)
+        n = int(hit.sum())
+        if n:
+            worst = max(worst, n / len(hb))
+            pairs[f"{a}/{b}"] = {"rows": n, "fraction": frac(n, len(hb)),
+                                 "example_rows_of_" + b: np.flatnonzero(hit)[:5].tolist()}
+    return pairs, worst
+
+
 def _cross(v, opt, near: bool):
     feats = tuple(v.features)
     if not feats:
@@ -60,50 +123,46 @@ def _cross(v, opt, near: bool):
         feats = tuple(opt["columns"])
     cols = feats + (tuple(v.spec.labels) if opt.get("include_label") else ())
     cols = tuple(c for c in cols if v.has(c))
-    all_cols = cols
-    if near and not opt.get("columns"):
-        # so that a copy under a new key still matches
-        cols = tuple(c for c in cols if not _is_key(v, c, opt["key_share"])) or cols
-    pairs, worst = {}, 0.0
-    for (a, _), (b, _) in combinations(v.splits.items(), 2):
-        ha, hb = v.hashes(a, cols, near, bits), v.hashes(b, cols, near, bits)
-        hit = np.isin(hb, ha)
-        if near:  # report only what the exact check does not already see
-            hit &= ~np.isin(v.hashes(b, all_cols), v.hashes(a, all_cols))
-        n = int(hit.sum())
-        if n:
-            worst = max(worst, n / len(hb))
-            pairs[f"{a}/{b}"] = {"rows": n, "fraction": frac(n, len(hb)),
-                                 "example_rows_of_" + b: np.flatnonzero(hit)[:5].tolist()}
+    pairs, worst = _matches(v, cols, cols, near, bits)
     kind = "near-duplicate" if near else "duplicate"
     base = _cross_group_rate(v, cols, near, bits) if opt["baseline"] else None
-    ignored = [c for c in all_cols if c not in cols]
-    if ignored:  # without the keys, rows can match by chance, so allow what train itself does
-        h = pd.Series(v.hashes(v.train_name, cols, near, bits))
-        base = max(base or 0.0, float(h.duplicated(keep=False).mean()))
     allowed = opt["max_fraction"]
     if base is not None:
         allowed = max(allowed, opt["ratio"] * base)
     details = {"pairs": pairs, "compared_columns": len(cols), "max_fraction": opt["max_fraction"]}
-    if ignored:
-        details["ignored_keys"] = ignored
     if base is not None:
         details.update(cross_group_rate_in_train=frac(base, 1), allowed=frac(allowed, 1))
     summary = ", ".join(f"{k} {p['rows']} rows ({p['fraction']:.2%})" for k, p in pairs.items())
-    if ignored:
-        summary += f" (ignoring key column(s) {', '.join(ignored)})"
+    name = "near_cross_split" if near else "cross_split"
+    hint = ("The model sees these evaluation examples during training. Deduplicate before "
+            "splitting, or split by a group key that keeps copies together (params.group). If "
+            "identical rows are legitimate (few low-cardinality features), raise "
+            f"checks.\"duplicates.{name}\".max_fraction.")
     if pairs and worst > allowed:
-        why = (f"; only {base:.3%} of {v.train_name} rows match another by chance, "
-               f"so this is more" if base is not None else "")
-        return failed(f"{kind} feature rows shared between splits: {summary}{why}",
-                      "The model sees these evaluation examples during training. Deduplicate "
-                      "before splitting, or split by a group key that keeps copies together "
-                      "(params.group). If identical rows are legitimate (few low-cardinality "
-                      "features), raise checks.\"duplicates."
-                      f"{'near_cross_split' if near else 'cross_split'}\".max_fraction.",
-                      **details)
+        why = (f"; different entities share a vector in only {base:.3%} of {v.train_name} rows, "
+               f"so this is more than chance" if base is not None else "")
+        return failed(f"{kind} feature rows shared between splits: {summary}{why}", hint, **details)
+    if near and not opt.get("columns"):
+        # a second look, not a replacement: a copy under a new key doesn't match on all columns
+        keys = [c for c in cols if _is_key(v, c, opt["key_share"])]
+        rest = tuple(c for c in cols if c not in keys)
+        anchors = _anchors(v, rest)
+        if keys:
+            details["ignored_keys"] = keys
+        if keys and anchors:
+            found, share = _matches(v, rest, cols, near, _FINE_BITS, anchors)
+            chance = _chance_share(v, rest, anchors) if opt["baseline"] else 0.0
+            limit = max(opt["max_fraction"], opt["ratio"] * chance,
+                        _MIN_SHARE if opt["baseline"] else 0.0)
+            details.update(pairs_without_keys=found, chance_without_keys=frac(chance, 1))
+            if found and share > limit:
+                text = ", ".join(f"{k} {p['rows']} rows ({p['fraction']:.2%})"
+                                 for k, p in found.items())
+                return failed(f"{kind} feature rows shared between splits: {text} (ignoring key "
+                              f"column(s) {', '.join(keys)}); {chance:.3%} would match by chance",
+                              hint, **details)
     if pairs:
-        reason = (f"no more than {v.train_name} rows share by chance "
+        reason = (f"no more than different {v.train_name} entities share by chance "
                   f"({base:.3%})" if base is not None else f"<= max_fraction {allowed:.3%}")
         return passed(f"{kind}s within tolerance: {summary}; {reason}", **details)
     return passed(f"no {kind} feature rows across {len(v.splits)} splits", **details)
@@ -131,14 +190,18 @@ def near_cross_split(v, opt):
     """Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is
     about 3 significant digits) and normalising text (case, punctuation, spacing). Catches
     copies that went through a lossy round trip, re-encoding or light editing. Exact copies
-    are not counted again. Same group baseline as duplicates.cross_split. Columns acting as
-    keys are left out, so a copy with a new id still matches: whole numbers distinct on almost
-    every row, and short text, single tokens such as hashes, or entity-named whole numbers
-    with at least 50 values, distinct on at least `key_share` of rows. The report lists them
-    in `ignored_keys`. Without them rows can match by chance, so the allowance is then `ratio`
-    times the share of training rows that match each other, which also keeps this quiet when
-    the other columns cannot tell rows apart. A copy given a fresh timestamp or other per-row
-    value is not found, unless `columns` leaves that column out."""
+    are not counted again. Same group baseline as duplicates.cross_split. It compares all
+    columns, then again without the columns acting as keys, so a copy with a new id still
+    matches: whole numbers distinct on almost every row, and short text, single tokens such
+    as hashes, or entity-named whole numbers with at least 50 values, distinct on at least
+    `key_share` of rows. The report lists them in `ignored_keys`. Without them rows can match
+    by chance, so this second comparison asks for more: about 4 significant digits, and a
+    value at most 5 training rows have in a column where at least half the values are
+    distinct. With `baseline` on it allows 0.5% of rows, or `ratio` times the share that
+    matches when each training column is shuffled on its own. So under a new key, it doesn't
+    find copies in data with only coarse columns, copies of common values, a row copied more
+    than 5 times, or a copy given a fresh timestamp or other per-row value, unless `columns`
+    leaves that column out."""
     return _cross(v, opt, near=True)
 
 

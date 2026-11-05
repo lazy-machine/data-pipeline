@@ -11,7 +11,7 @@ import pytest
 from conftest import bucket, time_split
 
 from data_verify import SpecError
-from data_verify.checks.poisoning import _inconsistent
+from data_verify.checks.poisoning import _agreement, _coded, _entity_se, _inconsistent
 from data_verify.checks.target import _rounding_step, _standardized
 
 TIME = {"time": "date", "label_time": "label_date", "time_order": "train < test",
@@ -1064,11 +1064,11 @@ def test_regression_label_flips_warn(case, splits):
     assert case.run(splits, {"task": "regression"}).failed("poisoning.label_consistency")
 
 
-def test_features_without_signal_cannot_fail(case, splits):
+def test_features_without_signal_say_nothing(case, splits):
     rng = np.random.default_rng(3)
     for d in splits.values():
         d["y"] = rng.integers(0, 2, len(d))
-    assert case.run(splits).status("poisoning.label_consistency") == "pass"
+    assert case.run(splits).status("poisoning.label_consistency") == "skip"
 
 
 def test_multiclass_is_skipped_with_a_reason(case, splits):
@@ -1196,7 +1196,8 @@ def test_chance_matches_without_keys_stay_quiet(case):
 
 
 @pytest.mark.parametrize("fmt", ["%Y/%m/%d", "%d-%m-%Y", "%d.%m.%Y", "%b %d, %Y", "%d %b %Y",
-                                 "%Y-%m-%dT%H:%M:%S"])
+                                 "%Y-%m-%dT%H:%M:%S", "%d-%b-%Y", "%d-%b-%y",
+                                 "%a, %d %b %Y %H:%M:%S +0000"])
 def test_more_date_formats_are_read_as_dates(case, splits, fmt):
     for d in splits.values():
         d["date"] = d["date"].dt.strftime(fmt)
@@ -1204,3 +1205,208 @@ def test_more_date_formats_are_read_as_dates(case, splits, fmt):
     r = case.run(splits)
     assert r.check("temporal.undeclared_time")["details"]["columns"] == ["date", "label_date"]
     assert "date, label_date" in r.check("temporal.undeclared_time")["message"]
+
+
+def _clustered(seed: int, entities: int, rows: int, group_effect: float = 1.0) -> pd.DataFrame:
+    """Clean labels, but rows of one entity share an effect, so they aren't independent."""
+    rng = np.random.default_rng(seed)
+    entity = np.repeat(np.arange(entities), rows)
+    x = rng.normal(size=len(entity)) + rng.normal(0, group_effect, entities)[entity]
+    z = x + rng.normal(0, group_effect, entities)[entity] + rng.normal(size=len(entity))
+    return pd.DataFrame({"row_id": np.arange(len(entity)) + seed * 10**7, "f1": x,
+                         "customer": [f"E{seed}-{e}" for e in entity],
+                         "y": (z > 0).astype("int64")})
+
+
+@pytest.mark.parametrize("train_shape, test_shape", [
+    ((5400, 1), (30, 60)),   # only the evaluation rows are clustered
+    ((30, 60), (1800, 1)),   # only the training rows are
+], ids=["evaluation", "train"])
+def test_clustered_rows_do_not_look_like_poisoning(case, train_shape, test_shape):
+    fires = sum(
+        case.run({"train": _clustered(s, *train_shape), "test": _clustered(s + 100, *test_shape)}, {
+            "group": ["customer"], "weight": None, "features": ["f1"], "forbidden": [],
+        }).failed("poisoning.label_consistency") for s in range(1, 13))
+    assert fires <= 1
+
+
+def test_both_sides_of_the_comparison_use_the_entity_error(case, monkeypatch):
+    """Each side has to allow for its own clusters, or one of them can raise a false alarm."""
+    from data_verify.checks import poisoning
+    real, calls = poisoning._entity_se, []
+
+    def spy(pred, y, task, entity):
+        calls.append(len(y))
+        return real(pred, y, task, entity)
+
+    monkeypatch.setattr(poisoning, "_entity_se", spy)
+    r = case.run({"train": _clustered(1, 90, 60), "test": _clustered(2, 30, 60)}, {
+        "group": ["customer"], "weight": None, "features": ["f1"], "forbidden": []})
+    assert r.status("poisoning.label_consistency") in ("pass", "fail")
+    assert len(calls) == 2 and 1800 in calls   # held-out train, and all of test
+
+
+def test_entity_error_reflects_how_few_entities_there_are():
+    rng = np.random.default_rng(0)
+    entity = np.repeat(np.arange(30), 100)
+    pred = rng.normal(size=3000) + rng.normal(size=30)[entity]
+    y = (rng.normal(size=3000) + pred * 0.5 + rng.normal(size=30)[entity] > 0).astype(float)
+    assert _entity_se(pred, y, "binary", entity) > 2 * _agreement(pred, y, "binary")[2]
+
+
+def test_labels_keep_the_meaning_train_gave_them():
+    d = pd.DataFrame({"y": ["no", "yes", "new", None, "yes"]})
+    y, ok = _coded(d, "y", "binary", ["no", "yes"])
+    assert ok.tolist() == [True, True, False, False, True]
+    assert y.tolist() == [0.0, 1.0, 1.0]
+
+
+def test_flips_are_still_found_with_entities_declared(case):
+    train = _clustered(1, 600, 8, group_effect=0.3)
+    _flip(train, train.sample(frac=0.3, random_state=0).index)
+    r = case.run({"train": train, "test": _clustered(2, 300, 8, group_effect=0.3)}, {
+        "group": ["customer"], "weight": None, "features": ["f1"], "forbidden": []})
+    assert r.failed("poisoning.label_consistency")
+
+
+def test_labels_are_coded_by_the_classes_train_has(case, splits):
+    """A label class train never saw must not shift the codes of the classes it did."""
+    splits = _strong(splits)
+    for d in splits.values():
+        d["y"] = d["y"].map({0: "no", 1: "yes"})
+    splits["test"].loc[splits["test"].index[:20], "y"] = "a new class"
+    found = case.run(splits, {"checks": {"labels.*": "off"}}).check("poisoning.label_consistency")
+    assert found["status"] == "pass"
+    assert "a new class" not in found["message"]
+
+
+def _copies_with_key(n: int, share: float, seed: int = 0) -> dict[str, pd.DataFrame]:
+    """Rows copied before the split under a new id, so the copies also repeat inside train."""
+    rng = np.random.default_rng(seed)
+    d = pd.DataFrame({"a": rng.normal(size=n), "b": rng.normal(size=n), "c": rng.normal(size=n),
+                      "y": rng.integers(0, 2, n)})
+    d = pd.concat([d, d.sample(frac=share, random_state=seed)], ignore_index=True)
+    d = d.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    d["rid"] = rng.permutation(len(d))
+    cut = len(d) * 3 // 4
+    return {"train": d.iloc[:cut], "test": d.iloc[cut:]}
+
+
+@pytest.mark.parametrize("share", [0.2, 0.5, 1.0])
+def test_copies_made_before_the_split_are_not_called_chance(case, share):
+    r = case.run(_copies_with_key(4000, share), {**LABEL_ONLY})
+    assert r.failed("duplicates.near_cross_split")
+
+
+def test_a_feature_that_looks_like_a_key_does_not_hide_copies(case):
+    """Short text with many values counts as a key, but it is a real feature here, and the
+    comparison on all columns still has to see the copies."""
+    rng = np.random.default_rng(0)
+    n = 5000
+    d = pd.DataFrame({"row_id": np.arange(n), "y": rng.integers(0, 2, n),
+                      "title": [f"item {rng.integers(0, 400)} blue" for _ in range(n)],
+                      "price": rng.normal(50, 10, n).round(2)})
+    train, test = d.iloc[:3750], d.iloc[3750:]
+    copies = test.head(200).copy()
+    copies["row_id"] += 10**6
+    copies["price"] *= 1 + 1e-5
+    r = case.run({"train": pd.concat([train, copies]), "test": test}, {
+        "group": [], "weight": None, "features": ["title", "price"], "forbidden": [],
+        "checks": {"temporal.undeclared_time": "off"}})
+    assert r.failed("duplicates.near_cross_split")
+
+
+def test_baseline_off_means_no_allowance(case):
+    rng = np.random.default_rng(0)
+    d = pd.DataFrame({"rid": [f"r{i}" for i in range(8000)], "y": rng.integers(0, 2, 8000),
+                      "a": rng.normal(size=8000)})   # alone, rare values do meet by chance
+    frames = {"train": d.iloc[:6000], "test": d.iloc[6000:]}
+    quiet = case.run(frames, LABEL_ONLY)
+    assert not quiet.failed("duplicates.near_cross_split")
+    strict = case.run(frames, {**LABEL_ONLY, "checks": {
+        "temporal.undeclared_time": "off",
+        "duplicates.near_cross_split": {"baseline": False}}})
+    assert strict.failed("duplicates.near_cross_split")
+
+
+def test_correlated_columns_are_not_copies(case):
+    """Shuffling understates how often correlated columns repeat together."""
+    rng = np.random.default_rng(0)
+    z = rng.normal(size=(20_000, 1))
+    d = pd.DataFrame((z + 0.2 * rng.normal(size=(20_000, 4))).round(1), columns=list("abce"))
+    d["rid"] = [f"r{i}" for i in range(20_000)]
+    d["y"] = rng.integers(0, 2, 20_000)
+    r = case.run({"train": d.iloc[:15_000], "test": d.iloc[15_000:]}, LABEL_ONLY)
+    assert not r.failed("duplicates.near_cross_split")
+
+
+def test_rows_of_a_common_value_are_not_copies(case):
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(20_000, 3))
+    x[rng.random(20_000) < 0.3] = 0
+    d = pd.DataFrame(x, columns=list("abc"))
+    d["rid"] = [f"r{i}" for i in range(20_000)]
+    d["y"] = rng.integers(0, 2, 20_000)
+    r = case.run({"train": d.iloc[:15_000], "test": d.iloc[15_000:]}, LABEL_ONLY)
+    assert not r.failed("duplicates.near_cross_split")
+
+
+@pytest.mark.parametrize("noise", [0.05, 0.01, 0.002])
+def test_correlated_floats_are_not_copies(case, noise):
+    rng = np.random.default_rng(1)
+    z = rng.normal(size=(20_000, 1))
+    d = pd.DataFrame(z + noise * rng.normal(size=(20_000, 2)), columns=["a", "b"])
+    d["rid"] = [f"r{i}" for i in range(20_000)]
+    d["y"] = rng.integers(0, 2, 20_000)
+    r = case.run({"train": d.iloc[:15_000], "test": d.iloc[15_000:]}, LABEL_ONLY)
+    assert not r.failed("duplicates.near_cross_split")
+
+
+def test_coarse_columns_alone_make_no_claim_under_a_new_key(case):
+    """The documented limit: nothing tells a copy from a coincidence here."""
+    rng = np.random.default_rng(0)
+    d = pd.DataFrame(rng.normal(size=(8000, 3)).round(1), columns=list("abc"))
+    d["rid"] = [f"r{i}" for i in range(8000)]
+    d["y"] = rng.integers(0, 2, 8000)
+    train, test = d.iloc[:6000], d.iloc[6000:]
+    copies = test.head(200).assign(rid=[f"c{i}" for i in range(200)])
+    r = case.run({"train": pd.concat([train, copies]), "test": test}, LABEL_ONLY)
+    found = r.check("duplicates.near_cross_split")
+    assert found["details"]["ignored_keys"] == ["rid"]
+    assert "pairs_without_keys" not in found["details"]
+
+
+def test_a_list_column_is_not_a_key_and_does_not_crash(case, splits):
+    for d in splits.values():
+        d["tags"] = [[str(i % 7)] for i in range(len(d))]
+    assert case.run(splits, {"features": ["f1", "f2", "f3", "tags"]}
+                    ).status("duplicates.near_cross_split") != "error"
+
+
+def test_two_integer_values_are_not_a_key(case):
+    rng = np.random.default_rng(0)
+    d = pd.DataFrame({"flag": [0, 1] * 3, "y": [0, 1, 1, 0, 1, 0], "a": rng.normal(size=6)})
+    from data_verify.checks.duplicates import _is_key
+
+    class Stub:
+        train = d.iloc[:2]
+
+        @staticmethod
+        def kind(col):
+            return "int"
+
+    assert not _is_key(Stub, "flag", 0.02)
+
+
+@pytest.mark.parametrize("pattern", ["Unit {} 1005", "{}-5-1005", "55-{}-2024", "{}.5.15"])
+def test_text_shaped_like_a_date_is_not_a_date(case, splits, pattern):
+    for d in splits.values():
+        d["serial"] = [pattern.format(i % 28 + 1) for i in range(len(d))]
+    assert "serial" not in case.run(splits).check("temporal.undeclared_time")["details"]["columns"]
+
+
+def test_near_copies_leave_exact_copies_to_the_exact_check(case, splits):
+    splits["train"] = pd.concat([splits["train"], splits["test"].head(50)], ignore_index=True)
+    r = case.run(splits, {"checks": {"temporal.undeclared_time": "off", "split.*": "off"}})
+    assert r.failed("duplicates.cross_split")
+    assert not r.failed("duplicates.near_cross_split")
