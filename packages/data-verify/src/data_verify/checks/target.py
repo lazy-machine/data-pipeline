@@ -402,8 +402,8 @@ def global_scaling_near(v, opt):
         return skipped("one split only")
     blocking = {**REGISTRY["preprocessing.global_scaling"].options,
                 **v.spec.checks.get("preprocessing.global_scaling", {})}
-    exact = _blocking_hits(v, blocking["tol_mean"], blocking["tol_std"],
-                           blocking["chance_margin"])
+    exact = {} if blocking.get("severity") == "off" else _blocking_hits(
+        v, blocking["tol_mean"], blocking["tol_std"], blocking["chance_margin"])
     near = _scaling_hits(v, opt["tol_mean"], opt["tol_std"], None, minmax=False)
     hits = {f: x for f, x in near.items() if f not in exact}
     if hits:

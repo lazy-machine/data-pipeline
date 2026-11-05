@@ -284,7 +284,7 @@ def is_data_input(path: Path) -> bool:
 def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[str]:
     """The inputs holding split data, for lint. Follows the layout rules of ``parse``, but
     data inputs may not exist yet, and it must not accuse a step on a guess: when a reference
-    can't be read yet it returns nothing."""
+    can't be read yet, or the layout leaves the table unclear, it returns nothing."""
     refs = Refs(inputs)
     try:
         spec_file = inputs.get("spec")
@@ -301,7 +301,8 @@ def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[s
     def is_data(path: Path) -> bool:
         return is_data_input(path) or (not path.exists() and not path.suffix)  # a directory
 
-    data = [n for n, path in inputs.items() if is_data(path) and n not in ("spec", source)]
+    data = [n for n, path in inputs.items()
+            if is_data(path) and n not in ("spec", source) and n not in refs.used]
     splits = params.get("splits")
     if params.get("split_column"):
         table = params.get("table")
@@ -311,7 +312,9 @@ def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[s
     if isinstance(splits, list):
         return [n for n in splits if n in inputs]
     named = [n for n in data if n.lower() in SPLIT_RANKS]
-    return named or (data[:1] if source else data)
+    if named or not source:
+        return named or data
+    return data if len(data) == 1 else []   # parse takes the first, but that may be a lookup
 
 
 def _option_type(default: Any) -> str:

@@ -154,7 +154,7 @@ previous run are deleted first, so a stale report never survives a failed run.
 
 ```jsonc
 {
-  "tool": "data-verify", "version": "0.1.0",
+  "tool": "data-verify", "version": "0.3.0",
   "passed": false,                       // false = the step failed
   "fail_on": "error",
   "blocking": ["split.group_overlap"],   // ids of the checks that blocked
@@ -397,10 +397,12 @@ A pass means that no blocking check fired, not that the data is clean.
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
   fitted on evaluation rows block when the signature is exact: closer to mean 0 and std 1
-  than chance allows, on values unrounded or rounded to at least 2 decimals. Anything less
-  exact can't be told from chance on large data, so it warns at best
+  than chance allows, with an allowance for rounding to 2 or more decimals. A real scaler
+  that misses that bar can't be told from chance on large data, so it warns at best
   (`preprocessing.global_scaling_near`). That covers coarser rounding, values kept to
-  significant figures, and float32 data with a large offset. Rows added or dropped after
+  significant figures, and float32 data with a large offset. In the other direction, a coarse
+  feature that is exactly standard by nature, such as a perfectly balanced +1/-1 column, still
+  blocks a clean pipeline, because nothing tells it from a scaler. Rows added or dropped after
   scaling often give no signal at all, and the more rows changed the less likely any signal
   is. The warning also fires on features that are roughly standard by nature, so a project
   with many of those will often see it. Target encoding and imputation leave no signature.

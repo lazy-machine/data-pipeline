@@ -430,6 +430,12 @@ def test_the_warning_follows_the_blocking_settings(case):
     assert not loose.failed("preprocessing.global_scaling_near")
 
 
+def test_turning_off_the_block_leaves_the_warning(case):
+    r = case.run(_one_feature(_scaled(200_000)), {
+        **ONE_FEATURE, "checks": {"preprocessing.global_scaling": "off"}})
+    assert r.failed("preprocessing.global_scaling_near")
+
+
 def test_rows_dropped_after_scaling_still_warn(case):
     frames = _one_feature(_scaled(200_000))
     frames["train"] = frames["train"].iloc[100:]
