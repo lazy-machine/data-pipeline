@@ -151,6 +151,7 @@ def _run_worker(pipeline: Pipeline, step: Step, log_path: Path,
             "params": step.params,
             "workdir": str(pipeline.workdir),
             "python_path": [str(p) for p in pipeline.python_path],
+            "runner": os.getpid(),
         }))
         env = dict(os.environ, PYTHONUNBUFFERED="1")  # what makes lines arrive live
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [_PKG_ROOT, env.get("PYTHONPATH")]))
@@ -188,7 +189,7 @@ def _run_worker(pipeline: Pipeline, step: Step, log_path: Path,
         except subprocess.TimeoutExpired:
             _stop(proc, reader, forwarding)
             return False, f"timed out after {step.timeout:g}s", b"".join(chunks).decode(errors="replace")
-        except KeyboardInterrupt:
+        except BaseException:  # a caller's signal handler may raise anything, then carry on
             _stop(proc, reader, forwarding, grace=_INTERRUPT_GRACE)
             raise
         forwarding.clear()  # late lines still reach the log, but not this step's outcome

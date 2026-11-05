@@ -446,7 +446,8 @@ status line (`warnings=1`). Read them before you trust a result.
 | upgrade a package listed by its import name (`sklearn`, not `scikit-learn`) | nothing; no version is recorded, so list the distribution name |
 | add or remove an entry in `requires` | that step reruns (`packages changed: joblib none → 1.5.0`) |
 | change the version specifier of an entry | nothing, as long as the installed version satisfies it |
-| a variable listed in the step's `env`, or add or remove a name there | that step reruns (`env changed: <name>`) |
+| the value of a variable listed in the step's `env` | that step reruns (`env changed: <name>`) |
+| add or remove a name in `env` | that step reruns (`env changed: <name>`) |
 | edit an installed step package without bumping its version | nothing; use `-r STEP` (§11) |
 | the `description` or `critical` flag | nothing; these don't affect results |
 | file timestamps only (`touch`) | nothing; caching compares content |
@@ -475,8 +476,9 @@ When `steps/model.py` imports `steps/features.py`, editing `features.py` reruns 
 step, and the reason names the file: `code changed: steps/features.py`. The runner reads
 the step module's `import` statements (without running them) and follows them through
 other local modules, including imports inside functions, relative imports and package
-`__init__.py` files. A module is local when it is found under `python_path`; the standard
-library and installed packages are never tracked.
+`__init__.py` files. A module is local when it is found under `python_path`. The source of
+the standard library and of installed packages is not followed: list a package in `requires`
+to track its version.
 
 Two things can't be seen this way, and need `watch`:
 
@@ -492,8 +494,9 @@ watch = ["sql/features.sql"]
 the files must exist.
 
 Checkpoints written before imports, packages or `env` were tracked are filled in on the next
-run instead of being invalidated. If you edited a helper that wasn't in `watch`, or upgraded a
-package, since your last run, run once with `-f` (or `-r STEP`) after upgrading.
+run instead of being invalidated, by a dry run too, so the first run after upgrading records
+that shell's values. If you edited a helper that wasn't in `watch`, or upgraded a package,
+since your last run, run once with `-f` (or `-r STEP`) after upgrading.
 
 ### Steps that read the outside world
 
@@ -682,8 +685,9 @@ already being ignored, so `nohup data-pipeline` keeps running after you log out.
 Each worker runs in its own process group. A step that means to leave a process running
 after it succeeds still can, but a process started by a step that times out or is interrupted
 does not survive, unless it moved itself to a new session. If the runner itself dies, for
-example from `kill -9`, the worker notices within a second and stops the same way, so nothing
-goes on writing outputs that no checkpoint will record.
+example from `kill -9`, the worker normally notices within a second and stops the same way, so
+nothing goes on writing outputs that no checkpoint will record. A step inside one long call
+that holds Python's lock, such as a big `sum()`, can delay that by as long as the call takes.
 
 ### Running from Python
 
@@ -832,7 +836,10 @@ tells you what the orchestrator thinks changed.
 - [ ] Raw data in `data/`, step code in `steps/`, generated files in `build/`.
 - [ ] `build/` and `.pipeline/` are in `.gitignore`.
 - [ ] Every file a step reads is listed in its `inputs`; every file it writes is in `outputs`.
-- [ ] Every step lists its third-party packages in `requires`.
+- [ ] Every step lists its third-party packages in `requires`, by distribution name
+      (`scikit-learn`, not `sklearn`), so that upgrades rerun it. Changing a name reruns the
+      step once.
+- [ ] Environment variables that change a step's results are listed in `env`.
 - [ ] All randomness is seeded through `params`.
 - [ ] Dynamic imports and non-Python helpers (SQL, templates, lookup tables) are listed in `watch`.
 - [ ] Optional steps (plots, reports, experiments) are `critical = false`, and no critical

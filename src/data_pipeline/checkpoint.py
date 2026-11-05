@@ -203,10 +203,13 @@ def _packages(step: Step) -> dict[str, str]:
     found = {}
     for spec in step.requires:
         try:
-            name = Requirement(spec).name
+            req = Requirement(spec)
         except InvalidRequirement:
             continue  # reported by preflight
-        found[canonicalize_name(name)] = installed_version(name)
+        version = installed_version(req.name)
+        if version == "import-only" and req.specifier:  # no version to test it against
+            version = "not installed"
+        found[canonicalize_name(req.name)] = version
     return dict(sorted(found.items()))
 
 
