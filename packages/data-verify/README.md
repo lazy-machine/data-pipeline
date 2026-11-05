@@ -395,11 +395,15 @@ A pass means that no blocking check fired, not that the data is clean.
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
-- **Preprocessing that leaves no signature.** Standardisation and min-max scaling fitted on
-  evaluation rows block when the signature is exact. If rows were added or dropped after
-  scaling, a match can't be told from chance on large data, so it only warns
-  (`preprocessing.global_scaling_near`). That warning also fires on features that are roughly
-  standard by nature. Target encoding and imputation leave no signature at all.
+- **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
+  fitted on evaluation rows block when the signature is exact: closer to mean 0 and std 1
+  than chance allows, on values unrounded or rounded to at least 2 decimals. Anything less
+  exact can't be told from chance on large data, so it warns at best
+  (`preprocessing.global_scaling_near`). That covers coarser rounding, values kept to
+  significant figures, and float32 data with a large offset. Rows added or dropped after
+  scaling often give no signal at all, and the more rows changed the less likely any signal
+  is. The warning also fires on features that are roughly standard by nature, so a project
+  with many of those will often see it. Target encoding and imputation leave no signature.
 
 To be stricter, set `checks = { "poisoning.*" = "error" }`, or `fail_on = "warn"` to block on
 every warning. Expect false alarms on heavy-tailed data. Fit preprocessing inside a

@@ -282,26 +282,36 @@ def is_data_input(path: Path) -> bool:
 
 
 def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[str]:
-    """The inputs holding split data, for lint. An approximation of the layout rules of
-    ``parse`` that tolerates what parse rejects, because data inputs may not exist yet. A
-    ``spec`` input is read when it is there, as its params count like the step's."""
-    spec_file = inputs.get("spec")
-    if spec_file is not None and spec_file.is_file():
-        base = read_config_file(spec_file)
-        if isinstance(base, dict):
-            params = {**(base["params"] if isinstance(base.get("params"), dict) else base),
-                      **params}
+    """The inputs holding split data, for lint. Follows the layout rules of ``parse``, but
+    data inputs may not exist yet, and it must not accuse a step on a guess: when a reference
+    can't be read yet it returns nothing."""
+    refs = Refs(inputs)
+    try:
+        spec_file = inputs.get("spec")
+        if spec_file is not None and spec_file.is_file():
+            base = refs.doc("spec", "inputs.spec")
+            if isinstance(base, dict):
+                params = {**(base["params"] if isinstance(base.get("params"), dict) else base),
+                          **params}
+        params = refs.resolve(params, "params")
+    except (SpecError, OSError):
+        return []
     source = params.get("source")
-    data = [n for n, path in inputs.items() if is_data_input(path) and n not in ("spec", source)]
+
+    def is_data(path: Path) -> bool:
+        return is_data_input(path) or (not path.exists() and not path.suffix)  # a directory
+
+    data = [n for n, path in inputs.items() if is_data(path) and n not in ("spec", source)]
     splits = params.get("splits")
     if params.get("split_column"):
         table = params.get("table")
         return [table] if table in inputs else data
-    if isinstance(splits, dict) and "from" not in splits:
+    if isinstance(splits, dict):
         return [n for n in splits.values() if n in inputs]
     if isinstance(splits, list):
         return [n for n in splits if n in inputs]
-    return [n for n in data if n.lower() in SPLIT_RANKS] or data
+    named = [n for n in data if n.lower() in SPLIT_RANKS]
+    return named or (data[:1] if source else data)
 
 
 def _option_type(default: Any) -> str:

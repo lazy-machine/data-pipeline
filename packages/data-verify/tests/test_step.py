@@ -269,12 +269,13 @@ def test_lint_flags_a_model_the_gate_merely_runs_after(tmp_path, capsys):
     assert "'train' reads" in capsys.readouterr().out
 
 
-# one table named nothing special, so only `source` tells it from the raw data
+# the raw table comes first and the data is named nothing special, so only `source` tells
+# the two apart
 SOURCE_ONLY = """
 [[steps]]
 name = "verify"
 function = "data_verify:verify"
-inputs = {{ rows = "build/rows.parquet", {extra} }}
+inputs = {{ {inputs} }}
 params = {{ label = "y"{params} }}
 
 [[steps]]
@@ -285,18 +286,19 @@ outputs = {{ o = "build/o.txt" }}
 """
 
 
+RAW_FIRST = 'raw = "build/raw.parquet", rows = "build/rows.parquet"'
+
+
 def test_lint_allows_a_step_reading_only_the_source(tmp_path):
     toml = tmp_path / "pipeline.toml"
-    toml.write_text(SOURCE_ONLY.format(extra='raw = "build/raw.parquet"',
-                                       params=', source = "raw"'))
+    toml.write_text(SOURCE_ONLY.format(inputs=RAW_FIRST, params=', source = "raw"'))
     assert main(["lint", str(toml)]) == 0
 
 
 def test_lint_reads_the_source_from_a_spec_input(tmp_path):
     (tmp_path / "gate.toml").write_text('source = "raw"\n')
     toml = tmp_path / "pipeline.toml"
-    toml.write_text(SOURCE_ONLY.format(extra='raw = "build/raw.parquet", spec = "gate.toml"',
-                                       params=""))
+    toml.write_text(SOURCE_ONLY.format(inputs=RAW_FIRST + ', spec = "gate.toml"', params=""))
     assert main(["lint", str(toml)]) == 0
 
 
@@ -332,12 +334,100 @@ def test_the_iris_example_passes_lint():
      ["t", "aux"], ["t"]),
     ({"label": "y", "split_column": "s", "splits": ["train", "test"]}, ["t"], ["t"]),
     ({"label": "y"}, ["only"], ["only"]),
+    ({"label": "y", "source": "raw"}, ["rows", "raw", "aux"], ["rows"]),
 ])
 def test_lint_layout_agrees_with_the_real_parser(tmp_path, params, names, expected):
     inputs = {n: tmp_path / f"{n}.parquet" for n in names}
     spec = parse(params, inputs, REGISTRY)
     assert split_input_names(params, inputs) == expected
     assert set(expected) == ({spec.table} if spec.table else set(spec.split_inputs.values()))
+
+
+def test_lint_sees_a_directory_split_that_is_not_built_yet(tmp_path, capsys):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { train = "build/train_ds", test = "build/test_ds" }
+params = { label = "y" }
+
+[[steps]]
+name = "train"
+function = "m:f"
+inputs = { train = "build/train_ds" }
+outputs = { o = "build/o.txt" }
+""")
+    assert main(["lint", str(toml)]) == 1
+    assert "'train' reads build/train_ds" in capsys.readouterr().out
+
+
+def test_lint_follows_a_gate_reached_through_a_directory(tmp_path):
+    """A step reads a directory another gated step writes into: the same rule as the runner."""
+    toml = _lint_project(tmp_path / "p", lambda t: _ungated(t).replace(
+        'inputs = { train = "build/train.parquet" }\noutputs = { model = "build/model.txt" }',
+        'inputs = { train = "build/train.parquet", gated = "build/gated" }\n'
+        'outputs = { model = "build/model.txt" }') + """
+[[steps]]
+name = "after_gate"
+function = "prep:train"
+outputs = { model = "build/gated/marker.txt" }
+depends_on = ["verify"]
+""")
+    assert main(["lint", str(toml)]) == 0
+
+
+CONFIG_REFS = """
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = {{ raw = "build/raw.parquet", a = "build/a.parquet", config = "config.toml" }}
+params = {{ label = "y", {layout} }}
+
+[[steps]]
+name = "overview"
+function = "m:f"
+inputs = {{ raw = "build/raw.parquet" }}
+outputs = {{ o = "build/o.txt" }}
+"""
+
+
+@pytest.mark.parametrize("layout", [
+    'source = { from = "config", key = "source" }',
+    'splits = { from = "config", key = "splits" }',
+])
+def test_lint_resolves_references_in_the_layout(tmp_path, layout):
+    (tmp_path / "config.toml").write_text('source = "raw"\nsplits = ["a"]\n')
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(CONFIG_REFS.format(layout=layout))
+    assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_flags_a_split_named_through_a_reference(tmp_path, capsys):
+    (tmp_path / "config.toml").write_text('splits = ["raw"]\n')
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(CONFIG_REFS.format(layout='splits = { from = "config", key = "splits" }'))
+    assert main(["lint", str(toml)]) == 1
+    assert "'overview' reads build/raw.parquet" in capsys.readouterr().out
+
+
+def test_lint_accuses_nobody_when_a_reference_is_not_built_yet(tmp_path):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(CONFIG_REFS.format(layout='source = { from = "config", key = "source" }'))
+    assert main(["lint", str(toml)]) == 0
+
+
+def test_lint_treats_extra_tables_as_auxiliary_when_there_are_no_named_splits(tmp_path):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(SOURCE_ONLY.format(inputs=RAW_FIRST + ', aux = "build/aux.parquet"',
+                                       params=', source = "raw"') + """
+[[steps]]
+name = "lookup"
+function = "m:f"
+inputs = { aux = "build/aux.parquet" }
+outputs = { o = "build/l.txt" }
+""")
+    assert main(["lint", str(toml)]) == 0
 
 
 def test_lint_covers_a_table_holding_every_split(tmp_path, capsys):

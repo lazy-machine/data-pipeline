@@ -350,8 +350,8 @@ def _one_feature(x: np.ndarray) -> dict[str, pd.DataFrame]:
     return {"train": d.iloc[: len(x) * 3 // 4], "test": d.iloc[len(x) * 3 // 4:]}
 
 
-def _scaled(rows: int) -> np.ndarray:
-    x = np.random.default_rng(0).normal(5, 3, rows)
+def _scaled(rows: int, seed: int = 0) -> np.ndarray:
+    x = np.random.default_rng(seed).normal(5, 3, rows)
     return (x - x.mean()) / x.std()
 
 
@@ -384,8 +384,50 @@ def test_widening_the_tolerances_is_honoured_while_the_margin_is_raised(case):
 
 
 def test_scaler_on_a_csv_with_two_decimals_blocks_on_large_data(case):
-    r = case.run(_one_feature(np.round(_scaled(200_000), 2)), ONE_FEATURE)
+    x = np.round(_scaled(200_000, seed=2), 2)
+    assert abs(x.mean()) > 0.003 / np.sqrt(len(x))   # only the rounding allowance explains it
+    r = case.run(_one_feature(x), ONE_FEATURE)
     assert r.failed("preprocessing.global_scaling")
+
+
+def test_scaler_on_a_coarser_grid_only_warns(case):
+    """At one decimal, rounding hides as much as sampling noise, so chance can't be ruled out."""
+    r = case.run(_one_feature(np.round(_scaled(200_000), 1)), ONE_FEATURE)
+    assert not r.failed("preprocessing.global_scaling")
+    assert r.failed("preprocessing.global_scaling_near")
+
+
+def test_whole_numbers_near_standard_do_not_block(case):
+    """A balanced +1/-1 feature, two rows off exact balance: inside the fixed tolerances."""
+    x = np.ones(200_000)
+    x[:99_999] = -1
+    r = case.run(_one_feature(np.random.default_rng(0).permutation(x)), ONE_FEATURE)
+    assert not r.failed("preprocessing.global_scaling")
+
+
+def test_train_alone_must_beat_chance_too(case):
+    """A train split that is near-standard by chance doesn't excuse an exact union."""
+    n1, n2 = 150_000, 50_000
+    train = _scaled(n1) * (1 + 5e-4) + 5e-5
+    m1, s1 = train.mean(), train.std()
+    m2 = -n1 * m1 / n2
+    s2 = np.sqrt(((n1 + n2) - n1 * (s1**2 + m1**2)) / n2 - m2**2)
+    x = np.concatenate([train, _scaled(n2, seed=5) * s2 + m2])
+    assert case.run(_one_feature(x), ONE_FEATURE).failed("preprocessing.global_scaling")
+
+
+def test_the_warning_follows_the_blocking_settings(case):
+    """What a tighter margin stops blocking must warn, and what a looser one blocks must not
+    be reported twice."""
+    x = _scaled(200_000) + 3e-6
+    tight = case.run(_one_feature(x), {**ONE_FEATURE, "checks": {
+        "preprocessing.global_scaling": {"chance_margin": 0.001}}})
+    assert not tight.failed("preprocessing.global_scaling")
+    assert tight.failed("preprocessing.global_scaling_near")
+    loose = case.run(_one_feature(_scaled(200_000) * (1 + 5e-4) + 5e-5), {
+        **ONE_FEATURE, "checks": {"preprocessing.global_scaling": {"chance_margin": 1.0}}})
+    assert loose.failed("preprocessing.global_scaling")
+    assert not loose.failed("preprocessing.global_scaling_near")
 
 
 def test_rows_dropped_after_scaling_still_warn(case):
@@ -413,7 +455,9 @@ def test_scaled_data_is_still_recognised_at_any_size(rows, decimals):
                          step=_rounding_step(x))
 
 
-def test_float32_scaled_data_is_still_recognised():
+def test_scaled_values_stored_as_float32_are_still_recognised():
+    """Only the storage. A scaler computing in float32 on a large offset can miss the bar,
+    which the README says."""
     x = _scaled(2_000_000).astype("float32").astype("float64")
     assert _standardized(len(x), x.sum(), (x**2).sum(), **LOOSE, margin=0.003,
                          step=_rounding_step(x))
@@ -421,7 +465,7 @@ def test_float32_scaled_data_is_still_recognised():
 
 @pytest.mark.parametrize("values, step", [
     ([1.25, 2.5, 3.75], 0.01), ([1.0, 2.0], 1.0), ([0.123456, 0.5], 1e-6),
-    ([np.pi, np.e], 0.0), ([], 0.0), ([1.25, np.inf, -np.inf], 0.01),
+    ([np.pi, np.e], 0.0), ([], 0.0), ([1.25, np.inf, -np.inf], 0.01), ([1.0, 2.0, 3.0, 0.5], 0.1),
 ])
 def test_rounding_step(values, step):
     assert _rounding_step(np.array(values)) == pytest.approx(step)

@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 
 from ..core import (
-    check, examples, failed, fmt, is_numeric_kind, kind, matches, numeric_values, passed, skipped,
-    value_text, value_texts,
+    REGISTRY, check, examples, failed, fmt, is_numeric_kind, kind, matches, numeric_values, passed,
+    skipped, value_text, value_texts,
 )
 from ..stats import feature_scores
 
@@ -258,10 +258,12 @@ def _short_text(s: pd.Series) -> bool:
 # -- preprocessing leakage -----------------------------------------------------------------
 
 _CHANCE_MARGIN = 0.003  # fraction of the sampling noise a match must beat to count as scaled
+_COARSEST_STEP = 0.01  # beyond this, rounding hides as much as sampling noise does
 
 
 def _rounding_step(x: np.ndarray) -> float:
-    """The decimal grid values sit on, or 0: a CSV keeps only so many digits."""
+    """The decimal grid values sit on, or 0: a CSV keeps only so many digits. Read from the
+    first values, which is enough for a column written one way."""
     sample = x[np.isfinite(x)][:1000]
     if len(sample):
         for decimals in range(7):
@@ -284,11 +286,13 @@ def _standardized(n, s, ss, tol_mean, tol_std, margin=None, step=0.0):
     A scaler leaves only rounding error. Unscaled data that is roughly standard already
     misses by its sampling noise, about 1/sqrt(n) for the mean and 1/sqrt(2n) for the std,
     which falls inside any fixed tolerance once there are enough rows. So the tolerance
-    shrinks with n, down to what rounding to ``step`` can explain.
+    shrinks with n, down to what rounding to ``step`` can explain. On a coarser grid than
+    _COARSEST_STEP rounding can explain a chance match too, so no allowance is made.
     """
     if n < 3:
         return False
     if margin is not None:
+        step = step if step <= _COARSEST_STEP else 0.0
         rounding = 4 * step / np.sqrt(12 * n)
         tol_mean = min(tol_mean, margin / np.sqrt(n) + rounding)
         tol_std = min(tol_std, margin / np.sqrt(2 * n) + rounding + step ** 2 / 24)
@@ -353,6 +357,11 @@ def _scaling_hits(v, tol_mean, tol_std, margin, minmax: bool) -> dict[str, str]:
     return hits
 
 
+def _blocking_hits(v, tol_mean, tol_std, margin) -> dict[str, str]:
+    return v.cached(("global_scaling", tol_mean, tol_std, margin),
+                    lambda: _scaling_hits(v, tol_mean, tol_std, margin, minmax=True))
+
+
 @check("preprocessing.global_scaling", "preprocessing", "error",
        "Scalers were fitted on the training split only", tol_mean=1e-4, tol_std=1e-3,
        chance_margin=_CHANCE_MARGIN)
@@ -364,12 +373,14 @@ def global_scaling(v, opt):
     signature, so it is also tested without repeated rows and, when params.source is set,
     on the rows found in the source only. `tol_mean` and `tol_std` are the widest gap allowed.
     On large data a match must also be closer than `chance_margin` of the sampling noise, plus
-    what the values' rounding explains, so data that is already roughly standard doesn't block.
-    Raise `chance_margin` to loosen this. preprocessing.global_scaling_near warns about the
-    matches this leaves out."""
+    what rounding to 2 or more decimals explains, so data that is already roughly standard
+    doesn't block. Raise `chance_margin` to loosen this. A real scaler can miss that bar: on
+    values rounded more coarsely or to significant figures, in float32 with a large offset, or
+    with rows added or dropped afterwards. preprocessing.global_scaling_near warns about what
+    is left within `tol_mean` and `tol_std`."""
     if len(v.splits) < 2:
         return skipped("one split only")
-    hits = _scaling_hits(v, opt["tol_mean"], opt["tol_std"], opt["chance_margin"], minmax=True)
+    hits = _blocking_hits(v, opt["tol_mean"], opt["tol_std"], opt["chance_margin"])
     if hits:
         return failed(f"{len(hits)} feature(s) scaled with statistics of evaluation data: "
                       + ", ".join(f"{k} ({x})" for k, x in list(hits.items())[:6]),
@@ -383,13 +394,17 @@ def global_scaling(v, opt):
        "No feature is almost scaled over evaluation rows", tol_mean=1e-4, tol_std=1e-3)
 def global_scaling_near(v, opt):
     """Features within `tol_mean` and `tol_std` of mean 0 and std 1 over train plus evaluation
-    rows, but not close enough to rule out chance, so preprocessing.global_scaling doesn't
-    block them. Either a scaler fitted on evaluation rows was followed by rows being added or
-    dropped, or the feature is roughly standard by nature, which on large data is common."""
+    rows that preprocessing.global_scaling doesn't block, because chance can't be ruled out.
+    Either a scaler was fitted on evaluation rows and the result lost precision or changed
+    rows afterwards, or the feature is roughly standard by nature, which on large data with
+    many such features is common."""
     if len(v.splits) < 2:
         return skipped("one split only")
+    blocking = {**REGISTRY["preprocessing.global_scaling"].options,
+                **v.spec.checks.get("preprocessing.global_scaling", {})}
+    exact = _blocking_hits(v, blocking["tol_mean"], blocking["tol_std"],
+                           blocking["chance_margin"])
     near = _scaling_hits(v, opt["tol_mean"], opt["tol_std"], None, minmax=False)
-    exact = _scaling_hits(v, opt["tol_mean"], opt["tol_std"], _CHANCE_MARGIN, minmax=False)
     hits = {f: x for f, x in near.items() if f not in exact}
     if hits:
         return failed(f"{len(hits)} feature(s) nearly standardised over evaluation rows: "
