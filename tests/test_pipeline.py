@@ -6,6 +6,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -699,12 +700,13 @@ outputs = { o = "out/o.txt" }
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
         # a killed child stays a zombie until it is reaped
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
-        return not Path("/proc/self").exists()  # no /proc here, so os.kill is all there is
-    except ProcessLookupError:   # gone, or reaped between the two looks
-        return False
+    except (FileNotFoundError, ProcessLookupError):   # reaped between the two looks
+        return not Path("/proc/self").exists()  # unless there is no /proc: os.kill said alive
 
 
 def wait_until(condition, seconds: float = 30) -> bool:
@@ -719,7 +721,7 @@ def wait_until(condition, seconds: float = 30) -> bool:
 AFTER_SIGNAL = 10  # the watch polls twice a second; starting up is what can take long
 
 
-def default_signals(*keep_ignored: int):
+def default_signals(*keep_ignored: int) -> Callable[[], None]:
     """For preexec_fn. A test run started as a shell background job ignores these, and that
     would carry over to the runner, which is right for the runner but not for these tests."""
     def reset() -> None:
@@ -730,27 +732,30 @@ def default_signals(*keep_ignored: int):
     return reset
 
 
-def test_alive_survives_a_process_reaped_between_its_two_looks(monkeypatch):
+@pytest.mark.skipif(not Path("/proc/self").exists(), reason="needs /proc")
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError])
+def test_alive_survives_a_process_reaped_between_its_two_looks(monkeypatch, error):
     def reaped(self, *args, **kwargs):
-        raise ProcessLookupError
+        raise error
 
     monkeypatch.setattr(Path, "read_text", reaped)
     assert alive(os.getpid()) is False
 
 
 @needs_groups
-def test_a_test_run_that_ignores_signals_can_still_interrupt_the_runner(tmp_path):
+@pytest.mark.parametrize("sig, code", [(signal.SIGINT, 130), (signal.SIGQUIT, -signal.SIGQUIT)])
+def test_a_test_run_that_ignores_signals_can_still_reach_the_runner(tmp_path, sig, code):
     """As in a shell background job: without the reset this hangs until the timeout."""
     cfg = make(tmp_path, SPAWNER)
-    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    previous = signal.signal(sig, signal.SIG_IGN)
     try:
         proc = start_runner(tmp_path, cfg)
-        proc.send_signal(signal.SIGINT)
+        proc.send_signal(sig)
         proc.communicate(timeout=15)
     finally:
-        signal.signal(signal.SIGINT, previous)
+        signal.signal(sig, previous)
         proc.kill()
-    assert proc.returncode == 130
+    assert proc.returncode == code
 
 
 @needs_groups
