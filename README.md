@@ -113,6 +113,7 @@ critical = true                               # false: failure only warns
 timeout = 600                                 # seconds; the worker and its children are killed after this
 depends_on = []                               # extra ordering beyond file dependencies
 watch = ["sql/features.sql"]                  # non-Python files or dynamic imports that invalidate the step
+env = ["API_REGION"]                          # environment variables that change the step's results
 description = "Fit a classifier"
 ```
 
@@ -148,7 +149,12 @@ A step's fingerprint combines:
 - **code**: the SHA-256 of the step's module file, the local modules it imports (directly
   or through other local modules), and any `watch` files,
 - **config**: `function`, `params`, `inputs` and `outputs`,
-- **inputs**: the SHA-256 of every input's content (directories are hashed recursively).
+- **inputs**: the SHA-256 of every input's content (directories are hashed recursively),
+- **packages**: the installed version of each distribution in `requires`. List the
+  distribution name (`scikit-learn`), because an import name (`sklearn`) has no version
+  to track. Adding or removing an entry counts as a change,
+- **env**: a SHA-256 of each variable listed in `env`, never its value. Adding or removing
+  a name counts as a change.
 
 After a successful run, the fingerprint and the output hashes go into
 `<state_dir>/state.json`. The next run skips the step only if the fingerprint matches and
@@ -157,8 +163,8 @@ step re-runs and writes byte-identical outputs, the steps after it stay cached. 
 are cached by size and mtime, so large unchanged files are not re-read.
 
 The status line says why a step ran: `no checkpoint`, `code changed`, `config changed`,
-`code changed: <files>`, `inputs changed: <names>`, `output missing: <name>`,
-`output modified: <name>`, `forced`.
+`code changed: <files>`, `packages changed: <name> <old> → <new>`, `env changed: <names>`,
+`inputs changed: <names>`, `output missing: <name>`, `output modified: <name>`, `forced`.
 
 Imports are found by reading the code, never by running it. A module is local when it is
 found under `python_path`; the standard library and installed packages are not tracked.
@@ -166,7 +172,8 @@ Modules loaded with `importlib.import_module` and non-Python files belong in `wa
 
 After upgrading from a version that didn't track imports, run with `-f` once if you edited
 a helper without `watch` since your last run: older checkpoints are filled in rather than
-invalidated, so that upgrading doesn't rerun everything.
+invalidated, so that upgrading doesn't rerun everything. Package versions and `env` work the
+same way: they are recorded on the first run after upgrading, without rerunning the step.
 
 ## Layout
 

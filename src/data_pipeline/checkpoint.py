@@ -1,9 +1,9 @@
 """Content-addressed checkpoints.
 
-A step is up to date when its fingerprint (code + config + input contents) matches the
-one recorded after its last successful run *and* every output still exists with the
-content it had then. File hashes are cached by (size, mtime) so unchanged large files
-are not re-read on every run.
+A step is up to date when its fingerprint (code, config, input contents, package versions
+and declared environment variables) matches the one recorded after its last successful
+run *and* every output still exists with the content it had then. File hashes are cached
+by (size, mtime) so unchanged large files are not re-read on every run.
 """
 
 from __future__ import annotations
@@ -15,8 +15,12 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 from typing import Any
+
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 
 from .config import Pipeline, Step
 
@@ -30,6 +34,8 @@ class Fingerprint:
     config: str
     inputs: dict[str, str]
     imports: dict[str, str] = field(default_factory=dict)
+    packages: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
 
 
 class State:
@@ -80,7 +86,8 @@ class State:
     def record(self, name: str, fp: Fingerprint, outputs: dict[str, str], **extra: Any) -> None:
         self.steps[name] = {
             "code": fp.code, "config": fp.config, "inputs": fp.inputs,
-            "imports": fp.imports, "outputs": outputs, **extra,
+            "imports": fp.imports, "packages": fp.packages, "env": fp.env,
+            "outputs": outputs, **extra,
         }
         self.save()
 
@@ -182,6 +189,34 @@ def _digest(obj: Any) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def installed_version(name: str) -> str:
+    """The installed version; ``requires`` may also name an import, such as ``sklearn``,
+    which has no version to track."""
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        found = "." not in name and importlib.util.find_spec(name)
+        return "import-only" if found else "not installed"
+
+
+def _packages(step: Step) -> dict[str, str]:
+    found = {}
+    for spec in step.requires:
+        try:
+            name = Requirement(spec).name
+        except InvalidRequirement:
+            continue  # reported by preflight
+        found[canonicalize_name(name)] = installed_version(name)
+    return dict(sorted(found.items()))
+
+
+def _env(step: Step) -> dict[str, str]:
+    """Hashes, never values: variables often hold secrets, and state.json is a plain file."""
+    values = {name: os.environ.get(name) for name in step.env}
+    return {name: "unset" if v is None else hashlib.sha256(os.fsencode(v)).hexdigest()
+            for name, v in sorted(values.items())}
+
+
 def fingerprint(pipeline: Pipeline, step: Step, state: State) -> Fingerprint:
     code = hashlib.sha256()
     src = module_file(pipeline, step.module)
@@ -198,7 +233,8 @@ def fingerprint(pipeline: Pipeline, step: Step, state: State) -> Fingerprint:
         for f in local_imports(pipeline, step.module)
     }
     return Fingerprint(code=code.hexdigest(), config=config, inputs=inputs,
-                       imports=dict(sorted(imports.items())))
+                       imports=dict(sorted(imports.items())),
+                       packages=_packages(step), env=_env(step))
 
 
 def _few(names: list[str]) -> str:
@@ -208,8 +244,9 @@ def _few(names: list[str]) -> str:
 def stale_reason(pipeline: Pipeline, step: Step, state: State, fp: Fingerprint) -> str | None:
     """Why the step must run, or None if its checkpoint is valid.
 
-    A checkpoint written before imports were tracked is backfilled in place rather than
-    invalidated, so upgrading does not rerun every step; the caller saves the state.
+    A checkpoint written before imports, packages or env were tracked is backfilled in
+    place rather than invalidated, so upgrading does not rerun every step; the caller
+    saves the state.
     """
     prev = state.steps.get(step.name)
     if prev is None:
@@ -222,6 +259,20 @@ def stale_reason(pipeline: Pipeline, step: Step, state: State, fp: Fingerprint) 
         old = prev["imports"]
         changed = sorted(k for k in old.keys() | fp.imports.keys() if old.get(k) != fp.imports.get(k))
         return f"code changed: {_few(changed)}"
+    if "packages" not in prev:
+        prev["packages"] = fp.packages
+    elif prev["packages"] != fp.packages:
+        old = prev["packages"]
+        changed = sorted(k for k in old.keys() | fp.packages.keys()
+                         if old.get(k) != fp.packages.get(k))
+        moves = [f"{k} {old.get(k, 'none')} → {fp.packages.get(k, 'none')}" for k in changed]
+        return f"packages changed: {_few(moves)}"
+    if "env" not in prev:
+        prev["env"] = fp.env
+    elif prev["env"] != fp.env:
+        old = prev["env"]
+        changed = sorted(k for k in old.keys() | fp.env.keys() if old.get(k) != fp.env.get(k))
+        return f"env changed: {_few(changed)}"
     if prev.get("config") != fp.config:
         return "config changed"
     if prev.get("inputs") != fp.inputs:

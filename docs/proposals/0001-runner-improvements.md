@@ -1,6 +1,6 @@
 # Proposal 0001: runner improvements from the hard-drive-analysis-v3 build
 
-- **Status:** Part A: A1 and A2 done, A3 todo. Part B: waiting for the owner's decision
+- **Status:** Part A: A1, A2 and A3 done. Part B: waiting for the owner's decision
 - **Source:** lessons from building `../hard-drive-analysis-v3` on this runner (12 steps,
   a 22 GB input, training steps that run for hours). Every claim below was checked
   against the code at commit `8f8dcaf`.
@@ -229,7 +229,7 @@ helpers from `test_pipeline.py`, or moving them to `tests/conftest.py`):
 
 ### A3. Package versions and declared environment variables in the fingerprint
 
-- **Status:** todo
+- **Status:** done (#5)
 - **Priority:** medium.
 
 **Problem.** `requires` is checked (installed, and the version satisfies the specifier),

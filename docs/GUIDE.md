@@ -442,6 +442,11 @@ status line (`warnings=1`). Read them before you trust a result.
 | a file listed in `watch` (data, SQL, templates, dynamic imports) | that step reruns (`code changed`) |
 | delete or edit an output | that step reruns (`output missing` / `output modified`) |
 | upgrade a step package whose `__version__` changed (e.g. data-verify) | its steps rerun (`code changed`) |
+| upgrade a package listed in the step's `requires` by its distribution name | that step reruns (`packages changed: duckdb 1.5.0 → 2.0.0`) |
+| upgrade a package listed by its import name (`sklearn`, not `scikit-learn`) | nothing; no version is recorded, so list the distribution name |
+| add or remove an entry in `requires` | that step reruns (`packages changed: joblib none → 1.5.0`) |
+| change the version specifier of an entry | nothing, as long as the installed version satisfies it |
+| a variable listed in the step's `env`, or add or remove a name there | that step reruns (`env changed: <name>`) |
 | edit an installed step package without bumping its version | nothing; use `-r STEP` (§11) |
 | the `description` or `critical` flag | nothing; these don't affect results |
 | file timestamps only (`touch`) | nothing; caching compares content |
@@ -486,9 +491,9 @@ watch = ["sql/features.sql"]
 `watch` paths are relative to the working directory (the TOML file's folder by default), and
 the files must exist.
 
-Checkpoints written before imports were tracked are filled in on the next run instead of
-being invalidated. If you edited a helper that wasn't in `watch` since your last run, run
-once with `-f` (or `-r STEP`) after upgrading.
+Checkpoints written before imports, packages or `env` were tracked are filled in on the next
+run instead of being invalidated. If you edited a helper that wasn't in `watch`, or upgraded a
+package, since your last run, run once with `-f` (or `-r STEP`) after upgrading.
 
 ### Steps that read the outside world
 
@@ -500,6 +505,12 @@ uv run data-pipeline -r fetch_prices          # rerun only that step (later step
 ```
 
 Or give it a parameter that you change on purpose, such as `params = { snapshot = "2026-10" }`.
+
+Environment variables are ignored unless declared. List the ones that change a step's
+results in `env`, such as `env = ["API_REGION"]`, and leave out those that only affect
+resources, such as a thread count. Only an unsalted hash of the value is stored in the
+checkpoint. That keeps it out of plain sight, but a short or guessable secret could still
+be recovered from `state.json`, so don't commit that file.
 
 ### Resetting
 

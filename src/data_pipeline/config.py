@@ -30,7 +30,7 @@ _FUNC_RE = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
 _PIPELINE_KEYS = {"name", "workdir", "python_path", "state_dir"}
 _STEP_KEYS = {
     "name", "function", "inputs", "outputs", "params", "requires",
-    "depends_on", "critical", "timeout", "watch", "description",
+    "depends_on", "critical", "timeout", "watch", "env", "description",
 }
 
 
@@ -50,6 +50,7 @@ class Step:
     critical: bool = True
     timeout: float | None = None
     watch: list[str] = field(default_factory=list)
+    env: list[str] = field(default_factory=list)
     description: str = ""
 
     @property
@@ -141,6 +142,7 @@ def _parse_step(raw: Any, idx: int) -> Step:
         critical=critical,
         timeout=float(timeout) if timeout is not None else None,
         watch=_str_list(raw.get("watch", []), f"{where}.watch"),
+        env=_str_list(raw.get("env", []), f"{where}.env"),
         description=description,
     )
 
