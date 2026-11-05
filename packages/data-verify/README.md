@@ -159,7 +159,7 @@ previous run are deleted first, so a stale report never survives a failed run.
 
 ```jsonc
 {
-  "tool": "data-verify", "version": "0.3.0",
+  "tool": "data-verify", "version": "0.4.0",
   "passed": false,                       // false = the step failed
   "fail_on": "error",
   "blocking": ["split.group_overlap"],   // ids of the checks that blocked
@@ -355,6 +355,12 @@ never show them, promote them:
 
 Or set `fail_on = "warn"` to block on every warning.
 
+`duplicates.near_cross_split` is a fair candidate for `"error"` only when you control how
+rows are copied. Rounding makes distinct rows collide, so low-cardinality or coarse features
+can raise a false alarm, and under a new key the check allows a share of rows for chance that
+is a statistical estimate, not a guarantee. Run it as a warning first and look at what it
+flags.
+
 Don't promote `poisoning.label_consistency`, alone or through `"poisoning.*" = "error"`, unless
 your splits are drawn from the same distribution. It also fires on clean data when the
 features vary more in an evaluation split than in train (a covariate shift, such as a wider
@@ -408,8 +414,10 @@ A pass means that no blocking check fired, not that the data is clean.
   compare labels with their source, not as proof. Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
 - **Near-copies under a new key.** These need a column with mostly distinct values to go on,
-  and they warn at best. Copies are missed in data with only coarse columns, or when a row
-  was copied more than 5 times or given a fresh timestamp or other per-row value.
+  and they warn at best. Copies are missed in data with only coarse columns, in data whose
+  columns, key aside, are all repeats of one (columns that repeat another are left out of
+  this comparison), or when a row was copied more than 5 times or given a fresh timestamp or
+  other per-row value.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling

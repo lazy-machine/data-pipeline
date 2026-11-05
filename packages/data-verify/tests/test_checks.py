@@ -1000,6 +1000,51 @@ def test_clean_data_with_undeclared_keys_has_no_near_copies(case, splits):
     assert not case.run(splits, LABEL_ONLY).failed("duplicates.near_cross_split")
 
 
+def _repeated_columns(noise: float, n: int = 20000, seed: int = 1) -> dict:
+    """Clean rows with an undeclared unique key and a column that repeats another."""
+    rng = np.random.default_rng(seed)
+    a = rng.normal(size=n)
+    d = pd.DataFrame({"sid": [f"s{i}" for i in range(n)], "a": a,
+                      "b": a + (rng.normal(0, noise, n) if noise else 0.0),
+                      "y": rng.integers(0, 2, n)})
+    k = n * 3 // 4
+    return {"train": d.iloc[:k], "test": d.iloc[k:]}
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.0001, 0.0005, 0.002])
+def test_a_column_that_repeats_another_is_not_chance_evidence_of_copies(case, noise):
+    """Shuffling the two apart used to forget they move together, so any match looked rare."""
+    r = case.run(_repeated_columns(noise), {**LABEL_ONLY, "features": "auto"})
+    assert not r.failed("duplicates.near_cross_split")
+    assert r.check("duplicates.near_cross_split")["details"]["ignored_repeats"] == ["b"]
+
+
+def test_copies_are_still_found_beside_a_column_that_repeats_another(case, splits):
+    for d in splits.values():
+        d["f5"] = d["f1"] + np.random.default_rng(3).normal(0, 0.0005, len(d))
+    r = case.run(_near_copies(splits), LABEL_ONLY)
+    assert r.failed("duplicates.near_cross_split")
+    assert r.check("duplicates.near_cross_split")["details"]["ignored_repeats"] == ["f5"]
+
+
+def test_a_text_column_that_repeats_another_is_dropped_too(case, splits):
+    for d in splits.values():
+        d["plan2"] = d["plan"]
+    r = case.run(_near_copies(splits), LABEL_ONLY)
+    assert "plan2" in r.check("duplicates.near_cross_split")["details"]["ignored_repeats"]
+    assert r.failed("duplicates.near_cross_split")
+
+
+def test_copies_are_missed_when_every_column_left_repeats_one_other(case):
+    """The limit: one column is all that remains, and one column can't tell copies from chance."""
+    frames = _repeated_columns(0.0, n=4000)
+    copies = frames["test"].head(200).copy()
+    copies["sid"] = "N" + copies["sid"]
+    frames["train"] = pd.concat([frames["train"], copies], ignore_index=True)
+    assert not case.run(frames, {**LABEL_ONLY, "features": "auto"}).failed(
+        "duplicates.near_cross_split")
+
+
 def test_columns_option_is_not_second_guessed(case, splits):
     r = case.run(_near_copies(splits), {**LABEL_ONLY, "checks": {
         "temporal.undeclared_time": "off",
@@ -1139,6 +1184,18 @@ def test_features_that_vary_more_in_evaluation_fire_and_the_warning_says_why(cas
     c = r.check("poisoning.label_consistency")
     assert c["status"] == "fail"
     assert "features vary more in one split" in c["hint"]
+
+
+@pytest.mark.parametrize("one_entity", [["val", "test"], ["train"]], ids=["evaluation", "train"])
+def test_a_split_of_one_entity_is_skipped_not_passed(case, splits, one_entity):
+    """With a single entity there is no way to say how far a score varies, so say nothing."""
+    splits = _strong(splits)
+    tr = splits["train"]
+    _flip(tr, tr.sample(frac=0.3, random_state=0).index)
+    for name in one_entity:
+        splits[name]["customer"] = "only"
+    c = case.run(splits, {"group": ["customer"]}).check("poisoning.label_consistency")
+    assert c["status"] == "skip" and "entity" in c["message"]
 
 
 def test_a_split_name_with_a_space_warns_rather_than_crashing(case, splits):

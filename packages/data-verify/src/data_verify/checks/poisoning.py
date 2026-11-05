@@ -439,11 +439,11 @@ def label_consistency(v, opt):
     predicts evaluation labels backwards. Needs a binary or regression label and numeric
     features that predict it (at least `min_signal` on a 0-1 scale: 2 * AUC - 1 for a binary
     label, rank correlation for regression). With params.group the errors are estimated over
-    entities. Sees label noise of about 15% and above on a few thousand rows, and
-    targeted flips of a subgroup; not small flip rates or a backdoor with a rare trigger. A
-    shift in class balance doesn't fire it. Features that vary more in an evaluation split
-    than in train can, with either kind of label, because the label is then easier to
-    predict."""
+    entities, and a split with a single entity is not compared. Sees label noise of about 15%
+    and above on a few thousand rows, and targeted flips of a subgroup; not small flip rates
+    or a backdoor with a rare trigger. A shift in class balance doesn't fire it. Features that
+    vary more in an evaluation split than in train can, with either kind of label, because the
+    label is then easier to predict."""
     if not v.labels or len(v.splits) < 2:
         return skipped("needs a label and at least two splits")
     feats = v.numeric_features()
@@ -475,6 +475,8 @@ def label_consistency(v, opt):
         held_entity = _entities(v, train[~fit])
         held_se = held[2] if held_entity is None else \
             max(held[2], _entity_se(held_pred, y[~fit], task, held_entity))
+        if math.isinf(held_se):   # too few entities to say how far a score can vary
+            continue
         for name, d in v.others():
             if lbl not in d.columns:
                 continue
@@ -487,17 +489,20 @@ def label_consistency(v, opt):
             ev = _agreement(pred, ye, task)
             if ev is None or max(held[0], ev[0]) < opt["min_signal"]:
                 continue   # the features predict too little for this to say anything
-            compared += 1
             ev_entity = _entities(v, d)
             ev_se = ev[2] if ev_entity is None else \
                 max(ev[2], _entity_se(pred, ye, task, ev_entity))
+            if math.isinf(ev_se):
+                continue
+            compared += 1
             z = (ev[1] - held[1]) / math.hypot(held_se, ev_se) if held_se or ev_se else 0.0
             if _inconsistent(held[0], ev[0], z, opt):
                 hits.append({"label": lbl, "split": name, "held_out_train": fmt(held[0]),
                              "evaluation": fmt(ev[0]), "z": fmt(z)})
     if not compared:
         return skipped("needs a binary or regression label, numeric features that predict it "
-                       "and enough rows in each split")
+                       "and enough rows in each split (with params.group, more than one entity in "
+                       "each)")
     if hits:
         return failed("labels fit the features differently in train and evaluation: " + ", ".join(
             f"{h['label']}: train {h['held_out_train']}, {h['split']} {h['evaluation']}"
