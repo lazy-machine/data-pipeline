@@ -117,7 +117,7 @@ def _ungated_steps(path: Path, gate_name: str | None, params, inputs,
 
     def paths(step, key):
         declared = step.get(key, {})
-        return [(workdir / p).resolve() for p in declared.values()] \
+        return [(workdir / p).resolve() for p in declared.values() if isinstance(p, str)] \
             if isinstance(declared, dict) else []
 
     def ancestors(step, ordering: bool = True) -> set[str]:

@@ -77,8 +77,10 @@ depends_on = ["verify"]        # nothing trains on data the gate has not passed
 turn comes, after the upstream steps ran.) It also exits 1 if a step reads a split without
 the gate upstream of it, directly or through other steps. Steps that feed the gate, and
 steps that read only `source`, are allowed. It prints `not checked` and exits 0 when it can't
-tell which inputs hold the splits, because a reference or `spec` isn't readable yet, or
-because `source` is set with several other tables and no split names.
+tell which inputs hold the splits: a reference or `spec` isn't readable yet, a split name
+isn't an input, an unbuilt path has an unknown suffix, or `source` is set with several other
+tables and no split names. With a config file listed first and `source` set, lint looks at
+the data table while the gate takes the config as the split and fails, so list the data first.
 
 ### Declare every role that exists in your data
 
@@ -399,8 +401,8 @@ A pass means that no blocking check fired, not that the data is clean.
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
   fitted on evaluation rows block when the signature is exact: closer to mean 0 and std 1
-  than chance allows, with an allowance for rounding to 2 or more decimals. A real scaler
-  that misses that bar can't be told from chance on large data, so it warns at best
+  than chance allows, with an allowance for rounding to 2 or more decimals. A standardising
+  scaler that misses that bar can't be told from chance on large data, so it warns at best
   (`preprocessing.global_scaling_near`). That covers coarser rounding, values kept to
   significant figures, and float32 data with a large offset. Features with only two values
   are not tested, so a scaled flag goes unseen. In the other direction, a coarse feature with

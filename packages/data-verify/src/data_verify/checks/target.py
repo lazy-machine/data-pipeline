@@ -314,13 +314,17 @@ def _minmax_shape(v, f, union) -> bool:
     return (x == 0).sum() <= cap and (x == 1).sum() <= cap
 
 
+def _more_than_two_values(v, f: str) -> bool:
+    """Two values can balance to mean 0 and std 1 by themselves: a +1/-1 flag is no evidence."""
+    x = np.concatenate([numeric_values(d[f]) for d in v.splits.values()])
+    return len(np.unique(x[~np.isnan(x)])) > 2
+
+
 def _scaling_hits(v, tol_mean, tol_std, margin, minmax: bool) -> dict[str, str]:
     """Features that look scaled over train plus evaluation rows, but not over train alone."""
     names = list(v.splits)
     hits: dict[str, str] = {}
-    # two values can balance to mean 0 and std 1 by themselves: a +1/-1 flag is no evidence
-    feats = [f for f in v.numeric_features()
-             if len(np.unique(np.concatenate([numeric_values(v.splits[n][f]) for n in names]))) > 2]
+    feats = [f for f in v.numeric_features() if _more_than_two_values(v, f)]
     # row subsets to test: all rows; without repeats; without repeats and rows absent from
     # params.source. Rows injected after scaling would otherwise hide the signature.
     unique = {n: ~pd.Series(v.hashes(n, tuple(v.features))).duplicated().to_numpy()

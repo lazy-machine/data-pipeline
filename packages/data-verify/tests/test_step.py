@@ -543,17 +543,81 @@ outputs = { o = "build/o.txt" }
     assert "'model' reads build/rows.parquet" in capsys.readouterr().out
 
 
-def test_lint_treats_extra_tables_as_auxiliary_when_there_are_no_named_splits(tmp_path):
+def test_lint_says_so_when_a_split_name_is_not_an_input(tmp_path, capsys):
     toml = tmp_path / "pipeline.toml"
-    toml.write_text(SOURCE_ONLY.format(inputs=RAW_FIRST + ', aux = "build/aux.parquet"',
-                                       params=', source = "raw"') + """
+    toml.write_text("""
 [[steps]]
-name = "lookup"
+name = "verify"
+function = "data_verify:verify"
+inputs = { train = "build/train.parquet", test = "build/test.parquet" }
+params = { label = "y", splits = ["tran", "tst"] }
+
+[[steps]]
+name = "model"
 function = "m:f"
-inputs = { aux = "build/aux.parquet" }
-outputs = { o = "build/l.txt" }
+inputs = { train = "build/train.parquet" }
+outputs = { o = "build/o.txt" }
 """)
     assert main(["lint", str(toml)]) == 0
+    assert "not checked" in capsys.readouterr().out
+
+
+def test_lint_does_not_guess_about_an_unbuilt_side_file(tmp_path, capsys):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { data = "b/data.csv", notes = "b/notes.txt" }
+params = { label = "y" }
+
+[[steps]]
+name = "reader"
+function = "m:f"
+inputs = { notes = "b/notes.txt" }
+outputs = { o = "b/o.txt" }
+""")
+    assert main(["lint", str(toml)]) == 0
+    assert "not checked" in capsys.readouterr().out
+
+
+def test_lint_has_nothing_to_compare_when_a_gate_has_only_a_source(tmp_path, capsys):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text(SOURCE_ONLY.format(inputs='raw = "build/raw.parquet"', params=', source = "raw"'))
+    assert main(["lint", str(toml)]) == 0
+    assert "not checked" not in capsys.readouterr().out
+
+
+def test_lint_survives_a_step_with_a_non_string_input(tmp_path):
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { train = "build/t.parquet" }
+params = { label = "y" }
+
+[[steps]]
+name = "odd"
+function = "m:f"
+inputs = { t = 1 }
+""")
+    assert main(["lint", str(toml)]) in (0, 2)
+
+
+def test_a_malformed_config_is_a_config_error(tmp_path, capsys):
+    (tmp_path / "t.parquet").touch()
+    (tmp_path / "c.json").write_text("{not json")
+    toml = tmp_path / "pipeline.toml"
+    toml.write_text("""
+[[steps]]
+name = "verify"
+function = "data_verify:verify"
+inputs = { train = "t.parquet", c = "c.json" }
+params = { label = { from = "c", key = "label" } }
+""")
+    assert main(["lint", str(toml)]) == 2
+    assert "c.json is not valid JSON" in capsys.readouterr().err
 
 
 def test_lint_covers_a_table_holding_every_split(tmp_path, capsys):

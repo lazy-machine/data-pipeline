@@ -81,10 +81,13 @@ def _expect(cond: bool, msg: str) -> None:
 def read_config_file(path: Path) -> Any:
     suffix = path.suffix.lower()
     text = path.read_text()
-    if suffix == ".toml":
-        return tomllib.loads(text)
-    if suffix == ".json":
-        return json.loads(text)
+    try:
+        if suffix == ".toml":
+            return tomllib.loads(text)
+        if suffix == ".json":
+            return json.loads(text)
+    except ValueError as e:  # both parsers' errors
+        raise SpecError(f"{path.name} is not valid {suffix[1:].upper()}: {e}") from None
     if suffix in (".yaml", ".yml"):
         try:
             import yaml  # type: ignore[import-untyped]
@@ -310,21 +313,26 @@ def split_input_names(params: dict[str, Any], inputs: dict[str, Path]) -> list[s
         splits = [splits]
     config = _reference_sources(params) | {"spec"}
 
-    def is_data(path: Path) -> bool:
-        return is_data_input(path) or \
-            (not path.exists() and path.suffix.lower() not in CONFIG_SUFFIXES)  # a directory
-
-    data = [n for n, path in inputs.items() if is_data(path) and n != source and n not in config]
+    candidates = {n: path for n, path in inputs.items() if n != source and n not in config}
+    unbuilt = {n for n, path in candidates.items()
+               if not path.exists() and path.suffix.lower() not in CONFIG_SUFFIXES}
+    data = [n for n, path in candidates.items()
+            if is_data_input(path) or (n in unbuilt and not path.suffix)]   # a future directory
     if layout["split_column"]:
         return [table] if isinstance(table, str) and table in inputs else data
     if isinstance(splits, dict):
-        return [n for n in splits.values() if isinstance(n, str) and n in inputs]
+        splits = list(splits.values())
     if isinstance(splits, list):
-        return [n for n in splits if isinstance(n, str) and n in inputs]
-    named = [n for n in data if n.lower() in SPLIT_RANKS]
-    if named or not source:
-        return named or data
-    return data if len(data) == 1 else None   # parse takes the first, but that may be a lookup
+        known = all(isinstance(n, str) and n in inputs for n in splits)
+        return splits if known else None    # parse reports the unknown name when it runs
+    named = [n for n in candidates if n.lower() in SPLIT_RANKS and (n in data or n in unbuilt)]
+    if named:
+        return named
+    if any(n in unbuilt and n not in data for n in candidates):
+        return None     # an unbuilt path with an odd suffix may be a directory or a side file
+    if not source or len(data) <= 1:
+        return data
+    return None         # parse takes the first, but that may be a lookup
 
 
 def _option_type(default: Any) -> str:

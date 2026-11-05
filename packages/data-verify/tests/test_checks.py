@@ -407,6 +407,14 @@ def test_two_values_prove_nothing(case, minus_ones):
     assert not r.failed("preprocessing.global_scaling_near")
 
 
+def test_two_values_with_gaps_prove_nothing(case):
+    """A missing value isn't a third value: this flag balances exactly apart from its gaps."""
+    x = np.concatenate([np.ones(100_000), -np.ones(100_000), np.full(10_000, np.nan)])
+    r = case.run(_one_feature(np.random.default_rng(0).permutation(x)), ONE_FEATURE)
+    assert not r.failed("preprocessing.global_scaling")
+    assert not r.failed("preprocessing.global_scaling_near")
+
+
 def test_rounding_also_widens_the_std_tolerance():
     n, step = 200_000, 0.01
     std = 1 + 0.003 / np.sqrt(2 * n) + 0.5 * 4 * step / np.sqrt(12 * n) + step**2 / 24
