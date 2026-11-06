@@ -355,13 +355,14 @@ never show them, promote them:
 
 Or set `fail_on = "warn"` to block on every warning.
 
-`duplicates.near_cross_split` is a fair candidate for `"error"` when you control how rows are
-copied: its keyless second look fires on none of the clean shapes measured (61 scenarios at 60
-seeds each), and a copy added to the training split cannot hide itself in it. But the check
-also runs the comparison on all columns first, and that look fires on dense or partly
-overlapping evaluation segments in 4–10 of 60 seeds — on `main` and here alike — because those
-shapes really do share rows. So promoting the check is safe with respect to the keyless look,
-not free of false alarms overall. Run it as a warning first and look at what it flags.
+`duplicates.near_cross_split` is a candidate for `"error"` when you control how rows are
+copied: a copy added to the training split cannot hide itself in its keyless second look, and
+that look fires on none of the 61 clean scenarios measured at 60 seeds each. It is not free of
+false alarms though. On clean data whose features repeat heavily (about 8% of rows) it fires
+on about 0.3% of runs (11 of 3,600 over nine row-count cells at 400 seeds each; worst cell
+3/400), and the comparison it runs on all columns first fires on dense or partly overlapping
+evaluation segments in 1–10 of 60 seeds — on `main` and here alike — because those shapes
+really do share rows. Run it as a warning first and look at what it flags.
 
 Don't promote `poisoning.label_consistency`, alone or through `"poisoning.*" = "error"`, unless
 your splits are drawn from the same distribution. It also fires on clean data when the
@@ -413,19 +414,23 @@ A pass means that no blocking check fired, not that the data is clean.
   predict a binary or regression label. Lower flip rates and a backdoor with a rare trigger
   look like ordinary noise. A shift in class balance doesn't fire it, but features that vary
   more in an evaluation split can, with either kind of label, so read it as a prompt to
-  compare labels with their source, not as proof. Other injected values and rows mostly warn. `schema.ranges`,
+  compare labels with their source, not as proof. Seen on real data: a clean phoneme segment
+  split (`V1_top25`, test the top quartile) fired 5/5 and adult `race_nonwhite` 1/5, both by
+  that covariate shift and not by label noise. Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
 - **Near-copies under a new key.** With a unique key column that isn't declared as `id`, the
   check also compares the other columns, at two precisions. The fine comparison follows the
   size of the training split: numbers equal to `ceil(log2(train rows)) + 7` bits of mantissa,
   between 20 and 48 (about 6 significant digits at 15,000 training rows, 8 at 150,000), and it
-  needs at least 3 standard deviations more matches than the two splits' own repeats predict.
-  That last bar is why a rounded or derived column alone is not treated as a copy: the
+  needs at least 4 standard errors more matches than the two splits' own repeats predict (wider
+  than nominal because the counts are overdispersed). That last bar is why a rounded or derived
+  column alone is not treated as a copy: the
   shuffled chance estimate collapses, but the splits repeat those vectors as often as they
   share them. The allowance is the larger of what each split's own repeats predict for the
   pair, and a copy added to the training split occurs in the evaluation split, so it is left
-  out of both: it cannot hide itself however many times it is placed (up to 5; a sixth copy
-  stops the value being rare). An evaluation split that sits where the features are dense is
+  out of both: it is not what the repeats are measured against and cannot hide itself, up to 5
+  placements (a sixth copy stops the value being rare). An evaluation split that sits where the
+  features are dense is
   explained. A copy jittered past the fine precision still agrees to about 4 significant
   digits, so a comparison at 14 bits needs the same. When no single column is distinct enough
   to go on, the whole row without the keys is the evidence. Between them they find exact
@@ -440,9 +445,10 @@ A pass means that no blocking check fired, not that the data is clean.
   the warning with 100 copies placed three times, so only the warning sees them; a denser
   frame (10 Likert items, a 30-column 20%-dense matrix, a 6-column 0-9 grid) does fire. Copies
   of a common vector fire neither check. The comparison on all columns runs first and fires on
-  its own: it hits dense and partly overlapping evaluation segments in 4–10 of 60 seeds, at
-  the same rate on `main` and here, so promoting this check to `error` is safe with respect to
-  its own keyless look but not free of false alarms from the all-columns look. Copies are
+  its own: it hits dense and partly overlapping evaluation segments in 1–10 of 60 seeds, at the
+  same rate on `main` and here. The keyless look is not silent either: on clean data whose
+  features repeat heavily it fires on about 0.3% of runs. So promoting this check to `error` is
+  safe with respect to what it claims, but not free of false alarms. Copies are
   still missed when fewer than 10 rows match, when a copy is jittered by 1e-4 or more or
   re-measured, when a row is copied more than 5 times, when a copy carries a common value or a
   fresh timestamp or other per-row value, and in data whose columns are all coarse; declaring

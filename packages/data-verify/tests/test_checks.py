@@ -1627,6 +1627,44 @@ def test_multiplied_copies_do_not_make_clean_data_fire(case, M, n_train, n_test)
     assert _near_quiet(case, _repeated_copies(M, n_train, n_test, 0))
 
 
+def test_a_clean_repeating_frame_is_quiet_at_the_four_sigma_bar(case):
+    """Seed 1004 of the a2 shape (M=6e4, 15,000/5,000) is a second-look false alarm at a
+    3-standard-error bar; the bar is 4 because those counts are overdispersed."""
+    from data_verify.checks import duplicates
+
+    frames = _repeated_copies(60_000, 15_000, 5_000, 0, seed=1004)
+    old = duplicates._SIGMA
+    try:
+        duplicates._SIGMA = 3.0
+        assert not _near_quiet(case, frames)
+    finally:
+        duplicates._SIGMA = old
+    assert _near_quiet(case, frames)
+
+
+def _pre_split_jittered(k, n=2000, share=0.2, jitter=1e-7, seed=0):
+    """Rows duplicated before the split, with a relative jitter across ``k`` float columns."""
+    rng = np.random.default_rng(seed)
+    d = pd.DataFrame({f"x{i}": rng.normal(size=n) for i in range(k)})
+    d["y"] = rng.integers(0, 2, n)
+    copies = d.sample(frac=share, random_state=seed).copy()
+    for c in (f"x{i}" for i in range(k)):
+        copies[c] = copies[c] * (1 + jitter)
+    full = pd.concat([d, copies], ignore_index=True)
+    full = full.sample(frac=1.0, random_state=seed + 1).reset_index(drop=True)
+    full["sid"] = [f"s{i}" for i in range(len(full))]
+    cut = int(len(full) * 0.75)
+    return {"train": full.iloc[:cut].copy(), "test": full.iloc[cut:].copy()}
+
+
+def test_pre_split_jittered_copies_still_warn(case):
+    """Across 40 columns a 1e-7 jitter breaks the fine comparison, so the repeat warning has to
+    read the 14-bit one too, or a copy made before the split is an all-clear."""
+    r = case.run(_pre_split_jittered(40), LABEL_ONLY)
+    assert not r.failed("duplicates.near_cross_split")
+    assert r.failed("duplicates.repeated_across_splits")
+
+
 
 def _dense_segment(seed, M=3_000_000, n_train=15_000, n_test=5_000):
     """Clean train over a wide range, evaluation from the dense low tail of the same shape."""
