@@ -1076,6 +1076,15 @@ def test_chance_collisions_stay_quiet_on_a_small_train(case, n, train):
     assert _near_quiet(case, _keyed(_repeating(0.0), n=n, train=train))
 
 
+def test_copies_are_counted_not_held_to_a_share_on_a_large_train(case):
+    """200 copies in a 50,000-row test is 0.4%: the second look asks for rows, so a small share
+    of a large split is still found."""
+    def cols(rng, n):
+        return {f"a{i}": rng.normal(size=n) for i in range(4)}
+    frames = _keyed(cols, n=200_000, train=150_000)
+    assert not _near_quiet(case, _copy_into_train(frames, 200))
+
+
 @pytest.mark.parametrize("coarse_first", [True, False], ids=["coarse-first", "fine-first"])
 def test_copies_are_found_whatever_the_order_of_columns(case, coarse_first):
     def columns(rng, n):
@@ -1433,15 +1442,53 @@ def _copies_with_key(n: int, share: float, seed: int = 0) -> dict[str, pd.DataFr
                       "y": rng.integers(0, 2, n)})
     d = pd.concat([d, d.sample(frac=share, random_state=seed)], ignore_index=True)
     d = d.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    d["rid"] = rng.permutation(len(d))
+    d["rid"] = [f"r{i}" for i in range(len(d))]   # a string id, so 10-bit rounding can't collide
     cut = len(d) * 3 // 4
     return {"train": d.iloc[:cut], "test": d.iloc[cut:]}
 
 
-@pytest.mark.parametrize("share", [0.2, 0.5, 1.0])
-def test_copies_made_before_the_split_are_not_called_chance(case, share):
+@pytest.mark.parametrize("share", [0.05, 0.2, 0.5, 1.0])
+def test_copies_made_before_the_split_are_reported_as_repeats(case, share):
+    """Copies made before the split also repeat inside train, at the same per-pair rate, so the
+    match is reported as a repeat, not as more cross-split matches than the data explains."""
     r = case.run(_copies_with_key(4000, share), {**LABEL_ONLY})
-    assert r.failed("duplicates.near_cross_split")
+    assert r.failed("duplicates.repeated_across_splits")
+    assert not r.failed("duplicates.near_cross_split")
+
+
+ORDERS_SHAPES = ["price/tax", "price/tax/qty", "price/tax/qty/cat", "a=100+b",
+                 "tempC/tempF", "integer a/2a"]
+
+
+@pytest.mark.parametrize("shape", ORDERS_SHAPES, ids=ORDERS_SHAPES)
+def test_a_derived_or_coarse_column_alone_is_not_a_near_copy(case, shape):
+    """A rounded amount with a column derived from it has far fewer distinct values than the
+    mantissa, so the shuffled chance collapses while real rows collide: the matches must also
+    beat the train's own repeats, and what is left is a repeat warning, not a copy claim."""
+    n = 20_000
+    rng = np.random.default_rng(0)
+    if shape.startswith("price"):
+        price = np.round(rng.uniform(1, 500, n), 2)
+        d = pd.DataFrame({"price": price, "tax": np.round(0.2 * price, 2)})
+        if "qty" in shape:
+            d["qty"] = rng.integers(1, 6, n)
+        if "cat" in shape:
+            d["cat"] = rng.choice(list("abcd"), n)
+    elif shape == "a=100+b":
+        a = 100 + rng.normal(size=n)
+        d = pd.DataFrame({"a": a, "b": a})
+    elif shape == "tempC/tempF":
+        tc = rng.normal(20, 5, n)
+        d = pd.DataFrame({"tc": tc, "tf": 1.8 * tc + 32})
+    else:
+        a = rng.integers(0, 100_001, n).astype("float64")
+        d = pd.DataFrame({"a": a, "b": 2 * a})
+    d.insert(0, "sid", [f"s{i}" for i in range(n)])
+    d["y"] = rng.integers(0, 2, n)
+    frames = {"train": d.iloc[:15_000], "test": d.iloc[15_000:]}
+    r = case.run(frames, LABEL_ONLY)
+    assert not r.failed("duplicates.near_cross_split")
+    assert r.failed("duplicates.repeated_across_splits")
 
 
 def test_a_feature_that_looks_like_a_key_does_not_hide_copies(case):
