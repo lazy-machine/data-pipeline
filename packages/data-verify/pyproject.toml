@@ -1,6 +1,6 @@
 [project]
 name = "data-verify"
-version = "0.3.0"
+version = "0.4.0"
 description = "Leakage and poisoning gate for data-pipeline projects: verifies processed data and train/val/test splits before training"
 readme = "README.md"
 requires-python = ">=3.13"

@@ -745,6 +745,10 @@ def test_status_line_names_the_warnings(tmp_path):
 
 def test_status_line_has_no_warned_key_without_warnings(tmp_path):
     root = make_project(tmp_path / "c", leak=False)
+    toml = root / "pipeline.toml"
+    toml.write_text(toml.read_text().replace(
+        'params = { label = "y",',
+        'params = { checks = { "temporal.undeclared_time" = "off" }, label = "y",'))
     res = run_pipeline(root)
     assert "warnings=0" in res.stdout and "warned=" not in res.stdout
 

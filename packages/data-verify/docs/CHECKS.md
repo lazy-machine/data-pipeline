@@ -126,6 +126,12 @@ Options: `allow_equal = True`
 
 **Features were observed by the row's time.** Each column in params.point_in_time holds when a feature (or a joined record) was observed. It must not be after the row's params.time: a feature from the future is unavailable at prediction time.
 
+#### `temporal.undeclared_time` (warn)
+
+**Date-like columns are declared as params.time.** Runs when params.time is not set. Looks for date columns with at least `min_distinct` values: date types, and text such as 2024-01-31, 2024-01, 31/01/2024, 31.01.2024, Jan 31, 2024, Jan 2024, 31 Jan 2024, 31-Jan-24 or Wed, 31 Jan 2024, with a year from 1900 to 2100. Numbers are not read as dates, so epoch times and 20240131 pass. Without params.time no temporal check runs, so a random split of time-dependent data looks fine. Declaring the column turns on the temporal checks; if the rows really don't depend on time, turn this check off.
+
+Options: `min_distinct = 20`
+
 ### duplicates
 
 #### `duplicates.cross_split` (error)
@@ -136,9 +142,15 @@ Options: `max_fraction = 0.0`, `include_label = False`, `baseline = True`, `rati
 
 #### `duplicates.near_cross_split` (warn)
 
-**No near-copy of an example appears in two splits.** Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is about 3 significant digits) and normalising text (case, punctuation, spacing). Catches copies that went through a lossy round trip, re-encoding or light editing. Exact copies are not counted again. Same group baseline as duplicates.cross_split.
+**No near-copy of an example appears in two splits.** Like duplicates.cross_split, after rounding numbers to `bits` bits of mantissa (10 is about 3 significant digits) and normalising text (case, punctuation, spacing). Catches copies that went through a lossy round trip, re-encoding or light editing. Exact copies are not counted again. Same group baseline as duplicates.cross_split. It compares all columns, then again without the columns acting as keys, so a copy with a new id still matches: whole numbers distinct on almost every row, and short text, single tokens such as hashes, or entity-named whole numbers with at least 50 values, distinct on at least `key_share` of rows. The report lists them in `ignored_keys`. Without them rows can match by chance, so the second comparison asks for more evidence: a value at most 5 training rows have in a column where at least half the values are distinct, or -- when no single column is distinctive enough -- the whole row without the keys; numbers equal to ceil(log2(train rows)) + 7 bits of mantissa, between 20 and 48 (about 6 significant digits at 15,000 training rows and 8 at 150,000); at least 10 matched rows; and at least 4 standard errors more matches than the two splits' own repeats predict. That last bar is the load-bearing one, and it is wider than the counts' nominal standard error because they are overdispersed: on clean data whose features repeat heavily it still fires on about 0.3% of runs. The allowance is the larger of what each side's own repeat rate predicts for the pair, at the same per-pair rate over the other split's size. A copy added to the earlier split occurs in the evaluation split, so it neither moves the evaluation split's rate nor counts in the earlier split's own repeats: it is not what the repeats are measured against and cannot hide itself there, up to 5 placements (a sixth copy stops its value being rare, see below). An evaluation split that sits where the features are dense raises the allowance and is explained. The shuffled-column share is only a floor under it, because shuffling the columns apart forgets how they relate. With `baseline = false` there is no allowance and the coarse comparison is skipped. A copy jittered past the fine precision still agrees to about 4 significant digits, so a further comparison at 14 bits needs the same, with the same null. Between them the comparisons find exact copies and jitter up to about 1e-5 relative when at least 10 rows match; a handful of copies is below the floor, whatever the jitter. Rows that match no more often than the splits' own repeats are not reported here: duplicates.repeated_across_splits warns about them, because a copy made before the split repeats inside the evaluation split too, and coarse columns that repeat by nature look the same. So under a new key a copy must almost carry the same numbers, unless the keys are declared (`params.id` and `params.group`), which leaves only the comparison at `bits`. It doesn't find a copy made before the split (the other check warns), a row copied more than 5 times in the earlier split (its value stops being rare), a copy of a common value, a copy given a fresh timestamp or other per-row value, or copies in data with only coarse or low-entropy columns whose rows still repeat, unless `columns` leaves that column out. When nothing is left to compare once the keys are ignored, the check skips with a message telling you to declare `params.id`.
 
-Options: `max_fraction = 0.0`, `bits = 10`, `baseline = True`, `ratio = 2.0`, `columns = []`
+Options: `max_fraction = 0.0`, `bits = 10`, `baseline = True`, `ratio = 2.0`, `columns = []`, `key_share = 0.02`
+
+#### `duplicates.repeated_across_splits` (warn)
+
+**Rows that repeat across splits are not called copies.** The other half of the comparison without key columns: rows that match across splits no more often than the two splits' own repeats predict. A copy made before the split repeats inside the evaluation split too, and coarse columns repeat by nature, so this warns and never claims copies. It uses the same key columns, `key_share`, rarity rule and null as duplicates.near_cross_split, and reads both of its comparisons: the fine one and the 14-bit one, which keeps seeing a copy whose jitter across many columns broke the fine match. `baseline = false` lifts the comparison and leaves it to that check, and `columns` is compared exactly, not second-guessed. It reports the pairs that duplicates.near_cross_split does not: those within the splits' own repeats, and -- when that check is off or its own settings allow them -- rows that match across splits more than the repeats explain. A warning needs at least 10 matched rows and more than `max_fraction` and 0.5% of the evaluation split's rows. The report lists the split pairs and the share the splits' own repeats predict.
+
+Options: `max_fraction = 0.0`, `baseline = True`, `ratio = 2.0`, `columns = []`, `key_share = 0.02`
 
 #### `duplicates.text_cross_split` (error)
 
@@ -265,6 +277,12 @@ Options: `z = 20.0`, `ratio = 3.0`, `slack = 0.005`
 **No rare value or token ties to one class in training only.** Backdoor search. For each classification label, looks for feature values (categories, small-integer values, and words in text columns) that occur in at most `max_coverage` of training rows, at least `min_support` times, and come with one class in at least `purity` of them, while the same value in evaluation splits (at least `min_eval_support` rows) is tied to that class at least `min_drop` less often, or is (nearly) absent from them although their size predicts it there (so few rows has a Poisson chance below 0.001). Such a trigger in train that does not hold elsewhere is what a backdoor (trigger + target label) poisoning attack leaves behind.
 
 Options: `min_support = 20`, `purity = 0.98`, `max_coverage = 0.2`, `min_drop = 0.3`, `min_eval_support = 5`
+
+#### `poisoning.label_consistency` (warn)
+
+**Training labels fit the features as well as evaluation labels.** Fits one linear model on half of the training rows, then compares how well it predicts the other half with how well it predicts each evaluation split. Corrupted training labels weaken that relationship in train only, so evaluation labels fit better than held-out training labels by at least `min_gap` and `z` standard errors. Also fires when the model predicts evaluation labels backwards. Needs a binary or regression label and numeric features that predict it (at least `min_signal` on a 0-1 scale: 2 * AUC - 1 for a binary label, rank correlation for regression). With params.group the errors are estimated over entities, and a split with a single entity is not compared. Sees label noise of about 15% and above on a few thousand rows, and targeted flips of a subgroup; not small flip rates or a backdoor with a rare trigger. A shift in class balance doesn't fire it. Features that vary more in an evaluation split than in train can, with either kind of label, because the label is then easier to predict.
+
+Options: `z = 3.0`, `min_gap = 0.05`, `min_signal = 0.1`, `min_rows = 100`
 
 ### drift
 

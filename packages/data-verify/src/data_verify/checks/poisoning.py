@@ -11,10 +11,10 @@ import numpy as np
 import pandas as pd
 
 from ..core import (
-    check, examples, failed, fmt, frac, jsonable, kind, numeric_values, passed, skipped, value_set,
-    value_texts,
+    check, examples, failed, fmt, frac, jsonable, kind, numeric_values, passed, row_hashes,
+    skipped, value_set, value_texts,
 )
-from ..stats import binned_counts, psi, robust_scale, robust_z
+from ..stats import auc, binned_counts, prepare_label, psi, robust_scale, robust_z, spearman
 
 # -- labels --------------------------------------------------------------------------------
 
@@ -353,6 +353,165 @@ def _token_rows(s: pd.Series) -> dict:
         for tok in set(_TOKEN.findall(text)):
             rows.setdefault(tok, []).append(i)
     return {k: np.asarray(x) for k, x in rows.items()}
+
+
+_SPEARMAN_SE = 1.03  # Fieller: a Fisher-transformed Spearman has variance about 1.06 / (n - 3)
+
+
+def _matrix(d: pd.DataFrame, feats: list[str], stats: dict[str, tuple[float, float]]):
+    cols = [np.ones(len(d))]
+    for f in feats:
+        center, scale = stats[f]
+        cols.append(np.clip(np.nan_to_num((numeric_values(d[f]) - center) / scale), -5, 5))
+    return np.column_stack(cols)
+
+
+def _agreement(pred: np.ndarray, y: np.ndarray, task: str):
+    """How well ``pred`` orders ``y``: (score, a value to compare, its standard error), or None.
+
+    The score is 0 for no signal and 1 for perfect. Binary labels use AUC (as 2 * AUC - 1),
+    because it doesn't depend on the share of positives, so a change in class balance
+    between splits is not mistaken for corrupted labels. A correlation does depend on it.
+    """
+    if task == "binary":
+        a = auc(pred, y)
+        if np.isnan(a):  # a class is missing
+            return None
+        pos = int(y.sum())
+        neg = len(y) - pos
+        q1, q2 = a / (2 - a), 2 * a ** 2 / (1 + a)   # Hanley and McNeil, 1982
+        var = (a * (1 - a) + (pos - 1) * (q1 - a ** 2) + (neg - 1) * (q2 - a ** 2)) / (pos * neg)
+        score = 2 * a - 1
+        return score, score, 2 * math.sqrt(max(var, 0.0))
+    r = spearman(pred, y)
+    if np.isnan(r):
+        return None
+    fisher = float(np.arctanh(np.clip(r, -0.999, 0.999)))
+    return r, fisher, _SPEARMAN_SE / math.sqrt(len(y) - 3)
+
+
+def _coded(d: pd.DataFrame, lbl: str, task: str, classes: list[str]):
+    """Labels as numbers, and which rows have one. Binary labels are coded by train's classes,
+    so codes mean the same in every split and a class train never saw is left out."""
+    if task != "binary":
+        y, ok, _ = prepare_label(d[lbl], task)
+        return y[ok].astype(float), ok
+    present = d[lbl].notna().to_numpy()
+    text = value_texts(d[lbl][present]).to_numpy()
+    known = np.isin(text, classes)
+    ok = present.copy()
+    ok[present] = known
+    return (text[known] == classes[1]).astype(float), ok
+
+
+def _entities(v, d: pd.DataFrame) -> np.ndarray | None:
+    cols = [c for c in v.spec.group if c in d.columns]
+    return np.unique(row_hashes(d, cols), return_inverse=True)[1] if cols else None
+
+
+def _entity_se(pred, y, task: str, entity: np.ndarray) -> float:
+    """Delete-a-block jackknife over entities. Rows of one entity aren't independent, so an
+    error computed from the row count understates how much a score can vary."""
+    n = int(entity.max()) + 1
+    block = np.random.default_rng(0).integers(0, min(20, n), n)[entity]
+    values = [a[1] for b in np.unique(block)
+              if (a := _agreement(pred[block != b], y[block != b], task)) is not None]
+    if len(values) < 2:
+        return math.inf
+    return math.sqrt((len(values) - 1) * float(np.var(values)))
+
+
+def _inconsistent(held: float, ev: float, z: float, opt: dict) -> bool:
+    """Evaluation labels fit better than held-out training labels, or the opposite way round."""
+    weaker = ev >= opt["min_signal"] and ev - held >= opt["min_gap"] and z >= opt["z"]
+    backwards = held >= opt["min_signal"] and ev <= -opt["min_signal"] and z <= -opt["z"]
+    return weaker or backwards
+
+
+@check("poisoning.label_consistency", "poisoning", "warn",
+       "Training labels fit the features as well as evaluation labels",
+       z=3.0, min_gap=0.05, min_signal=0.1, min_rows=100)
+def label_consistency(v, opt):
+    """Fits one linear model on half of the training rows, then compares how well it predicts
+    the other half with how well it predicts each evaluation split. Corrupted training labels
+    weaken that relationship in train only, so evaluation labels fit better than held-out
+    training labels by at least `min_gap` and `z` standard errors. Also fires when the model
+    predicts evaluation labels backwards. Needs a binary or regression label and numeric
+    features that predict it (at least `min_signal` on a 0-1 scale: 2 * AUC - 1 for a binary
+    label, rank correlation for regression). With params.group the errors are estimated over
+    entities, and a split with a single entity is not compared. Sees label noise of about 15%
+    and above on a few thousand rows, and targeted flips of a subgroup; not small flip rates
+    or a backdoor with a rare trigger. A shift in class balance doesn't fire it. Features that
+    vary more in an evaluation split than in train can, with either kind of label, because the
+    label is then easier to predict."""
+    if not v.labels or len(v.splits) < 2:
+        return skipped("needs a label and at least two splits")
+    feats = v.numeric_features()
+    if not feats:
+        return skipped("no numeric features")
+    hits, compared = [], 0
+    for lbl in v.labels:
+        task = v.task(lbl)
+        if lbl not in v.train.columns or task == "multiclass":
+            continue
+        train = v.sample(v.train_name)
+        classes = sorted(set(value_texts(train[lbl].dropna()))) if task == "binary" else []
+        if task == "binary" and len(classes) != 2:
+            continue
+        y, ok = _coded(train, lbl, task, classes)
+        train = train[ok]
+        if len(train) < 2 * opt["min_rows"]:
+            continue
+        stats = {f: robust_scale(numeric_values(train[f])) for f in feats}
+        stats = {f: (c if np.isfinite(c) else 0.0, s if np.isfinite(s) and s > 0 else 1.0)
+                 for f, (c, s) in stats.items()}
+        fit = np.random.default_rng(v.spec.seed).random(len(train)) < 0.5
+        x = _matrix(train, feats, stats)
+        coef = np.linalg.lstsq(x[fit], y[fit], rcond=None)[0]
+        held_pred = x[~fit] @ coef
+        held = _agreement(held_pred, y[~fit], task)
+        if held is None:
+            continue
+        held_entity = _entities(v, train[~fit])
+        held_se = held[2] if held_entity is None else \
+            max(held[2], _entity_se(held_pred, y[~fit], task, held_entity))
+        if math.isinf(held_se):   # too few entities to say how far a score can vary
+            continue
+        for name, d in v.others():
+            if lbl not in d.columns:
+                continue
+            d = v.sample(name)
+            ye, oke = _coded(d, lbl, task, classes)
+            if oke.sum() < opt["min_rows"]:
+                continue
+            d = d[oke]
+            pred = _matrix(d, feats, stats) @ coef
+            ev = _agreement(pred, ye, task)
+            if ev is None or max(held[0], ev[0]) < opt["min_signal"]:
+                continue   # the features predict too little for this to say anything
+            ev_entity = _entities(v, d)
+            ev_se = ev[2] if ev_entity is None else \
+                max(ev[2], _entity_se(pred, ye, task, ev_entity))
+            if math.isinf(ev_se):
+                continue
+            compared += 1
+            z = (ev[1] - held[1]) / math.hypot(held_se, ev_se) if held_se or ev_se else 0.0
+            if _inconsistent(held[0], ev[0], z, opt):
+                hits.append({"label": lbl, "split": name, "held_out_train": fmt(held[0]),
+                             "evaluation": fmt(ev[0]), "z": fmt(z)})
+    if not compared:
+        return skipped("needs a binary or regression label, numeric features that predict it "
+                       "and enough rows in each split (with params.group, more than one entity in "
+                       "each)")
+    if hits:
+        return failed("labels fit the features differently in train and evaluation: " + ", ".join(
+            f"{h['label']}: train {h['held_out_train']}, {h['split']} {h['evaluation']}"
+            for h in hits),
+            "Check first whether the features vary more in one split, which makes labels easier "
+            "to predict there and also causes this. If not, training labels may be corrupted "
+            "or flipped: compare them with their source.", comparisons=hits)
+    return passed(f"training labels fit the features as well as evaluation labels "
+                  f"({compared} comparison(s))")
 
 
 # -- drift ---------------------------------------------------------------------------------

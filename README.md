@@ -28,7 +28,7 @@ and the pipeline keeps going (their dependents get skipped). A critical failure 
 ▶ iris · 7 steps · examples/iris/pipeline.toml
 [1/7] clean     ↷ cached            rows=149 dropped=1 classes=3
 [2/7] split     ↷ cached            train=111 test=38
-[3/7] verify    ↷ cached            checks=28 passed=27 warnings=1 skipped=24 warned=drift.features
+[3/7] verify    ↷ cached            checks=29 passed=28 warnings=1 skipped=26 warned=drift.features
 [4/7] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
 ┌─ eda: exit code 1 ─ analysis:explore
 Traceback (most recent call last):

@@ -159,7 +159,7 @@ previous run are deleted first, so a stale report never survives a failed run.
 
 ```jsonc
 {
-  "tool": "data-verify", "version": "0.3.0",
+  "tool": "data-verify", "version": "0.4.0",
   "passed": false,                       // false = the step failed
   "fail_on": "error",
   "blocking": ["split.group_overlap"],   // ids of the checks that blocked
@@ -355,6 +355,20 @@ never show them, promote them:
 
 Or set `fail_on = "warn"` to block on every warning.
 
+`duplicates.near_cross_split` is a candidate for `"error"` when you control how rows are
+copied: a copy added to the training split cannot hide itself in its keyless second look, and
+that look fires on none of the 61 clean scenarios measured at 60 seeds each. It is not free of
+false alarms though. On clean data whose features repeat heavily (about 8% of rows) it fires
+on about 0.3% of runs (11 of 3,600 over nine row-count cells at 400 seeds each; worst cell
+3/400), and the comparison it runs on all columns first fires on dense or partly overlapping
+evaluation segments in 1–10 of 60 seeds — on `main` and here alike — because those shapes
+really do share rows. Run it as a warning first and look at what it flags.
+
+Don't promote `poisoning.label_consistency`, alone or through `"poisoning.*" = "error"`, unless
+your splits are drawn from the same distribution. It also fires on clean data when the
+features vary more in an evaluation split than in train (a covariate shift, such as a wider
+spread of values), and it would then block a run that has nothing wrong with its labels.
+
 ### Unlabeled test split
 
 ```toml
@@ -395,9 +409,52 @@ A pass means that no blocking check fired, not that the data is clean.
 
 - **Undeclared roles.** Without `group` or `time`, leaks across entities or across time at
   most warn. With `label` alone, a grouped dataset split by row passes with a warning.
-- **Poisoning.** Random or targeted label flips, and a backdoor with a rare trigger, can look
-  like ordinary noise. Other injected values and rows mostly warn. `schema.ranges`,
+- **Poisoning.** `poisoning.label_consistency` warns about label noise of roughly 15% and up
+  on a few thousand rows, and about targeted flips of a subgroup, when numeric features
+  predict a binary or regression label. Lower flip rates and a backdoor with a rare trigger
+  look like ordinary noise. A shift in class balance doesn't fire it, but features that vary
+  more in an evaluation split can, with either kind of label, so read it as a prompt to
+  compare labels with their source, not as proof. Seen on real data: a clean phoneme segment
+  split (`V1_top25`, test the top quartile) fired 5/5 and adult `race_nonwhite` 1/5, both by
+  that covariate shift and not by label noise. Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
+- **Near-copies under a new key.** With a unique key column that isn't declared as `id`, the
+  check also compares the other columns, at two precisions. The fine comparison follows the
+  size of the training split: numbers equal to `ceil(log2(train rows)) + 7` bits of mantissa,
+  between 20 and 48 (about 6 significant digits at 15,000 training rows, 8 at 150,000), and it
+  needs at least 4 standard errors more matches than the two splits' own repeats predict (wider
+  than nominal because the counts are overdispersed). That last bar is why a rounded or derived
+  column alone is not treated as a copy: the
+  shuffled chance estimate collapses, but the splits repeat those vectors as often as they
+  share them. The allowance is the larger of what each split's own repeats predict for the
+  pair, and a copy added to the training split occurs in the evaluation split, so it is left
+  out of both: it is not what the repeats are measured against and cannot hide itself, up to 5
+  placements (a sixth copy stops the value being rare). An evaluation split that sits where the
+  features are dense is
+  explained. A copy jittered past the fine precision still agrees to about 4 significant
+  digits, so a comparison at 14 bits needs the same. When no single column is distinct enough
+  to go on, the whole row without the keys is the evidence. Between them they find exact
+  copies and jitter up to about 1e-5 relative when at least 10 rows match; a handful of copies
+  is below the floor, whatever the jitter. `duplicates.repeated_across_splits` warns about
+  every split pair that `near_cross_split` does not report: rows that match no more often than
+  the splits' own repeats (a warning, not a copy claim), and — when `near_cross_split` is off
+  or its own settings let the pair through — rows that match more than those repeats explain.
+  The first covers copies made before the split (which also repeat inside the evaluation
+  split) and coarse columns that repeat by nature, including a column rounded to about 4
+  decimals with another derived from it. Post-split copies in a frame whose rows still repeat — a 5-item
+  Likert scale, correlated Likert items, one-hot categories, a sparse binary matrix, a small
+  grid, zero-inflated columns, or clustered rows — are 0/20 on the second look and 20/20 on
+  the warning with 100 copies placed three times, so only the warning sees them; a denser
+  frame (10 Likert items, a 30-column 20%-dense matrix, a 6-column 0-9 grid) does fire. Copies
+  of a common vector fire neither check. The comparison on all columns runs first and fires on
+  its own: it hits dense and partly overlapping evaluation segments in 1–10 of 60 seeds, at the
+  same rate on `main` and here. The keyless look is not silent either: on clean data whose
+  features repeat heavily it fires on about 0.3% of runs. So promoting this check to `error` is
+  safe with respect to what it claims, but not free of false alarms. Copies are
+  still missed when fewer than 10 rows match, when a copy is jittered by 1e-4 or more or
+  re-measured, when a row is copied more than 5 times, when a copy carries a common value or a
+  fresh timestamp or other per-row value, and in data whose columns are all coarse; declaring
+  the keys (`id`, `group`) leaves only the comparison at `bits`. These all warn at best.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
@@ -419,7 +476,7 @@ pipeline after the split, since the gate can't confirm that from the data.
 
 ## What it checks
 
-52 built-in checks. `data-verify checks` lists them with their options, and
+55 built-in checks. `data-verify checks` lists them with their options, and
 [docs/CHECKS.md](docs/CHECKS.md) describes each one. By area:
 
 **split**
@@ -431,14 +488,18 @@ pipeline after the split, since the gate can't confirm that from the data.
 **duplicates**
 - Blocks: identical feature rows in two splits (beyond what different entities share by
   chance in train); the same text (normalised) in two splits.
-- Warns: near-copies across splits (rounded numbers, normalised text); mass-repeated rows
-  in train; identical rows with conflicting labels.
+- Warns: near-copies across splits (rounded numbers, normalised text, ignoring undeclared
+  key columns); the split pairs that check does not report — rows that repeat across and
+  within splits (copies made before the split, or coarse columns, reported as repeats) and,
+  when it is off or tolerates them, rows that match more than the repeats explain;
+  mass-repeated rows in train; identical rows with conflicting labels.
 
 **temporal**
 - Blocks: rows outside `time_bounds`; splits overlapping in time (or per group); labels
   known only after the evaluation period starts; rows dated after their own outcome;
   features observed after the row's time; unparseable dates.
-- Warns: time-stamped splits overlapping when no time rule is declared.
+- Warns: time-stamped splits overlapping when no time rule is declared; date-like columns
+  when `time` is not declared.
 
 **target**
 - Blocks: label/key/time columns or `forbidden` patterns used as features; a feature equal
@@ -465,7 +526,8 @@ pipeline after the split, since the gate can't confirm that from the data.
 
 **poisoning**
 - Blocks: pinned input changed (`pins`).
-- Warns: excess of extreme values in train vs held-out data; backdoor-like value or text
+- Warns: training labels fitting the features worse than evaluation labels; excess of
+  extreme values in train vs held-out data; backdoor-like value or text
   token tied to one class in train only.
 
 **schema / integrity**

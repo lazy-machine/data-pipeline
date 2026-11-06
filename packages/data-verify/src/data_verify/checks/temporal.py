@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from ..core import check, examples, failed, frac, jsonable, passed, skipped
 from ..spec import SpecError
+
+_DATE_TEXT = re.compile(
+    r"\s*([A-Za-z]{3,9},? )?"                                    # a weekday
+    r"(\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?"                         # 2024-01-31, 2024-01
+    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\.\d{1,2}\.\d{4}"    # 31/01/2024, 31.01.2024
+    r"|[A-Za-z]{3,9}\.? (\d{1,2},? )?\d{4}"                       # Jan 31, 2024, Jan 2024
+    r"|\d{1,2}[- ][A-Za-z]{3,9}\.?,?[- ]\d{2,4})([T\s]|$)")        # 31 Jan 2024, 31-Jan-24
 
 
 def _need_time(v):
@@ -280,3 +289,41 @@ def point_in_time(v, opt):
                       "Join features as of the row's time (merge_asof with direction="
                       "'backward'), never the latest value.", columns=bad)
     return passed(f"{len(cols)} observation-time column(s) respect the row's time")
+
+
+def _date_like(v, col: str) -> bool:
+    if v.kind(col) == "datetime":
+        return True
+    if v.kind(col) != "string":
+        return False
+    text = v.train[col].dropna().astype("string").head(200)
+    if not len(text) or text.map(lambda x: bool(_DATE_TEXT.match(x))).mean() < 0.95:
+        return False
+    # the pattern only looks like a date: Unit 6 1005 and 55-5-1005 fit it too
+    parsed = pd.to_datetime(text, errors="coerce", format="mixed", utc=True)
+    return bool(parsed.dt.year.between(1900, 2100).mean() >= 0.95)
+
+
+@check("temporal.undeclared_time", "temporal", "warn",
+       "Date-like columns are declared as params.time", min_distinct=20)
+def undeclared_time(v, opt):
+    """Runs when params.time is not set. Looks for date columns with at least `min_distinct`
+    values: date types, and text such as 2024-01-31, 2024-01, 31/01/2024, 31.01.2024,
+    Jan 31, 2024, Jan 2024, 31 Jan 2024, 31-Jan-24 or Wed, 31 Jan 2024, with a year from 1900
+    to 2100. Numbers are not read as dates, so epoch times and 20240131 pass. Without
+    params.time no temporal check runs, so a random split of time-dependent data looks fine.
+    Declaring the column turns on the temporal checks; if the rows really don't depend on
+    time, turn this check off."""
+    if v.spec.time:
+        return skipped("params.time is set")
+    if len(v.splits) < 2:
+        return skipped("one split only")
+    roles = set(v.spec.role_columns())
+    found = [c for c in v.common_columns() if c not in roles and _date_like(v, c)
+             and v.train[c].nunique() >= opt["min_distinct"]]
+    if found:
+        return failed(f"date-like column(s) {', '.join(found)} but params.time is not set",
+                      "Set params.time to the row's timestamp, and declare time_order or "
+                      "time_bounds, so the gate can check that no split sees the future of "
+                      "another.", columns=found)
+    return passed("no undeclared date-like columns")
