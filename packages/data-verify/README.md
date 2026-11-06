@@ -435,11 +435,13 @@ A pass means that no blocking check fired, not that the data is clean.
   digits, so a comparison at 14 bits needs the same. When no single column is distinct enough
   to go on, the whole row without the keys is the evidence. Between them they find exact
   copies and jitter up to about 1e-5 relative when at least 10 rows match; a handful of copies
-  is below the floor, whatever the jitter. Rows that match no more often than the splits' own
-  repeats get a warning, not a copy claim, from `duplicates.repeated_across_splits`: that
-  covers copies made before the split (which also repeat inside the evaluation split) and
-  coarse columns that repeat by nature, including a column rounded to about 4 decimals with
-  another derived from it. Post-split copies in a frame whose rows still repeat — a 5-item
+  is below the floor, whatever the jitter. `duplicates.repeated_across_splits` warns about
+  every split pair that `near_cross_split` does not report: rows that match no more often than
+  the splits' own repeats (a warning, not a copy claim), and — when `near_cross_split` is off
+  or its own settings let the pair through — rows that match more than those repeats explain.
+  The first covers copies made before the split (which also repeat inside the evaluation
+  split) and coarse columns that repeat by nature, including a column rounded to about 4
+  decimals with another derived from it. Post-split copies in a frame whose rows still repeat — a 5-item
   Likert scale, correlated Likert items, one-hot categories, a sparse binary matrix, a small
   grid, zero-inflated columns, or clustered rows — are 0/20 on the second look and 20/20 on
   the warning with 100 copies placed three times, so only the warning sees them; a denser
@@ -487,9 +489,10 @@ pipeline after the split, since the gate can't confirm that from the data.
 - Blocks: identical feature rows in two splits (beyond what different entities share by
   chance in train); the same text (normalised) in two splits.
 - Warns: near-copies across splits (rounded numbers, normalised text, ignoring undeclared
-  key columns); rows that repeat across and within splits (copies made before the split, or
-  coarse columns, reported as repeats); mass-repeated rows in train; identical rows with
-  conflicting labels.
+  key columns); the split pairs that check does not report — rows that repeat across and
+  within splits (copies made before the split, or coarse columns, reported as repeats) and,
+  when it is off or tolerates them, rows that match more than the repeats explain;
+  mass-repeated rows in train; identical rows with conflicting labels.
 
 **temporal**
 - Blocks: rows outside `time_bounds`; splits overlapping in time (or per group); labels

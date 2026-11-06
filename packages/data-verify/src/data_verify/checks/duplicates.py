@@ -9,8 +9,10 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from ..core import check, failed, frac, passed, row_hashes, skipped
+from ..core import REGISTRY, check, failed, frac, passed, resolve_check, row_hashes, skipped
 from .splits import _ENTITY_NAME
+
+_NEAR = "duplicates.near_cross_split"
 
 # Without keys, a match needs more evidence than a match on every column does.
 _RARE_VALUE = 5  # training rows that may share a value for a match on it to mean something
@@ -156,6 +158,22 @@ def _pair_stats(v, a: str, b: str, cols: tuple[str, ...], rest: tuple[str, ...],
     return {"rows": c, "self": s, "self_earlier": sa, "fraction": frac(c, n_b),
             "n_a": n_a, "n_b": n_b, "expected": expected, "sigma": math.sqrt(var),
             "example_rows_of_" + b: np.flatnonzero(cross)[:5].tolist()}
+
+
+def _near_reports(v, cols: tuple[str, ...]) -> set[str]:
+    """The split pairs duplicates.near_cross_split reports in this run under its own resolved
+    settings. Empty when it is off, compares only `columns`, or skips for want of a key: those
+    pairs are duplicates.repeated_across_splits's to report."""
+    cdef = REGISTRY[_NEAR]
+    severity, opt = resolve_check(_NEAR, v.spec, cdef.severity, cdef.options)
+    if severity == "off" or opt.get("columns"):
+        return set()
+    look = _second_look(v, opt, cols)
+    if not look or not look["ran"]:
+        return set()
+    more = set(_pair_verdicts(look["stats"], opt["max_fraction"], 0.0)[0])
+    more |= set(_pair_verdicts(look["cstats"], opt["max_fraction"], 0.0)[0])
+    return more
 
 
 def _pair_verdicts(stats: dict, max_fraction: float, min_share: float):
@@ -400,9 +418,12 @@ def repeated_across_splits(v, opt):
     duplicates.near_cross_split, and reads both of its comparisons: the fine one and the 14-bit
     one, which keeps seeing a copy whose jitter across many columns broke the fine match.
     `baseline = false` lifts the comparison and leaves it to that check, and `columns` is
-    compared exactly, not second-guessed. A warning needs at least 10 matched rows and more
-    than `max_fraction` and 0.5% of the evaluation split's rows. The report lists the split
-    pairs and the share the splits' own repeats predict."""
+    compared exactly, not second-guessed. It reports the pairs that duplicates.near_cross_split
+    does not: those within the splits' own repeats, and -- when that check is off or its own
+    settings allow them -- rows that match across splits more than the repeats explain. A
+    warning needs at least 10 matched rows and more than `max_fraction` and 0.5% of the
+    evaluation split's rows. The report lists the split pairs and the share the splits' own
+    repeats predict."""
     feats = tuple(v.features)
     if not feats:
         return skipped("no features")
@@ -415,31 +436,42 @@ def repeated_across_splits(v, opt):
     look = _second_look(v, opt, feats)
     if not look or not look["ran"]:
         return skipped("no key column, or nothing left to compare once the keys are ignored")
-    # near_cross_split reads both comparisons, so a pair it would report must not also be
-    # reported here: only the pairs that neither look calls more than the repeats explain.
-    more = set(_pair_verdicts(look["stats"], opt["max_fraction"], 0.0)[0])
-    more |= set(_pair_verdicts(look["cstats"], opt["max_fraction"], 0.0)[0])
-    fine = _pair_verdicts(look["stats"], opt["max_fraction"], _MIN_SHARE)[1]
-    coarse = _pair_verdicts(look["cstats"], opt["max_fraction"], _MIN_SHARE)[1]
-    repeats = [k for k in dict.fromkeys(fine + coarse) if k not in more]
+    # near_cross_split reports some pairs; the rest are this check's, so the two together cover
+    # every pair and neither depends on the other's settings being on or at their defaults.
+    reported = _near_reports(v, feats)
+    fine_more, fine = _pair_verdicts(look["stats"], opt["max_fraction"], _MIN_SHARE)
+    coarse_more, coarse = _pair_verdicts(look["cstats"], opt["max_fraction"], _MIN_SHARE)
+    beyond = [k for k in dict.fromkeys(fine_more + coarse_more) if k not in reported]
+    within = [k for k in dict.fromkeys(fine + coarse) if k not in reported]
+
+    def show(names):
+        out = []
+        for k in names:
+            st = look["stats"].get(k) or look["cstats"][k]
+            bits = " within 14 bits of mantissa" if k in coarse and k not in fine else ""
+            out.append(f"{k} {st['rows']} rows ({st['fraction']:.2%}){bits}")
+        return ", ".join(out)
+
     details = {"pairs": look["pairs"], "pairs_at_coarse_bits": look["coarse"],
                "ignored_keys": look["keys"], "chance": frac(look["chance"], 1),
                "repeated_in_train": frac(look["repeated_in_train"], 1)}
-    if repeats:
-        parts = []
-        for k in repeats:
-            st = look["stats"].get(k) or look["cstats"][k]
-            bits = " within 14 bits of mantissa" if k in coarse and k not in fine else ""
-            parts.append(f"{k} {st['rows']} rows ({st['fraction']:.2%}){bits}")
-        stats = [look["stats"].get(k) or look["cstats"][k] for k in repeats]
+    if beyond:
+        also = f"; also within them: {show(within)}" if within else ""
+        return failed(f"feature rows match across splits more than the splits' own repeats "
+                      f"explain: {show(beyond)} (ignoring key column(s) "
+                      f"{', '.join(look['keys'])}){also}; duplicates.near_cross_split is off "
+                      f"or allows this share, so nothing else reports them",
+                      "The model sees these evaluation examples during training. Deduplicate "
+                      "before splitting, or split by a group key that keeps copies together "
+                      "(params.group).", **details)
+    if within:
+        stats = [look["stats"].get(k) or look["cstats"][k] for k in within]
         own = max(st["expected"] / st["n_b"] for st in stats)
-        match = max(st["rows"] / st["n_b"] for st in stats)
-        return failed(f"feature rows repeat across and within splits: {', '.join(parts)} "
-                      f"(ignoring key column(s) {', '.join(look['keys'])}); those rows are "
-                      f"{match:.3%} of the evaluation split and the splits' own repeats predict "
-                      f"up to {own:.3%} match by chance, so this is within the data's own "
-                      f"repeats, not more than they explain: it can be rows copied before the "
-                      f"split or coarse columns that repeat by nature",
+        return failed(f"feature rows repeat across and within splits: {show(within)} "
+                      f"(ignoring key column(s) {', '.join(look['keys'])}); the splits' own "
+                      f"repeats predict up to {own:.3%} of rows match by chance, so this is "
+                      f"within the data's own repeats, not more than they explain: it can be "
+                      f"rows copied before the split or coarse columns that repeat by nature",
                       "If these rows were copied before the split, deduplicate before "
                       "splitting. If the repeats are legitimate (coarse columns), declare "
                       "params.id and params.group, or raise "

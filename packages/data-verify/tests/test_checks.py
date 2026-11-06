@@ -1665,6 +1665,50 @@ def test_pre_split_jittered_copies_still_warn(case):
     assert r.failed("duplicates.repeated_across_splits")
 
 
+def _leak(seed=0):
+    """150 of a 5,000-row test copied exactly into train under new ids (3% of the split)."""
+    return _repeated_copies(1_000_000_000, 15_000, 5_000, 150, 1, seed=seed)
+
+
+def _with_near(settings):
+    return {**LABEL_ONLY, "checks": {**LABEL_ONLY["checks"],
+                                     "duplicates.near_cross_split": settings}}
+
+
+def test_the_repeat_warning_covers_a_leak_when_near_cross_split_is_off(case):
+    """A pair may be left out of the repeat warning only if near_cross_split reports it. With that
+    check off nothing does, so this one must."""
+    r = case.run(_leak(), _with_near("off"))
+    assert r.status("duplicates.near_cross_split") == "off"
+    assert r.failed("duplicates.repeated_across_splits")
+
+
+def test_the_repeat_warning_covers_a_leak_near_cross_split_lets_through_by_fraction(case):
+    r = case.run(_leak(), _with_near({"max_fraction": 0.5}))
+    assert not r.failed("duplicates.near_cross_split")
+    assert r.failed("duplicates.repeated_across_splits")
+
+
+def test_the_repeat_warning_covers_a_leak_near_cross_split_tolerates_by_ratio(case):
+    r = case.run(_leak(seed=1), _with_near({"ratio": 1000.0}))
+    assert not r.failed("duplicates.near_cross_split")
+    assert r.failed("duplicates.repeated_across_splits")
+
+
+def test_the_repeat_warning_covers_a_leak_near_cross_split_skips_by_key_share(case):
+    """Raised past the id column's share, near_cross_split finds no key and skips its second look,
+    so the leak is this check's to report."""
+    r = case.run(_leak(), _with_near({"key_share": 1.5}))
+    assert not r.failed("duplicates.near_cross_split")
+    assert r.failed("duplicates.repeated_across_splits")
+
+
+def test_the_repeat_warning_does_not_double_report_at_default_settings(case):
+    r = case.run(_leak(), LABEL_ONLY)
+    assert r.failed("duplicates.near_cross_split")
+    assert not r.failed("duplicates.repeated_across_splits")
+
+
 
 def _dense_segment(seed, M=3_000_000, n_train=15_000, n_test=5_000):
     """Clean train over a wide range, evaluation from the dense low tail of the same shape."""
