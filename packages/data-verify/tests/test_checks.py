@@ -1555,8 +1555,9 @@ def test_correlated_floats_are_not_copies(case, noise):
     assert not r.failed("duplicates.near_cross_split")
 
 
-def test_coarse_columns_alone_make_no_claim_under_a_new_key(case):
-    """The documented limit: nothing tells a copy from a coincidence here."""
+def test_coarse_columns_alone_do_not_make_a_copy_claim_under_a_new_key(case):
+    """The documented limit: coarse columns repeat by nature, so nothing tells a copy within
+    them from a coincidence. The whole row is the rare evidence, and the repeats are named."""
     rng = np.random.default_rng(0)
     d = pd.DataFrame(rng.normal(size=(8000, 3)).round(1), columns=list("abc"))
     d["rid"] = [f"r{i}" for i in range(8000)]
@@ -1566,7 +1567,119 @@ def test_coarse_columns_alone_make_no_claim_under_a_new_key(case):
     r = case.run({"train": pd.concat([train, copies]), "test": test}, LABEL_ONLY)
     found = r.check("duplicates.near_cross_split")
     assert found["details"]["ignored_keys"] == ["rid"]
-    assert "pairs_without_keys" not in found["details"]
+    assert "pairs_without_keys" in found["details"]
+    assert found["status"] == "pass"
+    assert r.failed("duplicates.repeated_across_splits")
+
+
+def _repeated_copies(M, n_train, n_test, copies, seed=0):
+    """Post-split copies into a train whose features repeat naturally."""
+    rng = np.random.default_rng(seed)
+    n = n_train + n_test
+    a = rng.integers(0, M, n) / 7.3
+    d = pd.DataFrame({"sid": [f"s{i}" for i in range(n)], "a": a, "b": a * 3 + 1,
+                      "c": rng.integers(0, 3, n), "y": rng.integers(0, 2, n)})
+    frames = {"train": d.iloc[:n_train].copy(), "test": d.iloc[n_train:].copy()}
+    cp = frames["test"].head(copies).copy()
+    cp["sid"] = "N" + cp["sid"]
+    frames["train"] = pd.concat([frames["train"], cp], ignore_index=True)
+    return frames
+
+
+@pytest.mark.parametrize("M,n_train,n_test,copies", [(300_000, 15_000, 5_000, 200),
+                                                     (60_000, 15_000, 5_000, 1_000),
+                                                     (15_000, 15_000, 5_000, 5_000)])
+def test_copies_are_found_though_the_features_repeat_naturally(case, M, n_train, n_test, copies):
+    """A copy is not hidden by the earlier split's own repeats: the null is the evaluation
+    split's repeats scaled to the pair, and a copy the earlier split gained does not move it."""
+    assert not _near_quiet(case, _repeated_copies(M, n_train, n_test, copies))
+
+
+def test_copies_are_found_when_train_is_much_larger_than_test(case):
+    """The allowance scales with the earlier split's size, not with the largest split."""
+    assert not _near_quiet(case, _repeated_copies(100_000_000, 150_000, 15_000, 100))
+
+
+@pytest.mark.parametrize("times", [2, 3])
+def test_multiplied_post_split_copies_are_found(case, splits, times):
+    """Copies of the same row in train inflate train's own repeats, but the evaluation split's
+    repeats are untouched, so a duplicated leak is still more than they explain."""
+    copies = pd.concat([splits["test"].head(100)] * times, ignore_index=True)
+    copies["row_id"] = np.arange(len(copies)) + 10**7
+    copies["customer"] = [f"N{i}" for i in range(len(copies))]
+    splits["train"] = pd.concat([splits["train"], copies], ignore_index=True)
+    for d in splits.values():
+        d.drop(columns=["date", "label_date", "weight"], inplace=True)
+    assert not _near_quiet(case, splits)
+
+
+def _dense_segment(seed, M=3_000_000, n_train=15_000, n_test=5_000):
+    """Clean train over a wide range, evaluation from the dense low tail of the same shape."""
+    rng = np.random.default_rng(seed)
+
+    def col(n, cap=None):
+        out, t = [], 0
+        while t < n:
+            v = np.floor(M * rng.random(n * 4) ** 3)
+            if cap:
+                v = v[v < cap]
+            out.append(v)
+            t += len(v)
+        return np.concatenate(out)[:n]
+
+    def frame(a):
+        return pd.DataFrame({"sid": [f"t{i}" for i in range(len(a))], "a": a / 7.3,
+                             "b": a * 3 / 7.3 + 1, "c": rng.integers(0, 3, len(a)),
+                             "y": rng.integers(0, 2, len(a))})
+    return {"train": frame(col(n_train)), "test": frame(col(n_test, M / 400))}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_a_dense_evaluation_segment_is_not_called_a_copy(case, seed):
+    """The null is the evaluation split's own repeat rate, so a segment where the features sit
+    close together is explained instead of looking like copies."""
+    assert _near_quiet(case, _dense_segment(seed))
+
+
+def _no_anchor(shape, copies, n=6000):
+    """No single column is distinctive enough to anchor a match; the whole row is."""
+    rng = np.random.default_rng(0)
+    if shape == "digits":
+        d = pd.DataFrame(rng.integers(0, 17, size=(n, 16)),
+                         columns=[f"p{i}" for i in range(16)])
+    else:
+        d = pd.DataFrame({"pclass": rng.integers(1, 4, n), "sex": rng.choice(["m", "f"], n),
+                          "sibsp": rng.integers(0, 9, n), "embarked": rng.choice(list("QSC"), n),
+                          "fare1": np.round(rng.normal(30, 20, n), 1)})
+    d.insert(0, "sid", [f"S{i:06d}" for i in range(n)])
+    d["y"] = rng.integers(0, 2, n)
+    cut = int(n * 0.75)
+    frames = {"train": d.iloc[:cut].copy(), "test": d.iloc[cut:].copy()}
+    if copies:
+        cp = frames["test"].head(copies).copy()
+        cp["sid"] = "X" + cp["sid"]
+        frames["train"] = pd.concat([frames["train"], cp], ignore_index=True)
+    return frames
+
+
+@pytest.mark.parametrize("shape,copies", [("digits", 100), ("titanic", 200)])
+def test_exact_copies_are_found_when_no_column_anchors_a_match(case, shape, copies):
+    """With a fresh id and no distinctive column the whole row is still the evidence."""
+    assert _near_quiet(case, _no_anchor(shape, 0))
+    assert not _near_quiet(case, _no_anchor(shape, copies))
+
+
+def test_the_second_look_says_when_it_cannot_run(case):
+    """Every feature is a unique key, so nothing is left to compare. It must say so rather
+    than pass as if it had looked."""
+    rng = np.random.default_rng(0)
+    n = 2000
+    d = pd.DataFrame({"sid": [f"s{i}" for i in range(n)], "uid": [f"u{i}" for i in range(n)],
+                      "y": rng.integers(0, 2, n)})
+    frames = {"train": d.iloc[:1500].copy(), "test": d.iloc[1500:].copy()}
+    found = case.run(frames, LABEL_ONLY).check("duplicates.near_cross_split")
+    assert found["status"] == "skip"
+    assert "params.id" in found["message"]
 
 
 def test_a_list_column_is_not_a_key_and_does_not_crash(case, splits):

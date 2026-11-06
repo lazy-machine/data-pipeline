@@ -414,26 +414,28 @@ A pass means that no blocking check fired, not that the data is clean.
   compare labels with their source, not as proof. Other injected values and rows mostly warn. `schema.ranges`,
   `schema.allowed` and `pins` block, so declare them when you know the valid values.
 - **Near-copies under a new key.** With a unique key column that isn't declared as `id`, the
-  check also compares the other columns, at two precisions, and it needs a column with mostly
-  distinct values to go on. The fine comparison follows the size of the training split:
-  numbers equal to `ceil(log2(train rows)) + 7` bits of mantissa, between 20 and 48 (about 6
-  significant digits at 15,000 training rows, 8 at 150,000), and it needs at least 3 standard
-  deviations more matches than the training rows' own repeats predict. That last bar is why a
-  rounded or derived column alone is not treated as a copy: the shuffled chance estimate
-  collapses, but the train repeats those vectors as often as the splits share them. The
-  coarse comparison is at 14 bits and asks whether the test rows collide with train more
-  often than the training rows collide with each other (by at least 10 rows and 3 standard
-  deviations). Between them they find exact copies and jitter up to about 1e-5 relative on
-  data with several columns, at any size, with or without a declared id. Rows that match no
-  more often than the train already repeats them get a warning, not a copy claim, from
-  `duplicates.repeated_across_splits`: that covers copies made before the split (which also
-  repeat inside train) and coarse columns that repeat by nature, including a column rounded
-  to about 4 decimals with another derived from it. Copies are still missed when fewer than
-  10 rows match, when a copy is jittered by 1e-4 or more or re-measured, when a row is copied
-  more than 5 times inside train, when a copy carries a common value or a fresh timestamp or
-  other per-row value, and in data whose columns are all coarse; declaring the keys (`id`,
-  `group`) leaves only the comparison at `bits`, which sees the first two. These all warn at
-  best.
+  check also compares the other columns, at two precisions. The fine comparison follows the
+  size of the training split: numbers equal to `ceil(log2(train rows)) + 7` bits of mantissa,
+  between 20 and 48 (about 6 significant digits at 15,000 training rows, 8 at 150,000), and it
+  needs at least 3 standard deviations more matches than the two splits' own repeats predict.
+  That last bar is why a rounded or derived column alone is not treated as a copy: the
+  shuffled chance estimate collapses, but the splits repeat those vectors as often as they
+  share them. The allowance is the larger of what each split's own repeats predict for the
+  pair, so a copy added to the training split cannot move the evaluation split's rate and
+  cannot hide itself, while an evaluation split that sits where the features are dense is
+  explained. A copy jittered past the fine precision still agrees to about 4 significant
+  digits, so a comparison at 14 bits needs the same. When no single column is distinct enough
+  to go on, the whole row without the keys is the evidence. Between them they find exact
+  copies and jitter up to about 1e-5 relative when at least 10 rows match; a handful of copies
+  is below the floor, whatever the jitter. Rows that match no more often than the splits' own
+  repeats get a warning, not a copy claim, from `duplicates.repeated_across_splits`: that
+  covers copies made before the split (which also repeat inside the evaluation split) and
+  coarse columns that repeat by nature, including a column rounded to about 4 decimals with
+  another derived from it. Copies are still missed when fewer than 10 rows match, when a copy
+  is jittered by 1e-4 or more or re-measured, when a row is copied more than 5 times, when a
+  copy carries a common value or a fresh timestamp or other per-row value, and in data whose
+  columns are all coarse; declaring the keys (`id`, `group`) leaves only the comparison at
+  `bits`. These all warn at best.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
@@ -468,8 +470,9 @@ pipeline after the split, since the gate can't confirm that from the data.
 - Blocks: identical feature rows in two splits (beyond what different entities share by
   chance in train); the same text (normalised) in two splits.
 - Warns: near-copies across splits (rounded numbers, normalised text, ignoring undeclared
-  key columns); mass-repeated rows
-  in train; identical rows with conflicting labels.
+  key columns); rows that repeat across and within splits (copies made before the split, or
+  coarse columns, reported as repeats); mass-repeated rows in train; identical rows with
+  conflicting labels.
 
 **temporal**
 - Blocks: rows outside `time_bounds`; splits overlapping in time (or per group); labels

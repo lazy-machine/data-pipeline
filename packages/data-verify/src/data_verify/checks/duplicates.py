@@ -19,7 +19,7 @@ _MARGIN = 7  # bits of mantissa above log2(rows): the share matching a number by
 # (about 0.15%, a third of _MIN_SHARE: a tighter margin false-alarms on dependent columns)
 _MIN_BITS, _MAX_BITS = 20, 48  # a small train is not compared too coarsely; float64 has 52 bits
 _COARSE_BITS = 14  # about 4 significant digits: a copy jittered past _fine_bits still matches
-_SIGMA = 3.0  # standard deviations over the train's own repeats a match must clear
+_SIGMA = 3.0  # standard deviations over the evaluation split's own repeats a match must clear
 _MIN_ROWS = 10  # a handful of matches is not evidence, however small the split
 _MIN_SHARE = 0.005  # a repeat warning needs a real share of rows, not just a count
 
@@ -66,58 +66,111 @@ def _anchors(v, cols: tuple[str, ...]) -> list[str]:
     return found
 
 
-def _rare_rows(v, d: pd.DataFrame, anchors: list[str], bits: int) -> np.ndarray:
-    """Rows of ``d`` holding, in an anchor column, a value at most _RARE_VALUE training rows
-    have. A common value recurring proves nothing, however the columns relate."""
-    rare = np.zeros(len(d), dtype=bool)
-    for c in anchors:
-        counts = pd.Series(v.hashes(v.train_name, (c,), True, bits)).value_counts()
-        seen = pd.Series(row_hashes(d, [c], True, bits)).map(counts).fillna(0).to_numpy()
-        rare |= seen <= _RARE_VALUE
-    return rare
+def _rare_mask(v, d: pd.DataFrame, cols: tuple[str, ...], anchors: list[str],
+               bits: int) -> np.ndarray:
+    """Rows of ``d`` whose evidence is rare in train: at most _RARE_VALUE training rows share
+    their value in an anchor column, or -- when no single column is distinctive enough -- their
+    whole vector of ``cols`` without the keys. A common value recurring proves nothing, however
+    the columns relate."""
+    if anchors:
+        rare = np.zeros(len(d), dtype=bool)
+        for c in anchors:
+            counts = pd.Series(v.hashes(v.train_name, (c,), True, bits)).value_counts()
+            seen = pd.Series(row_hashes(d, [c], True, bits)).map(counts).fillna(0).to_numpy()
+            rare |= seen <= _RARE_VALUE
+        return rare
+    counts = pd.Series(v.hashes(v.train_name, cols, True, bits)).value_counts()
+    seen = pd.Series(row_hashes(d, list(cols), True, bits)).map(counts).fillna(0).to_numpy()
+    return seen <= _RARE_VALUE
 
 
 def _chance_share(v, cols: tuple[str, ...], anchors: list[str], bits: int) -> float:
     """How often rare rows match by chance: the share of rows, built by shuffling each training
-    column on its own, that have a rare value and match a real training row. Counting repeats
-    in train would not do, because copies inflate that, and they are what this has to find."""
+    column on its own, that have a rare value and match a real training row. Only a floor under
+    the null, because shuffling the columns apart forgets how they relate."""
     train = v.train
     rng = np.random.default_rng(v.spec.seed)
     mixed = pd.DataFrame({c: train[c].iloc[rng.permutation(len(train))].reset_index(drop=True)
                           for c in cols})
     match = np.isin(row_hashes(mixed, list(cols), True, bits),
                     v.hashes(v.train_name, cols, True, bits))
-    return float((match & _rare_rows(v, mixed, anchors, bits)).mean())
+    return float((match & _rare_mask(v, mixed, cols, anchors, bits)).mean())
 
 
 def _collision_share(v, cols: tuple[str, ...], anchors: list[str], bits: int) -> float:
-    """How often rare training rows match each other at ``bits``. Real rows, so the count keeps
-    every relation between the columns, which shuffling them apart would forget: columns that
-    depend on each other collide here as often as they really do. A copy repeated inside train
-    raises it, which only makes the coarse comparison harder to fire."""
+    """Share of training rows that repeat another training row's rare vector. Reported, not
+    used as the null: a copy added to train inflates it, which is what hides a leak."""
     h = pd.Series(v.hashes(v.train_name, cols, True, bits))
     seen = h.map(h.value_counts()).to_numpy()
-    return float(((seen > 1) & _rare_rows(v, v.train, anchors, bits)).mean())
+    return float(((seen > 1) & _rare_mask(v, v.train, cols, anchors, bits)).mean())
 
 
-def _repeats_explain(look: dict, opt) -> bool:
-    """Whether the training rows repeat these vectors often enough that the matches across
-    splits are no more than that repetition predicts. Copies made before the split collide
-    inside train too, so they land here, as do coarse columns that repeat by nature."""
-    if not opt["baseline"]:
-        return False
-    return look["hits"] <= look["expected"] + _SIGMA * math.sqrt(look["expected"] + 1)
+def _pair_counts(v, a: str, b: str, cols: tuple[str, ...], rest: tuple[str, ...],
+                 anchors: list[str], bits: int):
+    """Rows of split ``b`` that match a row of ``a`` on ``rest``, and rows of ``b`` that match
+    another row of ``b``: both rare, and the first excluding the exact all-column matches the
+    comparison on all columns already reports."""
+    hb = v.hashes(b, rest, True, bits)
+    rare = _rare_mask(v, v.splits[b], rest, anchors, bits)
+    cross = np.isin(hb, v.hashes(a, rest, True, bits)) & rare
+    cross &= ~np.isin(v.hashes(b, cols), v.hashes(a, cols))
+    ser = pd.Series(hb)
+    selfb = (ser.map(ser.value_counts()).to_numpy() > 1) & rare
+    return cross, selfb
+
+
+def _self_count(v, split: str, rest: tuple[str, ...], anchors: list[str], bits: int) -> int:
+    """Rows of ``split`` that repeat another row of the same split, rare and at ``bits``."""
+    h = v.hashes(split, rest, True, bits)
+    ser = pd.Series(h)
+    rare = _rare_mask(v, v.splits[split], rest, anchors, bits)
+    return int(((ser.map(ser.value_counts()).to_numpy() > 1) & rare).sum())
+
+
+def _pair_stats(v, a: str, b: str, cols: tuple[str, ...], rest: tuple[str, ...],
+                anchors: list[str], bits: int, chance: float, ratio: float,
+                use_null: bool) -> dict:
+    """One split pair at one precision. ``expected`` is the larger of what each side's own
+    repeats predict for the matches between them, at the same per-pair rate: a copy added to
+    ``a`` cannot move ``b``'s own rate, and a dense ``b`` raises it, so between them a post-split
+    copy stays visible and a dense evaluation segment is explained. ``sigma`` carries both the
+    count's variance and the variance of those repeat estimates."""
+    n_a, n_b = len(v.splits[a]), len(v.splits[b])
+    cross, selfb = _pair_counts(v, a, b, cols, rest, anchors, bits)
+    c, s = int(cross.sum()), int(selfb.sum())
+    sa = _self_count(v, a, rest, anchors, bits)
+    scale = n_a / max(n_b - 1, 1)
+    from_eval, from_earlier = s * scale, sa * n_b / max(n_a - 1, 1)
+    expected = max(from_eval, from_earlier, ratio * chance * n_b) if use_null else 0.0
+    var = expected + 1
+    return {"rows": c, "self": s, "self_earlier": sa, "fraction": frac(c, n_b),
+            "n_a": n_a, "n_b": n_b, "expected": expected, "sigma": math.sqrt(var),
+            "example_rows_of_" + b: np.flatnonzero(cross)[:5].tolist()}
+
+
+def _pair_verdicts(stats: dict, max_fraction: float, min_share: float):
+    """(pairs that are more than the data explains, pairs that are only its own repeats) among
+    the split pairs with at least _MIN_ROWS matches, over max_fraction and min_share."""
+    more, repeats = [], []
+    for key, st in stats.items():
+        share = st["rows"] / st["n_b"] if st["n_b"] else 0.0
+        if st["rows"] < _MIN_ROWS or share <= max(max_fraction, min_share):
+            continue
+        if st["rows"] > st["expected"] + _SIGMA * st["sigma"]:
+            more.append(key)
+        else:
+            repeats.append(key)
+    return more, repeats
 
 
 def _second_look(v, opt, cols: tuple[str, ...]):
-    """The comparison without the key columns, at the fine precision: the pairs of rows that
-    match across splits, the share that matches when each training column is shuffled on its
-    own, the fine precision, and how often the training rows repeat each other's vectors.
-    ``None`` when there is no key column; ``ran`` is false when no column has enough distinct
-    values to anchor a match, so the pairs are not computed."""
+    """The comparison without the key columns: for each split pair the matches at the fine and
+    (with `baseline`) the coarse precision, and what the evaluation split's own repeats predict
+    for them. ``None`` when no column acts as a key; ``ran`` is false when nothing is left to
+    compare once the keys are ignored."""
     if opt.get("columns"):
         return None
-    return v.cached(("second_look", cols, opt["key_share"], bool(opt["baseline"])),
+    return v.cached(("second_look", cols, opt["key_share"], bool(opt["baseline"]), opt["ratio"]),
                     lambda: _second_look_scan(v, opt, cols))
 
 
@@ -126,20 +179,42 @@ def _second_look_scan(v, opt, cols: tuple[str, ...]):
     if not keys:
         return None
     rest = tuple(c for c in cols if c not in keys)
-    anchors = _anchors(v, rest)
     fine = _fine_bits(len(v.train))
-    look = {"keys": keys, "rest": rest, "anchors": anchors, "ran": bool(anchors), "bits": fine,
-            "pairs": {}, "share": 0.0, "chance": 0.0, "repeated": 0.0, "hits": 0,
-            "expected": 0.0}
-    if not anchors:
+    look = {"keys": keys, "rest": rest, "anchors": [], "ran": bool(rest), "bits": fine,
+            "pairs": {}, "coarse": {}, "stats": {}, "cstats": {}, "chance": 0.0,
+            "cochance": 0.0, "repeated_in_train": 0.0}
+    if not rest:
         return look
-    found, share = _matches(v, rest, cols, True, fine, anchors)
-    chance = _chance_share(v, rest, anchors, fine) if opt["baseline"] else 0.0
-    repeated = _collision_share(v, rest, anchors, fine) if opt["baseline"] else 0.0
-    hits = max((p["rows"] for p in found.values()), default=0)
-    look.update(pairs=found, share=share, chance=chance, repeated=repeated, hits=hits,
-                expected=repeated * max(len(d) for d in v.splits.values()))
+    anchors = _anchors(v, rest)
+    look["anchors"] = anchors
+    base = bool(opt["baseline"])
+    if base:
+        look["repeated_in_train"] = _collision_share(v, rest, anchors, fine)
+        look["chance"] = _chance_share(v, rest, anchors, fine)
+        look["cochance"] = _chance_share(v, rest, anchors, _COARSE_BITS)
+    for (a, _), (b, _) in combinations(v.splits.items(), 2):
+        name = f"{a}/{b}"
+        look["stats"][name] = _pair_stats(v, a, b, cols, rest, anchors, fine,
+                                           look["chance"], opt["ratio"], base)
+        if look["stats"][name]["rows"]:
+            look["pairs"][name] = look["stats"][name]
+        if base:
+            look["cstats"][name] = _pair_stats(v, a, b, cols, rest, anchors, _COARSE_BITS,
+                                                look["cochance"], opt["ratio"], True)
+            if look["cstats"][name]["rows"]:
+                look["coarse"][name] = look["cstats"][name]
     return look
+
+
+def _shared(stats: dict, names: list[str], keys: list[str], kind: str,
+            coarse: bool = False) -> str:
+    """The message for matches that are more than the evaluation split's own repeats explain."""
+    bits = f", within {_COARSE_BITS} bits of mantissa" if coarse else ""
+    text = ", ".join(f"{k} {stats[k]['rows']} rows ({stats[k]['fraction']:.2%})" for k in names)
+    own = max(stats[k]["expected"] / stats[k]["n_b"] for k in names)
+    return (f"{kind} feature rows shared between splits: {text} (ignoring key column(s) "
+            f"{', '.join(keys)}{bits}); the splits' own repeats predict only {own:.3%} of those "
+            f"rows match by chance, so this is more than that")
 
 
 def _cross_group_rate(v, cols, near: bool, bits: int) -> float | None:
@@ -167,7 +242,7 @@ def _matches(v, cols, all_cols, near: bool, bits: int, anchors: list[str] | None
         if near:  # report only what the exact check does not already see
             hit &= ~np.isin(v.hashes(b, all_cols), v.hashes(a, all_cols))
         if anchors:
-            hit &= _rare_rows(v, v.splits[b], anchors, bits)
+            hit &= _rare_mask(v, v.splits[b], cols, anchors, bits)
         n = int(hit.sum())
         if n:
             worst = max(worst, n / len(hb))
@@ -214,38 +289,26 @@ def _cross(v, opt, near: bool):
         look = _second_look(v, opt, cols)
         if look:
             details["ignored_keys"] = look["keys"]
-        if look and look["ran"]:
+        if look and not look["ran"]:
+            return skipped("nothing is left to compare once the undeclared key column(s) "
+                           f"{', '.join(look['keys'])} are ignored; declare params.id so the "
+                           "key is a role")
+        if look:
             details.update(pairs_without_keys=look["pairs"],
                            chance_without_keys=frac(look["chance"], 1))
-            limit = max(opt["max_fraction"], opt["ratio"] * look["chance"])
-            if look["pairs"] and look["share"] > limit and look["hits"] >= _MIN_ROWS \
-                    and not _repeats_explain(look, opt):
-                text = ", ".join(f"{k} {p['rows']} rows ({p['fraction']:.2%})"
-                                 for k, p in look["pairs"].items())
-                return failed(f"{kind} feature rows shared between splits: {text} (ignoring key "
-                              f"column(s) {', '.join(look['keys'])}); {look['chance']:.3%} would "
-                              f"match by chance", hint, **details)
+            more, _ = _pair_verdicts(look["stats"], opt["max_fraction"], 0.0)
+            if more:
+                return failed(_shared(look["stats"], more, look["keys"], kind), hint, **details)
             if opt["baseline"]:
-                # A copy jittered past `bits` still agrees to about 4 significant digits. At
-                # that precision columns that depend on each other collide by themselves, so
-                # this asks whether the test rows collide with train more often than the train
-                # collides with itself: same columns, same relations, no copy alignment.
-                rest, anchors = look["rest"], look["anchors"]
-                found, share = _matches(v, rest, cols, near, _COARSE_BITS, anchors)
-                chance = _collision_share(v, rest, anchors, _COARSE_BITS)
-                limit = max(opt["max_fraction"], opt["ratio"] * chance)
-                hits = max((p["rows"] for p in found.values()), default=0)
-                expected = chance * max(len(d) for d in v.splits.values())
-                details.update(pairs_at_coarse_bits=found, chance_at_coarse_bits=frac(chance, 1))
-                if hits >= _MIN_ROWS and share > limit \
-                        and hits > expected + _SIGMA * math.sqrt(expected + 1):
-                    text = ", ".join(f"{k} {p['rows']} rows ({p['fraction']:.2%})"
-                                     for k, p in found.items())
-                    return failed(
-                        f"{kind} feature rows shared between splits: {text} (ignoring key "
-                        f"column(s) {', '.join(look['keys'])}, within {_COARSE_BITS} bits of "
-                        f"mantissa); {chance:.3%} of {v.train_name} rows match each other",
-                        hint, **details)
+                # A copy jittered past `bits` still agrees to about 4 significant digits, and
+                # the same null applies: the evaluation split's own repeats, which a copy into
+                # the earlier split cannot move.
+                details.update(pairs_at_coarse_bits=look["coarse"],
+                               chance_at_coarse_bits=frac(look["cochance"], 1))
+                more, _ = _pair_verdicts(look["cstats"], opt["max_fraction"], 0.0)
+                if more:
+                    return failed(_shared(look["cstats"], more, look["keys"], kind,
+                                          coarse=True), hint, **details)
     if pairs:
         reason = (f"no more than different {v.train_name} entities share by chance "
                   f"({base:.3%})" if base is not None else f"<= max_fraction {allowed:.3%}")
@@ -280,31 +343,32 @@ def near_cross_split(v, opt):
     matches: whole numbers distinct on almost every row, and short text, single tokens such
     as hashes, or entity-named whole numbers with at least 50 values, distinct on at least
     `key_share` of rows. The report lists them in `ignored_keys`. Without them rows can match
-    by chance, so the second comparison asks for more: numbers equal to ceil(log2(train
-    rows)) + 7 bits of mantissa, at least 20 and at most 48 (about 6 significant digits at
-    15,000 training rows and 8 at 150,000), a value at most 5 training rows have in a column
-    where at least half the values are distinct, at least 10 matched rows, and at least 3
-    standard deviations more matches than the training rows' own repeats predict. The last bar
-    is load bearing: the share that matches by chance falls with precision only while the
-    values fill the mantissa, so rounded or derived columns, which have far fewer distinct
-    values than 2**bits, collide far more than the shuffled estimate says, and the train's own
-    repeat rate is the honest floor. Following the train size keeps the shuffled estimate near
-    0.15%, and with `baseline` on it also needs more than `ratio` times that shuffled share.
-    A copy jittered past the fine precision still agrees to about 4 significant digits, so a
-    further comparison at 14 bits asks whether the test rows collide with train more often
-    than the training rows collide with each other: real rows, so that count keeps every
-    relation between the columns, and it needs at least 10 matched rows and 3 standard
-    deviations over the train's own rate. Between them the comparisons find exact copies and
-    jitter up to about 1e-5 relative on data with several columns, at any train size. Rows
-    that match no more often than the training rows already repeat each other's vectors are
-    not reported here: duplicates.repeated_across_splits warns about them, because a copy made
-    before the split collides inside train too, and coarse columns that repeat by nature look
-    the same. So under a new key a copy must almost carry the same numbers, unless the keys
-    are declared (`params.id` and `params.group`), which leaves only the comparison at `bits`.
-    It doesn't find a copy made before the split (the other check warns), a row copied more
-    than 5 times, a copy of a common value, a copy given a fresh timestamp or other per-row
-    value, or copies in data with only coarse columns, unless `columns` leaves that column
-    out."""
+    by chance, so the second comparison asks for more evidence: a value at most 5 training
+    rows have in a column where at least half the values are distinct, or -- when no single
+    column is distinctive enough -- the whole row without the keys; numbers equal to
+    ceil(log2(train rows)) + 7 bits of mantissa, between 20 and 48 (about 6 significant digits
+    at 15,000 training rows and 8 at 150,000); at least 10 matched rows; and at least 3
+    standard deviations more matches than the two splits' own repeats predict. That last bar
+    is the load-bearing one. The allowance is the larger of what each side's own repeat rate
+    predicts for the pair, at the same per-pair rate over the other split's size, so a copy
+    added to the earlier split cannot move the evaluation split's rate and cannot hide itself,
+    while an evaluation split that sits where the features are dense raises the allowance and
+    is explained. The shuffled-column share is only a floor under it, because shuffling the
+    columns apart forgets how they relate. With `baseline = false` there is no allowance and
+    the coarse comparison is skipped. A copy jittered past the fine precision still agrees to
+    about 4 significant digits, so a further comparison at 14 bits needs the same, with the
+    same null. Between them the comparisons find exact copies and jitter up to about 1e-5
+    relative when at least 10 rows match; a handful of copies is below the floor, whatever the
+    jitter. Rows that match no more often than the splits' own repeats are not reported here:
+    duplicates.repeated_across_splits warns about them, because a copy made before the split
+    repeats inside the evaluation split too, and coarse columns that repeat by nature look the
+    same. So under a new key a copy must almost carry the same numbers, unless the keys are
+    declared (`params.id` and `params.group`), which leaves only the comparison at `bits`. It
+    doesn't find a copy made before the split (the other check warns), a row copied more than
+    5 times, a copy of a common value, a copy given a fresh timestamp or other per-row value,
+    or copies in data with only coarse columns, unless `columns` leaves that column out. When
+    nothing is left to compare once the keys are ignored, the check skips with a message
+    telling you to declare `params.id`."""
     return _cross(v, opt, near=True)
 
 
@@ -313,14 +377,14 @@ def near_cross_split(v, opt):
        baseline=True, ratio=2.0, columns=[], key_share=0.02)
 def repeated_across_splits(v, opt):
     """The other half of the comparison without key columns: rows that match across splits no
-    more often than the training rows already repeat each other's feature vectors. A copy made
-    before the split collides inside train too, and coarse columns repeat by nature, so this
-    warns and never claims copies. It uses the same key columns, `key_share`, fine precision
-    and rarity rule as duplicates.near_cross_split; `baseline = false` lifts the comparison
-    and leaves it to that check, and `columns` is compared exactly, not second-guessed. A
-    warning needs at least 10 matched rows and more than `max_fraction`, `ratio` times the
-    shuffled share, or 0.5% of rows. The warning names the split pairs and the share of
-    training rows that repeat."""
+    more often than the two splits' own repeats predict. A copy made before the split repeats
+    inside the evaluation split too, and coarse columns repeat by nature, so this warns and
+    never claims copies. It uses the same key columns, `key_share`, fine precision, rarity
+    rule and null as duplicates.near_cross_split; `baseline = false` lifts the comparison and
+    leaves it to that check, and `columns` is compared exactly, not second-guessed. A warning
+    needs at least 10 matched rows and more than `max_fraction` and 0.5% of the evaluation
+    split's rows. The report lists the split pairs and the share the splits' own repeats
+    predict."""
     feats = tuple(v.features)
     if not feats:
         return skipped("no features")
@@ -332,24 +396,27 @@ def repeated_across_splits(v, opt):
         return skipped("baseline is off: duplicates.near_cross_split runs alone")
     look = _second_look(v, opt, feats)
     if not look or not look["ran"]:
-        return skipped("no key column, or no column with mostly distinct values to anchor on")
-    limit = max(opt["max_fraction"], opt["ratio"] * look["chance"], _MIN_SHARE)
+        return skipped("no key column, or nothing left to compare once the keys are ignored")
+    _, repeats = _pair_verdicts(look["stats"], opt["max_fraction"], _MIN_SHARE)
     details = {"pairs": look["pairs"], "ignored_keys": look["keys"],
-               "chance": frac(look["chance"], 1), "repeated_in_train": frac(look["repeated"], 1)}
-    if look["pairs"] and look["share"] > limit and look["hits"] >= _MIN_ROWS \
-            and _repeats_explain(look, opt):
-        text = ", ".join(f"{k} {p['rows']} rows ({p['fraction']:.2%})"
-                         for k, p in look["pairs"].items())
+               "chance": frac(look["chance"], 1),
+               "repeated_in_train": frac(look["repeated_in_train"], 1)}
+    if repeats:
+        text = ", ".join(f"{k} {look['stats'][k]['rows']} rows "
+                         f"({look['stats'][k]['fraction']:.2%})" for k in repeats)
+        own = max(look["stats"][k]["expected"] / look["stats"][k]["n_b"] for k in repeats)
         return failed(f"feature rows repeat across and within splits: {text} (ignoring key "
-                      f"column(s) {', '.join(look['keys'])}); {look['repeated']:.3%} of "
-                      f"{v.train_name} rows repeat another row's vectors, so this can be rows "
-                      f"copied before the split or coarse columns that repeat by nature",
+                      f"column(s) {', '.join(look['keys'])}); the splits' own repeats predict "
+                      f"{own:.3%} of those rows match by chance, so this is within the data's "
+                      f"own repeats and not more than they explain: it can be rows copied "
+                      f"before the split or coarse columns that repeat by nature",
+
                       "If these rows were copied before the split, deduplicate before "
                       "splitting. If the repeats are legitimate (coarse columns), declare "
                       "params.id and params.group, or raise "
                       "checks.\"duplicates.repeated_across_splits\".max_fraction.", **details)
-    return passed(f"repeated rows across splits stay within the training rows' own repeats "
-                  f"({look['repeated']:.3%})", **details)
+    return passed("repeated rows across splits stay within the evaluation split's own repeats",
+                  **details)
 
 
 def _long_text(v, col: str, min_chars: int) -> bool:

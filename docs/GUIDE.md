@@ -777,7 +777,7 @@ the same commit. If no step needs a feature yet, leave it out.
 ```
 ▶ iris · 7 steps · examples/iris/pipeline.toml
 [1/7] clean     ↷ cached            rows=149 dropped=1 classes=3
-[3/7] verify    ✓ ran        0.51s  checks=29 passed=28 warnings=1 skipped=25 warned=drift.features  (inputs changed: train)
+[3/7] verify    ✓ ran        0.51s  checks=29 passed=28 warnings=1 skipped=26 warned=drift.features  (inputs changed: train)
 [4/7] eda       ⚠ warning    0.90s  exit code 1  [non-critical, continuing]
 ┌─ eda: exit code 1 ─ analysis:explore
   …full captured output and traceback…
