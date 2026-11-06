@@ -119,12 +119,19 @@ def _pair_counts(v, a: str, b: str, cols: tuple[str, ...], rest: tuple[str, ...]
     return cross, selfb
 
 
-def _self_count(v, split: str, rest: tuple[str, ...], anchors: list[str], bits: int) -> int:
-    """Rows of ``split`` that repeat another row of the same split, rare and at ``bits``."""
+def _self_count(v, split: str, rest: tuple[str, ...], anchors: list[str], bits: int,
+                other: str | None = None) -> int:
+    """Rows of ``split`` that repeat another row of the same split, rare and at ``bits``.
+    With ``other``, rows whose vector also occurs there are left out: those are the cross
+    matches, and a copy placed a few times in one split is exactly such a row, so leaving them
+    in would let the copy raise the repeats it is measured against."""
     h = v.hashes(split, rest, True, bits)
     ser = pd.Series(h)
     rare = _rare_mask(v, v.splits[split], rest, anchors, bits)
-    return int(((ser.map(ser.value_counts()).to_numpy() > 1) & rare).sum())
+    rep = (ser.map(ser.value_counts()).to_numpy() > 1) & rare
+    if other is not None:
+        rep &= ~np.isin(h, v.hashes(other, rest, True, bits))
+    return int(rep.sum())
 
 
 def _pair_stats(v, a: str, b: str, cols: tuple[str, ...], rest: tuple[str, ...],
@@ -132,13 +139,14 @@ def _pair_stats(v, a: str, b: str, cols: tuple[str, ...], rest: tuple[str, ...],
                 use_null: bool) -> dict:
     """One split pair at one precision. ``expected`` is the larger of what each side's own
     repeats predict for the matches between them, at the same per-pair rate: a copy added to
-    ``a`` cannot move ``b``'s own rate, and a dense ``b`` raises it, so between them a post-split
-    copy stays visible and a dense evaluation segment is explained. ``sigma`` carries both the
-    count's variance and the variance of those repeat estimates."""
+    ``a`` cannot move ``b``'s own rate and is left out of ``a``'s (it occurs in ``b``), and a
+    dense ``b`` raises its own rate, so between them a post-split copy stays visible and a
+    dense evaluation segment is explained. ``sigma`` carries both the count's variance and the
+    variance of those repeat estimates."""
     n_a, n_b = len(v.splits[a]), len(v.splits[b])
     cross, selfb = _pair_counts(v, a, b, cols, rest, anchors, bits)
     c, s = int(cross.sum()), int(selfb.sum())
-    sa = _self_count(v, a, rest, anchors, bits)
+    sa = _self_count(v, a, rest, anchors, bits, other=b)
     scale = n_a / max(n_b - 1, 1)
     from_eval, from_earlier = s * scale, sa * n_b / max(n_a - 1, 1)
     expected = max(from_eval, from_earlier, ratio * chance * n_b) if use_null else 0.0
@@ -350,12 +358,14 @@ def near_cross_split(v, opt):
     at 15,000 training rows and 8 at 150,000); at least 10 matched rows; and at least 3
     standard deviations more matches than the two splits' own repeats predict. That last bar
     is the load-bearing one. The allowance is the larger of what each side's own repeat rate
-    predicts for the pair, at the same per-pair rate over the other split's size, so a copy
-    added to the earlier split cannot move the evaluation split's rate and cannot hide itself,
-    while an evaluation split that sits where the features are dense raises the allowance and
-    is explained. The shuffled-column share is only a floor under it, because shuffling the
-    columns apart forgets how they relate. With `baseline = false` there is no allowance and
-    the coarse comparison is skipped. A copy jittered past the fine precision still agrees to
+    predicts for the pair, at the same per-pair rate over the other split's size. A copy added
+    to the earlier split occurs in the evaluation split, so it neither moves the evaluation
+    split's rate nor counts in the earlier split's own repeats: it cannot hide itself, however
+    many times it is placed. An evaluation split that sits where the features are dense raises
+    the allowance and is explained. The shuffled-column share is only a floor under it, because
+    shuffling the columns apart forgets how they relate. With `baseline = false` there is no
+    allowance and the coarse comparison is skipped. A copy jittered past the fine precision
+    still agrees to
     about 4 significant digits, so a further comparison at 14 bits needs the same, with the
     same null. Between them the comparisons find exact copies and jitter up to about 1e-5
     relative when at least 10 rows match; a handful of copies is below the floor, whatever the
@@ -365,8 +375,9 @@ def near_cross_split(v, opt):
     same. So under a new key a copy must almost carry the same numbers, unless the keys are
     declared (`params.id` and `params.group`), which leaves only the comparison at `bits`. It
     doesn't find a copy made before the split (the other check warns), a row copied more than
-    5 times, a copy of a common value, a copy given a fresh timestamp or other per-row value,
-    or copies in data with only coarse columns, unless `columns` leaves that column out. When
+    5 times in the earlier split (its value stops being rare), a copy of a common value, a copy
+    given a fresh timestamp or other per-row value, or copies in data with only coarse or
+    low-entropy columns whose rows still repeat, unless `columns` leaves that column out. When
     nothing is left to compare once the keys are ignored, the check skips with a message
     telling you to declare `params.id`."""
     return _cross(v, opt, near=True)

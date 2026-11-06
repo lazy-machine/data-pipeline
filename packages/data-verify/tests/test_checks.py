@@ -1572,16 +1572,17 @@ def test_coarse_columns_alone_do_not_make_a_copy_claim_under_a_new_key(case):
     assert r.failed("duplicates.repeated_across_splits")
 
 
-def _repeated_copies(M, n_train, n_test, copies, seed=0):
-    """Post-split copies into a train whose features repeat naturally."""
+def _repeated_copies(M, n_train, n_test, copies, times=1, seed=0):
+    """Post-split copies of the evaluation split's first rows into train, ``times`` each,
+    under a fresh ``sid``, in a train whose features repeat naturally."""
     rng = np.random.default_rng(seed)
     n = n_train + n_test
     a = rng.integers(0, M, n) / 7.3
     d = pd.DataFrame({"sid": [f"s{i}" for i in range(n)], "a": a, "b": a * 3 + 1,
                       "c": rng.integers(0, 3, n), "y": rng.integers(0, 2, n)})
     frames = {"train": d.iloc[:n_train].copy(), "test": d.iloc[n_train:].copy()}
-    cp = frames["test"].head(copies).copy()
-    cp["sid"] = "N" + cp["sid"]
+    cp = pd.concat([frames["test"].head(copies)] * times, ignore_index=True)
+    cp["sid"] = [f"N{i}" for i in range(len(cp))]
     frames["train"] = pd.concat([frames["train"], cp], ignore_index=True)
     return frames
 
@@ -1590,8 +1591,8 @@ def _repeated_copies(M, n_train, n_test, copies, seed=0):
                                                      (60_000, 15_000, 5_000, 1_000),
                                                      (15_000, 15_000, 5_000, 5_000)])
 def test_copies_are_found_though_the_features_repeat_naturally(case, M, n_train, n_test, copies):
-    """A copy is not hidden by the earlier split's own repeats: the null is the evaluation
-    split's repeats scaled to the pair, and a copy the earlier split gained does not move it."""
+    """A copy is not hidden by the earlier split's own repeats: the null takes the larger of what
+    each split's own repeats predict, and a copy the earlier split gained is left out of that."""
     assert not _near_quiet(case, _repeated_copies(M, n_train, n_test, copies))
 
 
@@ -1600,17 +1601,31 @@ def test_copies_are_found_when_train_is_much_larger_than_test(case):
     assert not _near_quiet(case, _repeated_copies(100_000_000, 150_000, 15_000, 100))
 
 
-@pytest.mark.parametrize("times", [2, 3])
-def test_multiplied_post_split_copies_are_found(case, splits, times):
-    """Copies of the same row in train inflate train's own repeats, but the evaluation split's
-    repeats are untouched, so a duplicated leak is still more than they explain."""
-    copies = pd.concat([splits["test"].head(100)] * times, ignore_index=True)
-    copies["row_id"] = np.arange(len(copies)) + 10**7
-    copies["customer"] = [f"N{i}" for i in range(len(copies))]
-    splits["train"] = pd.concat([splits["train"], copies], ignore_index=True)
-    for d in splits.values():
-        d.drop(columns=["date", "label_date", "weight"], inplace=True)
-    assert not _near_quiet(case, splits)
+MULTIPLIED = [(1_000_000_000, 15_000, 5_000, 100, t) for t in (2, 3, 5)] \
+    + [(1_000_000_000, 15_000, 15_000, 150, t) for t in (2, 3)] \
+    + [(60_000, 15_000, 5_000, 300, t) for t in (2, 3, 5)] \
+    + [(300_000, 15_000, 15_000, 150, t) for t in (2, 3)]
+
+
+@pytest.mark.parametrize("M,n_train,n_test,copies,times", MULTIPLIED,
+                         ids=[f"{M}-{n_train}-{n_test}-{c}-x{t}" for M, n_train, n_test, c, t
+                              in MULTIPLIED])
+def test_multiplied_post_split_copies_are_found(case, M, n_train, n_test, copies, times):
+    """Copies of the same row in train repeat each other, and those rows are left out of the
+    earlier split's rate too (their vector occurs in the evaluation split), so a duplicated leak
+    still beats what the splits' own repeats explain. Without that, ×2 and ×3 were demoted to
+    the repeat warning."""
+    assert not _near_quiet(case, _repeated_copies(M, n_train, n_test, copies, times))
+
+
+@pytest.mark.parametrize("M,n_train,n_test", [(1_000_000_000, 15_000, 5_000),
+                                              (1_000_000_000, 15_000, 15_000),
+                                              (60_000, 15_000, 5_000),
+                                              (300_000, 15_000, 15_000)])
+def test_multiplied_copies_do_not_make_clean_data_fire(case, M, n_train, n_test):
+    """The same shape with no copies stays quiet."""
+    assert _near_quiet(case, _repeated_copies(M, n_train, n_test, 0))
+
 
 
 def _dense_segment(seed, M=3_000_000, n_train=15_000, n_test=5_000):

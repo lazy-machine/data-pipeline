@@ -355,11 +355,13 @@ never show them, promote them:
 
 Or set `fail_on = "warn"` to block on every warning.
 
-`duplicates.near_cross_split` is a fair candidate for `"error"` only when you control how
-rows are copied. Rounding makes distinct rows collide, so low-cardinality or coarse features
-can raise a false alarm, and under a new key the check allows a share of rows for chance that
-is a statistical estimate, not a guarantee. Run it as a warning first and look at what it
-flags.
+`duplicates.near_cross_split` is a fair candidate for `"error"` when you control how rows are
+copied: its keyless second look fires on none of the clean shapes measured (61 scenarios at 60
+seeds each), and a copy added to the training split cannot hide itself in it. But the check
+also runs the comparison on all columns first, and that look fires on dense or partly
+overlapping evaluation segments in 4–10 of 60 seeds — on `main` and here alike — because those
+shapes really do share rows. So promoting the check is safe with respect to the keyless look,
+not free of false alarms overall. Run it as a warning first and look at what it flags.
 
 Don't promote `poisoning.label_consistency`, alone or through `"poisoning.*" = "error"`, unless
 your splits are drawn from the same distribution. It also fires on clean data when the
@@ -421,8 +423,9 @@ A pass means that no blocking check fired, not that the data is clean.
   That last bar is why a rounded or derived column alone is not treated as a copy: the
   shuffled chance estimate collapses, but the splits repeat those vectors as often as they
   share them. The allowance is the larger of what each split's own repeats predict for the
-  pair, so a copy added to the training split cannot move the evaluation split's rate and
-  cannot hide itself, while an evaluation split that sits where the features are dense is
+  pair, and a copy added to the training split occurs in the evaluation split, so it is left
+  out of both: it cannot hide itself however many times it is placed (up to 5; a sixth copy
+  stops the value being rare). An evaluation split that sits where the features are dense is
   explained. A copy jittered past the fine precision still agrees to about 4 significant
   digits, so a comparison at 14 bits needs the same. When no single column is distinct enough
   to go on, the whole row without the keys is the evidence. Between them they find exact
@@ -431,11 +434,19 @@ A pass means that no blocking check fired, not that the data is clean.
   repeats get a warning, not a copy claim, from `duplicates.repeated_across_splits`: that
   covers copies made before the split (which also repeat inside the evaluation split) and
   coarse columns that repeat by nature, including a column rounded to about 4 decimals with
-  another derived from it. Copies are still missed when fewer than 10 rows match, when a copy
-  is jittered by 1e-4 or more or re-measured, when a row is copied more than 5 times, when a
-  copy carries a common value or a fresh timestamp or other per-row value, and in data whose
-  columns are all coarse; declaring the keys (`id`, `group`) leaves only the comparison at
-  `bits`. These all warn at best.
+  another derived from it. Post-split copies in a frame whose rows still repeat — a 5-item
+  Likert scale, correlated Likert items, one-hot categories, a sparse binary matrix, a small
+  grid, zero-inflated columns, or clustered rows — are 0/20 on the second look and 20/20 on
+  the warning with 100 copies placed three times, so only the warning sees them; a denser
+  frame (10 Likert items, a 30-column 20%-dense matrix, a 6-column 0-9 grid) does fire. Copies
+  of a common vector fire neither check. The comparison on all columns runs first and fires on
+  its own: it hits dense and partly overlapping evaluation segments in 4–10 of 60 seeds, at
+  the same rate on `main` and here, so promoting this check to `error` is safe with respect to
+  its own keyless look but not free of false alarms from the all-columns look. Copies are
+  still missed when fewer than 10 rows match, when a copy is jittered by 1e-4 or more or
+  re-measured, when a row is copied more than 5 times, when a copy carries a common value or a
+  fresh timestamp or other per-row value, and in data whose columns are all coarse; declaring
+  the keys (`id`, `group`) leaves only the comparison at `bits`. These all warn at best.
 - **Leaks that look like signal.** A single feature only blocks at AUC 0.99 and warns from
   0.95, so a leak weaker than that passes. Two columns that leak only together pass too.
 - **Preprocessing that leaves little or no signature.** Standardisation and min-max scaling
