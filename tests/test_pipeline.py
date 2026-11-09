@@ -1372,7 +1372,9 @@ outputs = { dst = "model.txt" }
 """)
     with pytest.raises(config.ConfigError, match="step 'train' reads 'data/raw.csv' inside it"):
         config.load(cfg)
-    cfg.write_text(cfg.read_text().replace("data/raw.csv", "data"))
+    cfg.write_text(cfg.read_text().replace('{ d = "data" }', '{ d = "data", f = "data/raw.csv" }'))
+    config.load(cfg)
+    cfg.write_text(cfg.read_text().replace('src = "data/raw.csv"', 'src = "data"'))
     config.load(cfg)
 
 

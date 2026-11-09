@@ -291,9 +291,10 @@ def load(path: str | Path) -> Pipeline:
             problem = pipeline.cleaning_problem(rel)
             _expect(problem is None, f"{where}: {problem}")
             out = resolve(rel)
+            declared = {resolve(o) for o in s.outputs.values()}
             for other in steps:
                 for inp in other.inputs.values():
-                    _expect(resolve(inp) == out or not resolve(inp).is_relative_to(out),
+                    _expect(resolve(inp) in declared or not resolve(inp).is_relative_to(out),
                             f"{where}: step '{other.name}' reads '{inp}' inside it, and the "
                             f"loader can't tell that file from an old output. Declare "
                             f"'{rel}' itself as the input, or don't clean it")
