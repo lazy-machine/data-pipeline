@@ -14,6 +14,7 @@ Example::
     params = { drop_na = true }
     requires = ["pandas>=2"]         # packages that must be installed
     critical = true                  # false -> failure is a warning, pipeline continues
+    clean_outputs = true             # delete the outputs before the step reruns
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ _FUNC_RE = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
 _PIPELINE_KEYS = {"name", "workdir", "python_path", "state_dir"}
 _STEP_KEYS = {
     "name", "function", "inputs", "outputs", "params", "requires",
-    "depends_on", "critical", "timeout", "watch", "env", "description",
+    "depends_on", "critical", "timeout", "watch", "env", "description", "clean_outputs",
 }
 
 
@@ -52,6 +53,7 @@ class Step:
     watch: list[str] = field(default_factory=list)
     env: list[str] = field(default_factory=list)
     description: str = ""
+    clean_outputs: bool = False
 
     @property
     def module(self) -> str:
@@ -131,6 +133,9 @@ def _parse_step(raw: Any, idx: int) -> Step:
     description = raw.get("description", "")
     _expect(isinstance(description, str), f"{where}: description must be a string")
 
+    clean_outputs = raw.get("clean_outputs", False)
+    _expect(isinstance(clean_outputs, bool), f"{where}: clean_outputs must be true or false")
+
     return Step(
         name=name,
         function=func,
@@ -144,12 +149,42 @@ def _parse_step(raw: Any, idx: int) -> Step:
         watch=_str_list(raw.get("watch", []), f"{where}.watch"),
         env=_str_list(raw.get("env", []), f"{where}.env"),
         description=description,
+        clean_outputs=clean_outputs,
     )
 
 
 def overlaps(a: Path, b: Path) -> bool:
     """True when the paths are equal or one lies inside the other, as a file in a directory."""
     return a.is_relative_to(b) or b.is_relative_to(a)
+
+
+def output_entry(workdir: Path, rel: str) -> Path:
+    """The directory entry an output names: its parent resolved, its last part kept.
+
+    Cleaning removes this entry, so a symlink output is unlinked, never followed.
+    """
+    path = workdir / rel
+    return path.parent.resolve() / path.name
+
+
+def _check_cleanable(steps: list[Step], workdir: Path, protected: list[Path]) -> None:
+    """Refuse to load a pipeline whose ``clean_outputs`` could delete more than outputs.
+
+    A path typed by mistake, such as ``"."`` or ``"data"``, would otherwise be deleted
+    with everything under it on the next run.
+    """
+    for s in steps:
+        if not s.clean_outputs:
+            continue
+        for rel in s.outputs.values():
+            where = f"step '{s.name}': clean_outputs can't delete output '{rel}'"
+            _expect(Path(rel).name not in ("", ".."),
+                    f"{where}: it must name a file or directory")
+            entry = output_entry(workdir, rel)
+            _expect(entry != workdir and entry.is_relative_to(workdir),
+                    f"{where}: it must lie inside the workdir {workdir}")
+            for p in protected:
+                _expect(not p.is_relative_to(entry), f"{where}: it contains {p}")
 
 
 def _build_graph(steps: list[Step], resolve) -> dict[str, list[str]]:
@@ -239,6 +274,9 @@ def load(path: str | Path) -> Pipeline:
 
     resolve = lambda rel: (workdir / rel).resolve()  # noqa: E731
     upstream = _build_graph(steps, resolve)
+    protected = [path, state_dir, *python_path,
+                 *(resolve(rel) for s in steps for rel in s.watch)]
+    _check_cleanable(steps, workdir, protected)
     return Pipeline(
         name=meta.get("name", path.stem),
         path=path,

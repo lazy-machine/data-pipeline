@@ -456,7 +456,7 @@ nature, where `preprocessing.global_scaling_near` often fires: turn that one off
 | the value of a variable listed in the step's `env` | that step reruns (`env changed: <name>`) |
 | add or remove a name in `env` | that step reruns (`env changed: <name>`) |
 | edit an installed step package without bumping its version | nothing; use `-r STEP` (§11) |
-| the `description` or `critical` flag | nothing; these don't affect results |
+| the `description`, `critical` or `clean_outputs` flag | nothing; these don't affect results |
 | file timestamps only (`touch`) | nothing; caching compares content |
 
 When a step reruns and writes **byte-identical** outputs, the steps after it stay cached.
@@ -528,6 +528,8 @@ be recovered from `state.json`, so don't commit that file.
 - Everything: `-f`.
 - Clear all saved state: delete `.pipeline/` (state lives in `.pipeline/state.json`).
   Deleting `build/` also forces reruns, because the outputs will be missing.
+  Keep `state_dir` out of `build/`: the state also caches file hashes, and without it the
+  next run reads every input again, which takes minutes for a dataset of tens of GB.
 
 Checkpoints are content hashes, not absolute paths, so copying or moving a project
 (state folder included) keeps everything cached.
@@ -605,8 +607,20 @@ def split_by_region(ctx):
 ```
 
 Directories are hashed recursively (file names and contents), so they work as inputs to
-later steps too. Remove stale files at the start of the step if region names can
-disappear, otherwise old files remain in the directory and become part of its hash.
+later steps too. If region names can disappear, set `clean_outputs = true` on the step:
+otherwise old files remain in the directory, become part of its hash, and reach every
+step that reads it, the gate and the model included.
+
+```toml
+clean_outputs = true                      # the runner empties build/regions before a rerun
+```
+
+The runner deletes the declared outputs just before the step runs, never when it is cached
+or in a dry run. The step then starts from nothing, so keep the `mkdir`. The trade-off: when
+the rerun fails, the previous result is gone too, which is the point (it no longer matches
+the inputs), but copy it aside first if you want to compare. The loader refuses an output
+that would delete more than outputs: one outside the workdir, or one holding the state
+folder, the pipeline file, an import root or a `watch` file.
 
 ### Comparing models: one step per variant
 
@@ -754,6 +768,8 @@ package instead of copying `steps/*.py` between projects.
    rerunning the step keeps later steps cached.
 5. **Fail by raising an exception** that names the problem and its fix. Delete stale
    outputs before running, so that a failed run never leaves an old result looking current.
+   A package does this itself, as the gate does: a project can't be relied on to set
+   `clean_outputs = true` on every step that uses it.
 6. **Document the contract in the package README**: the input names it understands, the
    outputs it writes, every param, and what makes it fail. A project must be able to use
    the step from the README alone.

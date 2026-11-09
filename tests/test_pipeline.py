@@ -100,6 +100,11 @@ def finish_quietly(ctx):
     time.sleep(0.5)
     ctx.outputs["dst"].write_text("finished")
 
+def write_files(ctx):
+    ctx.outputs["d"].mkdir(exist_ok=True)
+    for name in ctx.params["names"]:
+        (ctx.outputs["d"] / name).write_text(name)
+
 def spawn_child_then_hang(ctx):
     import subprocess
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -1152,3 +1157,164 @@ def test_old_checkpoint_without_packages_or_env_is_backfilled(tmp_path, monkeypa
     result, _ = run(cfg)
     assert statuses(result) == {"a": "cached"}
     assert state_of(tmp_path)["steps"]["a"][key] == expected
+
+
+# -- clean_outputs ------------------------------------------------------------------------
+
+REGIONS = """
+[[steps]]
+name = "regions"
+function = "fns:write_files"
+outputs = { d = "out/regions" }
+params = { names = ["a.csv", "b.csv"] }
+clean_outputs = CLEAN
+"""
+
+
+@pytest.mark.parametrize("clean, left", [("true", ["a.csv"]), ("false", ["a.csv", "b.csv"])])
+def test_clean_outputs_drops_files_a_rerun_no_longer_writes(tmp_path, clean, left):
+    cfg = make(tmp_path, REGIONS.replace("CLEAN", clean))
+    run(cfg)
+    cfg.write_text(cfg.read_text().replace('"a.csv", "b.csv"', '"a.csv"'))
+    result, _ = run(cfg)
+    assert statuses(result) == {"regions": "ran"}
+    assert sorted(f.name for f in (tmp_path / "out/regions").iterdir()) == left
+
+
+FLAGGED = """
+[[steps]]
+name = "a"
+function = "fns:fail_on_flag"
+outputs = { dst = "out/o.txt" }
+clean_outputs = CLEAN
+
+[[steps]]
+name = "b"
+function = "fns:copy"
+inputs = { src = "out/o.txt" }
+outputs = { dst = "out/b.txt" }
+"""
+
+
+def test_failed_rerun_with_clean_outputs_leaves_no_old_output_to_read(tmp_path):
+    cfg = make(tmp_path, FLAGGED.replace("CLEAN", "true"))
+    run(cfg)
+    (tmp_path / "flag").touch()
+    result, _ = run(cfg, rerun=["a"])
+    assert result.halted_by == "a"
+    assert not (tmp_path / "out/o.txt").exists()
+    result, _ = run(cfg, only=["b"])
+    assert statuses(result) == {"b": "failed"}
+    assert "input 'src' not found" in result.outcomes["b"].output
+
+
+def test_failed_rerun_without_clean_outputs_keeps_the_old_output(tmp_path):
+    cfg = make(tmp_path, FLAGGED.replace("CLEAN", "false"))
+    run(cfg)
+    (tmp_path / "flag").touch()
+    run(cfg, rerun=["a"])
+    assert (tmp_path / "out/o.txt").read_text() == "done"
+
+
+def test_clean_outputs_leaves_cached_and_dry_run_steps_alone(tmp_path):
+    cfg = make(tmp_path, REGIONS.replace("CLEAN", "true"))
+    run(cfg)
+    before = (tmp_path / "out/regions/a.csv").stat()
+    result, _ = run(cfg)
+    assert statuses(result) == {"regions": "cached"}
+    cfg.write_text(cfg.read_text().replace('"a.csv", "b.csv"', '"a.csv"'))
+    result, _ = run(cfg, dry_run=True)
+    assert statuses(result) == {"regions": "would run"}
+    after = (tmp_path / "out/regions/a.csv").stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    assert (tmp_path / "out/regions/b.csv").exists()
+
+
+def test_clean_outputs_leaves_outputs_alone_when_upstream_failed(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "a"
+function = "fns:fail_on_flag"
+outputs = { dst = "out/a.txt" }
+critical = false
+
+[[steps]]
+name = "b"
+function = "fns:copy"
+inputs = { src = "out/a.txt" }
+outputs = { dst = "out/b.txt" }
+clean_outputs = true
+critical = false
+""")
+    run(cfg)
+    (tmp_path / "flag").touch()
+    result, _ = run(cfg, rerun=["a", "b"])
+    assert statuses(result) == {"a": "warned", "b": "skipped"}
+    assert (tmp_path / "out/b.txt").read_text() == "DONE"
+
+
+def test_clean_outputs_unlinks_a_symlink_without_following_it(tmp_path):
+    cfg = make(tmp_path, REGIONS.replace("CLEAN", "true"))
+    kept = tmp_path / "elsewhere"
+    kept.mkdir()
+    (kept / "keep.txt").write_text("keep")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out/regions").symlink_to(kept, target_is_directory=True)
+    result, _ = run(cfg)
+    assert statuses(result) == {"regions": "ran"}
+    assert not (tmp_path / "out/regions").is_symlink()
+    assert (kept / "keep.txt").read_text() == "keep"
+
+
+def test_turning_clean_outputs_on_does_not_rerun_the_step(tmp_path):
+    cfg = make(tmp_path, REGIONS.replace("CLEAN", "false"))
+    run(cfg)
+    cfg.write_text(cfg.read_text().replace("clean_outputs = false", "clean_outputs = true"))
+    result, _ = run(cfg)
+    assert statuses(result) == {"regions": "cached"}
+
+
+def test_an_output_that_cannot_be_cleaned_fails_the_step(tmp_path, monkeypatch):
+    cfg = make(tmp_path, REGIONS.replace("CLEAN", "true"))
+    run(cfg)
+
+    def refuse(path, *a, **kw):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr("data_pipeline.orchestrator.shutil.rmtree", refuse)
+    result, _ = run(cfg, rerun=["regions"])
+    assert result.halted_by == "regions"
+    assert "could not clean output 'd' (out/regions)" in result.outcomes["regions"].detail
+    assert (tmp_path / "out/regions/b.csv").exists()
+
+
+@pytest.mark.parametrize("output, header, msg", [
+    (".", "", "must name a file or directory"),
+    ("out/..", "", "must name a file or directory"),
+    ("../elsewhere", "", "must lie inside the workdir"),
+    ("/tmp/x", "", "must lie inside the workdir"),
+    ("steps", "", "it contains .*steps"),
+    ("state", 'state_dir = "state/runs"', "it contains .*runs"),
+    ("sql", "", "it contains .*q.sql"),
+])
+def test_clean_outputs_refuses_paths_that_hold_more_than_outputs(tmp_path, output, header, msg):
+    cfg = make(tmp_path, f"""
+[[steps]]
+name = "a"
+function = "fns:no_output"
+outputs = {{ o = "{output}" }}
+watch = WATCH
+clean_outputs = true
+""".replace("WATCH", '["sql/q.sql"]' if output == "sql" else "[]"), header)
+    (tmp_path / "sql").mkdir()
+    (tmp_path / "sql/q.sql").write_text("select 1")
+    with pytest.raises(config.ConfigError, match=msg):
+        config.load(cfg)
+    cfg.write_text(cfg.read_text().replace("clean_outputs = true", "clean_outputs = false"))
+    config.load(cfg)
+
+
+def test_clean_outputs_must_be_a_boolean(tmp_path):
+    cfg = make(tmp_path, '[[steps]]\nname = "a"\nfunction = "m:f"\nclean_outputs = "yes"\n')
+    with pytest.raises(config.ConfigError, match="clean_outputs must be true or false"):
+        config.load(cfg)

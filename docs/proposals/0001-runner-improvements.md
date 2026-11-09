@@ -1,6 +1,7 @@
 # Proposal 0001: runner improvements from the hard-drive-analysis-v3 build
 
-- **Status:** Part A: A1, A2 and A3 done. Part B: waiting for the owner's decision
+- **Status:** Part A: A1, A2 and A3 done. Part B: decided (2026-11-09): B3 approved and
+  built; B1, B2 and B4 not approved
 - **Source:** lessons from building `../hard-drive-analysis-v3` on this runner (12 steps,
   a 22 GB input, training steps that run for hours). Every claim below was checked
   against the code at commit `8f8dcaf`.
@@ -289,7 +290,18 @@ These came out of the same build. Each is a design change, so it waits for a "ye
 written into this file. The notes are there to make that decision easier, not to be
 implemented.
 
+**Decision (2026-11-09).** The owner asked for three independent evaluations (Claude Opus
+5.5, DeepSeek V4.1 Flash 1017, GLM 5.3) and approved only what all three called an
+improvement. Do not reopen B1, B2 or B4 without a new case that answers the objections
+below.
+
 ### B1. Step templates (`extends`)
+
+- **Decision:** not approved (two of three against). `data-verify lint` reads the raw TOML
+  (`packages/data-verify/src/data_verify/cli.py`, `_ungated_steps`), so `inputs`,
+  `depends_on` or `function` inherited from a template would be invisible to it, and an
+  ungated model step would pass lint. It also reverses the documented choice in
+  `GUIDE.md` "Shared settings", for a gain that a shared config input already gives.
 
 hda-v3's three `train_*` steps repeat the same parameter block of about 200 characters.
 One of them differs in a single value (`feature_fraction = 1.0`), which is easy to miss
@@ -304,6 +316,13 @@ so this reverses a documented choice.
 
 ### B2. Inputs that name another step's output
 
+- **Decision:** not approved (no consensus). DeepSeek and GLM would build the minimal form
+  only if the gate's lint resolved `@` references in the same change; without that,
+  `"@split.train"` is no path to lint, and a model reading the split that way escapes the
+  ungated-step check. Claude judged the gain (one fewer place to edit) too small for a
+  reference syntax that both the runner and the gate must understand. The glob form was
+  rejected by all three: it breaks the gate's name-based split detection.
+
 hda-v3's `predict` lists six model paths by hand (`model_<name>`, `meta_<name>`), copied
 from the `outputs` of the three train steps. Adding a model means editing two places, and
 nothing checks that they agree.
@@ -314,6 +333,14 @@ nothing checks that they agree.
   matching step (`m.train_hazard_smart`, …).
 
 ### B3. Clean outputs before a step reruns
+
+- **Decision:** approved by all three, and built as the opt-in step key `clean_outputs`
+  (see `README.md` "Pipeline file" and `GUIDE.md` §10). Opt-in because a failed rerun now
+  leaves no previous output, and a step that relied on its directory output surviving
+  must create it. The loader refuses a cleaned output outside the workdir or holding the
+  state folder, the pipeline file, an import root or a `watch` file. Since PR #13, `-o`
+  already warns when it leaves out a step that isn't current, so the case below is now
+  covered twice.
 
 Outputs are written in place. A failed rerun leaves the previous or half-written files
 behind; the checkpoint is forgotten, so the step does rerun next time.
@@ -329,6 +356,11 @@ would be safer, but `ctx.outputs` would then point somewhere else, which breaks 
 build paths relative to their outputs.
 
 ### B4. Fingerprint huge, unchanging inputs by size and time only
+
+- **Decision:** not approved (all three against). `(size, mtime_ns)` alone is the
+  silent-stale cache the runner is built to avoid, and the hash is already cached by size
+  and time. The cost came from putting `state_dir` inside `build/`; keep the state folder
+  out of anything you delete.
 
 The first run hashes hda-v3's 22 GB input, which takes about 80 s. Later runs reuse the
 cached hash, which is keyed by size and `mtime_ns`. The hash cache lives in
