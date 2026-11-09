@@ -117,6 +117,7 @@ timeout = 600                                 # seconds; the worker and its chil
 depends_on = []                               # extra ordering beyond file dependencies
 watch = ["sql/features.sql"]                  # non-Python files or dynamic imports that invalidate the step
 env = ["API_REGION"]                          # environment variables that change the step's results
+clean_outputs = false                         # true: delete the outputs just before the step runs
 description = "Fit a classifier"
 ```
 
@@ -126,6 +127,18 @@ input depends on a step when the paths match or one lies inside the other, as wi
 in another step's directory output. Cycles, duplicate names, two steps writing the same or
 overlapping outputs, a step reading its own output and unknown keys are rejected when the
 file is loaded.
+
+With `clean_outputs = true`, the runner deletes the step's declared outputs (files, or
+directories with everything in them) just before the step runs, so a failed run leaves
+nothing that looks current and a directory output keeps no files the new run didn't write.
+Cached steps, dry runs and steps that can't start are left alone, and a symlink is removed
+without following it. The step must create a directory output itself
+(`mkdir(exist_ok=True)`). An output it would delete must lie inside the workdir, outside the state
+folder, and must not contain the pipeline file, an import root, a step's module or a
+`watch` file. This is checked when the file is loaded and again just before deleting, in
+case an earlier step turned a folder on the path into a symlink. A step that reads a
+cleaned directory output must declare the whole directory as its input, not a file inside
+it: the loader can't tell such a file from your own data placed there by mistake.
 
 ## Writing a step
 

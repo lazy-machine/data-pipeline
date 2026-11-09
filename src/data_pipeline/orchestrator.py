@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from pathlib import Path
 from packaging.requirements import InvalidRequirement, Requirement
 
 from . import checkpoint
-from .config import Pipeline, Step, overlaps
+from .config import Pipeline, Step, output_entry, overlaps
 from .report import Reporter
 
 _PKG_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -90,6 +91,26 @@ def preflight(pipeline: Pipeline) -> dict[str, list[str]]:
         if found:
             issues[step.name] = found
     return issues
+
+
+def _clean_outputs(pipeline: Pipeline, step: Step) -> str | None:
+    """Delete a step's declared outputs before it reruns. Returns an error, or None.
+
+    Without this a failed rerun leaves the previous outputs looking current, and a
+    directory output keeps files the new run no longer writes.
+    """
+    for key, rel in step.outputs.items():
+        if problem := pipeline.cleaning_problem(rel):
+            return f"could not clean output '{key}' ({rel}): {problem}"
+        entry = output_entry(pipeline.workdir, rel)
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink(missing_ok=True)
+        except OSError as exc:
+            return f"could not clean output '{key}' ({rel}): {exc}"
+    return None
 
 
 def _missing_inputs(pipeline: Pipeline, step: Step) -> list[str]:
@@ -310,6 +331,8 @@ class Orchestrator:
 
         # 3. execute in an isolated worker
         self.state.forget(step.name)
+        if step.clean_outputs and (error := _clean_outputs(p, step)):
+            return Outcome(bad, error)
         t0 = time.perf_counter()
         log = p.state_dir / "logs" / f"{step.name}.log"
         self.running_log = log

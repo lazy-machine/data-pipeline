@@ -14,6 +14,7 @@ Example::
     params = { drop_na = true }
     requires = ["pandas>=2"]         # packages that must be installed
     critical = true                  # false -> failure is a warning, pipeline continues
+    clean_outputs = true             # delete the outputs just before the step runs
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ _FUNC_RE = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
 _PIPELINE_KEYS = {"name", "workdir", "python_path", "state_dir"}
 _STEP_KEYS = {
     "name", "function", "inputs", "outputs", "params", "requires",
-    "depends_on", "critical", "timeout", "watch", "env", "description",
+    "depends_on", "critical", "timeout", "watch", "env", "description", "clean_outputs",
 }
 
 
@@ -52,6 +53,7 @@ class Step:
     watch: list[str] = field(default_factory=list)
     env: list[str] = field(default_factory=list)
     description: str = ""
+    clean_outputs: bool = False
 
     @property
     def module(self) -> str:
@@ -81,6 +83,26 @@ class Pipeline:
             if s.name == name:
                 return s
         raise KeyError(name)
+
+    def cleaning_problem(self, rel: str) -> str | None:
+        """Why deleting the output ``rel`` could delete more than that output, or None.
+
+        Checked when the file is loaded and again just before deleting, because an
+        earlier step may have turned a folder on the path into a symlink in between.
+        """
+        entry = output_entry(self.workdir, rel)
+        if entry == self.workdir or not entry.is_relative_to(self.workdir):
+            return f"it must lie inside the workdir {self.workdir}"
+        if entry.is_relative_to(self.state_dir):
+            return f"it lies inside the state folder {self.state_dir}"
+        watched = [self.resolve(w) for s in self.steps for w in s.watch]
+        top = {s.module.split(".")[0] for s in self.steps}
+        sources = [root / f"{name}{ext}" for root in self.python_path for name in top
+                   for ext in ("", ".py")]
+        for p in [self.path, self.state_dir, *self.python_path, *watched, *sources]:
+            if p.is_relative_to(entry):
+                return f"it contains {p}"
+        return None
 
 
 def _expect(cond: bool, msg: str) -> None:
@@ -131,6 +153,9 @@ def _parse_step(raw: Any, idx: int) -> Step:
     description = raw.get("description", "")
     _expect(isinstance(description, str), f"{where}: description must be a string")
 
+    clean_outputs = raw.get("clean_outputs", False)
+    _expect(isinstance(clean_outputs, bool), f"{where}: clean_outputs must be true or false")
+
     return Step(
         name=name,
         function=func,
@@ -144,12 +169,22 @@ def _parse_step(raw: Any, idx: int) -> Step:
         watch=_str_list(raw.get("watch", []), f"{where}.watch"),
         env=_str_list(raw.get("env", []), f"{where}.env"),
         description=description,
+        clean_outputs=clean_outputs,
     )
 
 
 def overlaps(a: Path, b: Path) -> bool:
     """True when the paths are equal or one lies inside the other, as a file in a directory."""
     return a.is_relative_to(b) or b.is_relative_to(a)
+
+
+def output_entry(workdir: Path, rel: str) -> Path:
+    """The directory entry an output names: its parent resolved, its last part kept.
+
+    Cleaning removes this entry, so a symlink output is unlinked, never followed.
+    """
+    path = workdir / rel
+    return path.parent.resolve() / path.name
 
 
 def _build_graph(steps: list[Step], resolve) -> dict[str, list[str]]:
@@ -239,7 +274,7 @@ def load(path: str | Path) -> Pipeline:
 
     resolve = lambda rel: (workdir / rel).resolve()  # noqa: E731
     upstream = _build_graph(steps, resolve)
-    return Pipeline(
+    pipeline = Pipeline(
         name=meta.get("name", path.stem),
         path=path,
         workdir=workdir,
@@ -248,3 +283,19 @@ def load(path: str | Path) -> Pipeline:
         steps=_topological(steps, upstream),
         upstream=upstream,
     )
+    for s in steps:
+        for rel in s.outputs.values() if s.clean_outputs else []:
+            where = f"step '{s.name}': clean_outputs can't delete output '{rel}'"
+            _expect(Path(rel).name not in ("", ".."),
+                    f"{where}: it must name a file or directory")
+            problem = pipeline.cleaning_problem(rel)
+            _expect(problem is None, f"{where}: {problem}")
+            out = resolve(rel)
+            declared = {resolve(o) for o in s.outputs.values()}
+            for other in steps:
+                for inp in other.inputs.values():
+                    _expect(resolve(inp) in declared or not resolve(inp).is_relative_to(out),
+                            f"{where}: step '{other.name}' reads '{inp}' inside it, and the "
+                            f"loader can't tell that file from an old output. Declare "
+                            f"'{rel}' itself as the input, or don't clean it")
+    return pipeline
