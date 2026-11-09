@@ -612,15 +612,18 @@ otherwise old files remain in the directory, become part of its hash, and reach 
 step that reads it, the gate and the model included.
 
 ```toml
-clean_outputs = true                      # the runner empties build/regions before a rerun
+clean_outputs = true                      # the runner deletes build/regions before each run
 ```
 
 The runner deletes the declared outputs just before the step runs, never when it is cached
 or in a dry run. The step then starts from nothing, so keep the `mkdir`. The trade-off: when
 the rerun fails, the previous result is gone too, which is the point (it no longer matches
-the inputs), but copy it aside first if you want to compare. The loader refuses an output
-that would delete more than outputs: one outside the workdir, or one holding the state
-folder, the pipeline file, an import root or a `watch` file.
+the inputs), but copy it aside first if you want to compare. The runner refuses to delete
+an output outside the workdir or inside the state folder, or one holding the pipeline file,
+an import root, a step's module or a `watch` file: when the file is loaded, and again just
+before deleting. Later steps must read the cleaned directory as a whole
+(`inputs = { d = "build/regions" }`), not a file inside it, so that a typo such as
+`outputs = { dir = "data" }` can't wipe `data/raw.csv` that another step reads.
 
 ### Comparing models: one step per variant
 

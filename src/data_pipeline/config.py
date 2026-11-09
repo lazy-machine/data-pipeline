@@ -14,7 +14,7 @@ Example::
     params = { drop_na = true }
     requires = ["pandas>=2"]         # packages that must be installed
     critical = true                  # false -> failure is a warning, pipeline continues
-    clean_outputs = true             # delete the outputs before the step reruns
+    clean_outputs = true             # delete the outputs just before the step runs
 """
 
 from __future__ import annotations
@@ -83,6 +83,26 @@ class Pipeline:
             if s.name == name:
                 return s
         raise KeyError(name)
+
+    def cleaning_problem(self, rel: str) -> str | None:
+        """Why deleting the output ``rel`` could delete more than that output, or None.
+
+        Checked when the file is loaded and again just before deleting, because an
+        earlier step may have turned a folder on the path into a symlink in between.
+        """
+        entry = output_entry(self.workdir, rel)
+        if entry == self.workdir or not entry.is_relative_to(self.workdir):
+            return f"it must lie inside the workdir {self.workdir}"
+        if entry.is_relative_to(self.state_dir):
+            return f"it lies inside the state folder {self.state_dir}"
+        watched = [self.resolve(w) for s in self.steps for w in s.watch]
+        top = {s.module.split(".")[0] for s in self.steps}
+        sources = [root / f"{name}{ext}" for root in self.python_path for name in top
+                   for ext in ("", ".py")]
+        for p in [self.path, self.state_dir, *self.python_path, *watched, *sources]:
+            if p.is_relative_to(entry):
+                return f"it contains {p}"
+        return None
 
 
 def _expect(cond: bool, msg: str) -> None:
@@ -165,26 +185,6 @@ def output_entry(workdir: Path, rel: str) -> Path:
     """
     path = workdir / rel
     return path.parent.resolve() / path.name
-
-
-def _check_cleanable(steps: list[Step], workdir: Path, protected: list[Path]) -> None:
-    """Refuse to load a pipeline whose ``clean_outputs`` could delete more than outputs.
-
-    A path typed by mistake, such as ``"."`` or ``"data"``, would otherwise be deleted
-    with everything under it on the next run.
-    """
-    for s in steps:
-        if not s.clean_outputs:
-            continue
-        for rel in s.outputs.values():
-            where = f"step '{s.name}': clean_outputs can't delete output '{rel}'"
-            _expect(Path(rel).name not in ("", ".."),
-                    f"{where}: it must name a file or directory")
-            entry = output_entry(workdir, rel)
-            _expect(entry != workdir and entry.is_relative_to(workdir),
-                    f"{where}: it must lie inside the workdir {workdir}")
-            for p in protected:
-                _expect(not p.is_relative_to(entry), f"{where}: it contains {p}")
 
 
 def _build_graph(steps: list[Step], resolve) -> dict[str, list[str]]:
@@ -274,10 +274,7 @@ def load(path: str | Path) -> Pipeline:
 
     resolve = lambda rel: (workdir / rel).resolve()  # noqa: E731
     upstream = _build_graph(steps, resolve)
-    protected = [path, state_dir, *python_path,
-                 *(resolve(rel) for s in steps for rel in s.watch)]
-    _check_cleanable(steps, workdir, protected)
-    return Pipeline(
+    pipeline = Pipeline(
         name=meta.get("name", path.stem),
         path=path,
         workdir=workdir,
@@ -286,3 +283,18 @@ def load(path: str | Path) -> Pipeline:
         steps=_topological(steps, upstream),
         upstream=upstream,
     )
+    for s in steps:
+        for rel in s.outputs.values() if s.clean_outputs else []:
+            where = f"step '{s.name}': clean_outputs can't delete output '{rel}'"
+            _expect(Path(rel).name not in ("", ".."),
+                    f"{where}: it must name a file or directory")
+            problem = pipeline.cleaning_problem(rel)
+            _expect(problem is None, f"{where}: {problem}")
+            out = resolve(rel)
+            for other in steps:
+                for inp in other.inputs.values():
+                    _expect(resolve(inp) == out or not resolve(inp).is_relative_to(out),
+                            f"{where}: step '{other.name}' reads '{inp}' inside it, and the "
+                            f"loader can't tell that file from an old output. Declare "
+                            f"'{rel}' itself as the input, or don't clean it")
+    return pipeline

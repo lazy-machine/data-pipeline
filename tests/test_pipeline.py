@@ -105,6 +105,10 @@ def write_files(ctx):
     for name in ctx.params["names"]:
         (ctx.outputs["d"] / name).write_text(name)
 
+def link_data(ctx):
+    (ctx.workdir / "data").symlink_to(ctx.params["target"], target_is_directory=True)
+    ctx.outputs["o"].write_text("linked")
+
 def spawn_child_then_hang(ctx):
     import subprocess
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -1263,7 +1267,8 @@ def test_clean_outputs_unlinks_a_symlink_without_following_it(tmp_path):
     result, _ = run(cfg)
     assert statuses(result) == {"regions": "ran"}
     assert not (tmp_path / "out/regions").is_symlink()
-    assert (kept / "keep.txt").read_text() == "keep"
+    assert (tmp_path / "out/regions/a.csv").read_text() == "a.csv"
+    assert sorted(f.name for f in kept.iterdir()) == ["keep.txt"]
 
 
 def test_turning_clean_outputs_on_does_not_rerun_the_step(tmp_path):
@@ -1296,6 +1301,9 @@ def test_an_output_that_cannot_be_cleaned_fails_the_step(tmp_path, monkeypatch):
     ("steps", "", "it contains .*steps"),
     ("state", 'state_dir = "state/runs"', "it contains .*runs"),
     ("sql", "", "it contains .*q.sql"),
+    ("pipeline.toml", "", "it contains .*pipeline.toml"),
+    (".pipeline/logs", "", "inside the state folder"),
+    ("linked/regions", "", "must lie inside the workdir"),
 ])
 def test_clean_outputs_refuses_paths_that_hold_more_than_outputs(tmp_path, output, header, msg):
     cfg = make(tmp_path, f"""
@@ -1308,6 +1316,7 @@ clean_outputs = true
 """.replace("WATCH", '["sql/q.sql"]' if output == "sql" else "[]"), header)
     (tmp_path / "sql").mkdir()
     (tmp_path / "sql/q.sql").write_text("select 1")
+    (tmp_path / "linked").symlink_to(tmp_path.parent, target_is_directory=True)
     with pytest.raises(config.ConfigError, match=msg):
         config.load(cfg)
     cfg.write_text(cfg.read_text().replace("clean_outputs = true", "clean_outputs = false"))
@@ -1317,4 +1326,65 @@ clean_outputs = true
 def test_clean_outputs_must_be_a_boolean(tmp_path):
     cfg = make(tmp_path, '[[steps]]\nname = "a"\nfunction = "m:f"\nclean_outputs = "yes"\n')
     with pytest.raises(config.ConfigError, match="clean_outputs must be true or false"):
+        config.load(cfg)
+
+
+def test_clean_outputs_rechecks_a_path_an_earlier_step_turned_into_a_symlink(tmp_path):
+    (tmp_path / "proj").mkdir()
+    shared = tmp_path / "shared"
+    (shared / "regions").mkdir(parents=True)
+    (shared / "regions" / "keep.txt").write_text("not ours")
+    cfg = make(tmp_path, f"""
+[[steps]]
+name = "link"
+function = "fns:link_data"
+outputs = {{ o = "ready.txt" }}
+params = {{ target = "{shared}" }}
+
+[[steps]]
+name = "regions"
+function = "fns:write_files"
+inputs = {{ ready = "ready.txt" }}
+outputs = {{ d = "data/regions" }}
+params = {{ names = ["a.csv"] }}
+clean_outputs = true
+""", 'workdir = "proj"')
+    result, _ = run(cfg)
+    assert result.halted_by == "regions"
+    assert "must lie inside the workdir" in result.outcomes["regions"].detail
+    assert (shared / "regions" / "keep.txt").read_text() == "not ours"
+
+
+def test_clean_outputs_refuses_an_output_holding_another_steps_input(tmp_path):
+    cfg = make(tmp_path, """
+[[steps]]
+name = "features"
+function = "fns:write_files"
+outputs = { d = "data" }
+params = { names = ["clean.csv"] }
+clean_outputs = true
+
+[[steps]]
+name = "train"
+function = "fns:copy"
+inputs = { src = "data/raw.csv" }
+outputs = { dst = "model.txt" }
+""")
+    with pytest.raises(config.ConfigError, match="step 'train' reads 'data/raw.csv' inside it"):
+        config.load(cfg)
+    cfg.write_text(cfg.read_text().replace("data/raw.csv", "data"))
+    config.load(cfg)
+
+
+def test_clean_outputs_refuses_an_output_holding_a_steps_source(tmp_path):
+    make(tmp_path, "")
+    cfg = tmp_path / "flat.toml"
+    cfg.write_text(textwrap.dedent("""
+        [[steps]]
+        name = "a"
+        function = "steps.fns:no_output"
+        outputs = { d = "steps" }
+        clean_outputs = true
+    """))
+    with pytest.raises(config.ConfigError, match="it contains .*steps"):
         config.load(cfg)

@@ -100,6 +100,8 @@ def _clean_outputs(pipeline: Pipeline, step: Step) -> str | None:
     directory output keeps files the new run no longer writes.
     """
     for key, rel in step.outputs.items():
+        if problem := pipeline.cleaning_problem(rel):
+            return f"could not clean output '{key}' ({rel}): {problem}"
         entry = output_entry(pipeline.workdir, rel)
         try:
             if entry.is_dir() and not entry.is_symlink():

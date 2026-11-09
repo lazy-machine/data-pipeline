@@ -337,8 +337,10 @@ nothing checks that they agree.
 - **Decision:** approved by all three, and built as the opt-in step key `clean_outputs`
   (see `README.md` "Pipeline file" and `GUIDE.md` §10). Opt-in because a failed rerun now
   leaves no previous output, and a step that relied on its directory output surviving
-  must create it. The loader refuses a cleaned output outside the workdir or holding the
-  state folder, the pipeline file, an import root or a `watch` file. Since PR #13, `-o`
+  must create it. The runner refuses a cleaned output outside the workdir or inside the
+  state folder, or one holding the pipeline file, an import root, a step's module or a
+  `watch` file, both at load time and just before deleting; and another step may read a
+  cleaned directory only as a whole. Since PR #13, `-o`
   already warns when it leaves out a step that isn't current, so the case below is now
   covered twice.
 
