@@ -179,10 +179,11 @@ every output still has the recorded hash. Hashes are content-based, so when an u
 step re-runs and writes byte-identical outputs, the steps after it stay cached. File hashes
 are cached by size, mtime, ctime and inode, so large unchanged files are not re-read. Size
 and mtime can be put back after an edit (`os.utime`), but ctime cannot be set from user
-space and a replaced file gets a new inode, so either catches the edit. A file changed less
-than 2 s before it was hashed is read again on the next run, since its timestamps may not
-have ticked yet. What the cache still trusts is the system clock and a filesystem that
-updates ctime; to re-read every byte, run with `-f` or delete `state.json`.
+space and a replaced file gets a new inode, so either catches the edit. A hash taken less
+than 2 s after the file last changed is never reused (the file is read again), since its
+timestamps may not have ticked yet. What the cache still trusts is the system clock and a
+filesystem that updates ctime; to re-read every byte, delete `state.json` (`-f` reruns
+the steps but keeps the hash cache).
 
 A `state.json` that isn't valid JSON, isn't a version 1 state file, or holds a malformed
 checkpoint is reported as a warning, and the steps it can't vouch for rerun. Run one

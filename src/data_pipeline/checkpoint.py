@@ -28,7 +28,7 @@ from .config import Pipeline, Step
 _STATE_VERSION = 1
 _CHUNK = 1 << 20
 # A file changed within this long of being hashed can change again without moving its
-# timestamps (they tick coarsely), so its hash is not kept for the next run.
+# timestamps (they tick coarsely), so its hash is never reused: it is read again.
 _RACY_NS = 2_000_000_000
 _RECORD_DICTS = ("inputs", "outputs", "imports", "packages", "env")
 
@@ -59,7 +59,8 @@ class State:
         except (ValueError, OSError) as exc:
             self.problems.append(f"{self.path.name} is unreadable ({exc}); every step reruns")
             return
-        if not isinstance(data, dict) or data.get("version") != _STATE_VERSION:
+        if not isinstance(data, dict) or type(data.get("version")) is not int \
+                or data["version"] != _STATE_VERSION:
             self.problems.append(f"{self.path.name} is not a version {_STATE_VERSION} state "
                                  "file; every step reruns")
             return
@@ -85,13 +86,14 @@ class State:
         Size and mtime alone can be put back (``os.utime``) after the bytes change; ctime
         cannot be set from user space and the inode changes when a file is replaced, so all
         four have to match. A cached hash still trusts the clock and the filesystem: a full
-        re-read needs ``-f`` or a deleted state file.
+        re-read needs a deleted state file.
         """
+        now = time.time_ns()  # before stat: a change after it is what a racy hash would miss
         st = path.stat()
         key = str(path)
         meta = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino]
         cached = self._files.get(key)
-        if cached and cached[:4] == meta:
+        if cached and cached[:4] == meta and key not in self._racy:
             return cached[4]
         h = hashlib.sha256()
         with path.open("rb") as fh:
@@ -99,7 +101,7 @@ class State:
                 h.update(chunk)
         digest = h.hexdigest()
         self._files[key] = [*meta, digest]
-        if time.time_ns() - max(st.st_mtime_ns, st.st_ctime_ns) < _RACY_NS:
+        if now - max(st.st_mtime_ns, st.st_ctime_ns) < _RACY_NS:
             self._racy.add(key)
         else:
             self._racy.discard(key)

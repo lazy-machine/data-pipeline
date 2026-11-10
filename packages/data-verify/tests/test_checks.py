@@ -185,10 +185,27 @@ def test_conservation_sees_a_timestamp_moved_by_a_nanosecond(case, source):
     (pd.Series([1.5]), pd.Series([np.float64(1.5).view("int64")])),
     (pd.Series([np.inf]), pd.Series([-np.inf])),
     (pd.Series([np.nan]), pd.Series([0.0])),
+    (pd.Series(["3"]), pd.Series([3])),
+    # pandas hashes integers with an invertible mix, so with per-type tags XORed on top this
+    # integer was computed to hash exactly like 1.5
+    (pd.Series([1.5]), pd.Series([-4685937998608076249], dtype="int64")),
 ])
 def test_row_hashes_keep_different_numbers_apart(a, b):
     from data_verify.core import row_hashes
     assert row_hashes(pd.DataFrame({"x": a}), ["x"])[0] != row_hashes(pd.DataFrame({"x": b}), ["x"])[0]
+
+
+def test_conservation_sees_an_integer_crafted_to_collide_with_a_float(tmp_path):
+    """An altered row computed to share the hash of a source row must not pass as that row."""
+    from data_verify.step import run
+    src, train = tmp_path / "source.parquet", tmp_path / "train.parquet"
+    pd.DataFrame({"x": [1.5]}).to_parquet(src, index=False)
+    pd.DataFrame({"x": pd.Series([-4685937998608076249], dtype="int64")}).to_parquet(train, index=False)
+    report = run({"source": "source", "id": "x", "checks": {"split.conservation": {"exact": True}}},
+                 {"source": src, "train": train}, log=lambda *a: None, workdir=tmp_path)
+    check = next(c for c in report["checks"] if c["id"] == "split.conservation")
+    assert check["status"] == "fail"
+    assert check["details"]["splits"]["train"]["not_in_source"] == 1
 
 
 @pytest.mark.parametrize("a, b", [

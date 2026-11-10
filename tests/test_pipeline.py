@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -1395,10 +1396,11 @@ def test_clean_outputs_refuses_an_output_holding_a_steps_source(tmp_path):
 # -- trust in the file-hash cache and the state file ---------------------------------------
 
 
-def _swap_keeping_size_and_mtime(path: Path, text: str) -> None:
+def _swap_keeping_size_and_mtime(path: Path, text: str, wait: bool = True) -> None:
     st = path.stat()
     assert len(text.encode()) == st.st_size
-    time.sleep(0.05)  # past the coarse tick of the kernel clock, so ctime moves
+    while wait and time.time_ns() - st.st_ctime_ns < 100_000_000:
+        time.sleep(0.01)  # well past the coarse tick of file timestamps, so ctime moves
     path.write_text(text)
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
     assert path.stat().st_mtime_ns == st.st_mtime_ns
@@ -1411,6 +1413,18 @@ def test_hash_cache_sees_bytes_changed_under_the_same_size_and_mtime(tmp_path):
     before = state.hash_path(f)
     _swap_keeping_size_and_mtime(f, "evil")
     assert state.hash_path(f) != before
+
+
+def test_hash_cache_sees_bytes_changed_in_the_same_tick_as_the_hash(tmp_path):
+    """Changed at once, the file can keep its size, mtime, ctime and inode: a hash taken so
+    soon after a change is never reused, in this run or the next."""
+    f = tmp_path / "f.txt"
+    for _ in range(20):
+        f.write_text("safe")
+        state = checkpoint.State(tmp_path / ".pipeline")
+        assert state.hash_path(f) == checkpoint.State(tmp_path / "x").hash_path(f)
+        _swap_keeping_size_and_mtime(f, "evil", wait=False)
+        assert state.hash_path(f) == hashlib.sha256(b"evil").hexdigest()
 
 
 def test_hash_cache_sees_a_file_replaced_by_one_with_the_same_size_and_mtime(tmp_path):
@@ -1469,6 +1483,13 @@ def test_old_three_field_hash_entries_are_read_again(tmp_path, monkeypatch):
     assert not state.problems
 
 
+@pytest.mark.parametrize("timeout", ["true", "inf", "nan", "0", "-1", "1" + "0" * 400])
+def test_unusable_timeouts_are_config_errors(tmp_path, timeout):
+    cfg = make(tmp_path, f'[[steps]]\nname = "a"\nfunction = "m:f"\ntimeout = {timeout}\n')
+    with pytest.raises(config.ConfigError, match="timeout must be a positive number"):
+        config.load(cfg)
+
+
 @pytest.mark.parametrize("header, msg", [
     ("workdir = 42", r"\[pipeline\].workdir must be a string"),
     ("state_dir = []", r"\[pipeline\].state_dir must be a string"),
@@ -1511,6 +1532,7 @@ def test_cli_reports_invalid_pipeline_metadata_as_a_config_error(tmp_path, capsy
     ("[]", "not a version 1 state file"),
     ('"state"', "not a version 1 state file"),
     ('{"version": 99, "steps": {}}', "not a version 1 state file"),
+    ('{"version": true, "steps": {}}', "not a version 1 state file"),
     ("{not json", "state.json is unreadable"),
     ('{"version": 1, "steps": []}', "'steps' is not a table"),
     ('{"version": 1, "steps": {"upper": [], "count": []}}', "checkpoint of 'upper' is malformed"),

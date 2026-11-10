@@ -480,7 +480,9 @@ pipeline after the split, since the gate can't confirm that from the data.
 [docs/CHECKS.md](docs/CHECKS.md) describes each one. Checks that match rows exactly (ids,
 `source` conservation, identical rows across splits) compare numbers as numbers: `3`, `3.0`
 and `True == 1` match across CSV and parquet, while integers and timestamps keep every digit,
-so ids above 2**53 or times a nanosecond apart stay distinct. By area:
+so ids above 2**53 or times a nanosecond apart stay distinct. Rows are matched by a SipHash
+of each value's type and exact value, so an altered row can't be computed to pass for a
+source row. By area:
 
 **split**
 - Blocks: same `id` or `group` in two splits; repeated ids; split not matching

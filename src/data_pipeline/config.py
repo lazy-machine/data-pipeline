@@ -19,6 +19,7 @@ Example::
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -151,8 +152,14 @@ def _parse_step(raw: Any, idx: int) -> Step:
     _expect(isinstance(critical, bool), f"{where}: critical must be true or false")
 
     timeout = raw.get("timeout")
-    _expect(timeout is None or (isinstance(timeout, (int, float)) and timeout > 0),
-            f"{where}: timeout must be a positive number of seconds")
+    if timeout is not None:
+        ok = isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+        try:
+            timeout = float(timeout) if ok else None
+        except OverflowError:
+            timeout = None
+        _expect(timeout is not None and math.isfinite(timeout) and timeout > 0,
+                f"{where}: timeout must be a positive number of seconds")
 
     params = raw.get("params", {})
     _expect(isinstance(params, dict), f"{where}: params must be a table")
@@ -172,7 +179,7 @@ def _parse_step(raw: Any, idx: int) -> Step:
         requires=_str_list(raw.get("requires", []), f"{where}.requires"),
         depends_on=_str_list(raw.get("depends_on", []), f"{where}.depends_on"),
         critical=critical,
-        timeout=float(timeout) if timeout is not None else None,
+        timeout=timeout,
         watch=_path_list(raw.get("watch", []), f"{where}.watch"),
         env=_str_list(raw.get("env", []), f"{where}.env"),
         description=description,
