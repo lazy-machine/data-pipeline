@@ -258,10 +258,11 @@ _NORMALIZE_RE = r"[\W_]+"
 # A value is coded as a type tag and 16 bytes that identify it within that type, so values
 # of different types can never be confused and equal values code alike whatever the dtype.
 # Missing text has a tag of its own: any string used for it could be written as data.
-_INT, _UINT, _FLOAT, _TEXT, _NO_TEXT, _TIME, _SPAN = range(7)
+_INT, _UINT, _FLOAT, _TEXT, _NO_TEXT, _TIME, _SPAN, _OBJECT = range(8)
 _CODE = 17
 _TEXT_KEYS = ("data-verify:text", "data-verify:txt2")  # two 64-bit SipHash keys: 128 bits
 _INT64_MAX = np.iinfo(np.int64).max
+_UINT64_MAX = np.iinfo(np.uint64).max
 
 
 def _codes(tags: np.ndarray, low: np.ndarray, high: np.ndarray | None = None) -> np.ndarray:
@@ -326,6 +327,10 @@ def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
     normalises text (case, punctuation, whitespace).
     """
     k = kind(s)
+    if k == "string" and (s.dtype == object or isinstance(s.dtype, pd.CategoricalDtype)):
+        values = s.to_numpy(dtype=object)
+        if pd.api.types.infer_dtype(values, skipna=True) not in ("string", "empty"):
+            return _mixed_codes(values, near, bits)
     if k in ("int", "float", "bool", "datetime"):
         if not near:
             return _exact_number_codes(s, k)
@@ -342,6 +347,42 @@ def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
     low, high = (pd.util.hash_array(values, hash_key=key, categorize=False) for key in _TEXT_KEYS)
     low[missing] = high[missing] = 0
     return _codes(np.where(missing, _NO_TEXT, _TEXT).astype(np.uint8), low, high)
+
+
+def _mixed_codes(values: np.ndarray, near: bool, bits: int) -> np.ndarray:
+    """An object column that holds more than text (JSON, pickles, categories of numbers),
+    coded value by value: a number as that number, text as text, anything else by its type
+    and repr. Stringifying the column first would let 1 pass for "1"."""
+    groups: dict[str, list[int]] = {}
+    items: dict[str, list] = {}
+    for i, v in enumerate(values):
+        if isinstance(v, (bool, np.bool_)):
+            g = "bool"
+        elif isinstance(v, (int, np.integer)):
+            g = ("int" if -_INT64_MAX - 1 <= v <= _INT64_MAX else "uint" if 0 <= v <= _UINT64_MAX
+                 else "float" if float(v) == v else "object")
+        elif isinstance(v, (float, np.floating)):
+            g = "float"
+        elif isinstance(v, str):
+            g = "text"
+        elif v is None or v is pd.NA or v is pd.NaT:
+            g = "missing"
+        else:
+            g = "object"
+            v = f"{type(v).__module__}.{type(v).__qualname__}:{v!r}"
+        groups.setdefault(g, []).append(i)
+        items.setdefault(g, []).append(float(v) if g == "float" else v)
+    dtypes = {"bool": "bool", "int": "int64", "uint": "uint64", "float": "float64",
+              "text": "string", "object": "string"}
+    out = np.zeros((len(values), _CODE), dtype=np.uint8)
+    for g, idx in groups.items():
+        if g == "missing":
+            out[idx, 0] = _NO_TEXT
+            continue
+        out[idx] = canonical(pd.Series(items[g], dtype=dtypes[g]), near, bits)
+        if g == "object":
+            out[idx, 0] = _OBJECT
+    return out
 
 
 def row_hashes(df: pd.DataFrame, cols: list[str], near: bool = False, bits: int = 10) -> np.ndarray:
