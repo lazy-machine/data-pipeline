@@ -6,6 +6,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import math
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -257,8 +258,8 @@ _NORMALIZE_RE = r"[\W_]+"
 
 # A value is coded as a type tag and 16 bytes that identify it within that type, so values
 # of different types can never be confused and equal values code alike whatever the dtype.
-# Missing text has a tag of its own: any string used for it could be written as data.
-_INT, _UINT, _FLOAT, _TEXT, _NO_TEXT, _TIME, _SPAN, _OBJECT = range(8)
+# Missing text codes as a missing number (NaN), never as a string that data could hold.
+_INT, _UINT, _FLOAT, _TEXT, _TIME, _SPAN, _OBJECT = range(7)
 _CODE = 17
 _TEXT_KEYS = ("data-verify:text", "data-verify:txt2")  # two 64-bit SipHash keys: 128 bits
 _INT64_MAX = np.iinfo(np.int64).max
@@ -345,41 +346,68 @@ def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
     missing = text.isna().to_numpy()
     values = text.fillna("").to_numpy(dtype=object)
     low, high = (pd.util.hash_array(values, hash_key=key, categorize=False) for key in _TEXT_KEYS)
-    low[missing] = high[missing] = 0
-    return _codes(np.where(missing, _NO_TEXT, _TEXT).astype(np.uint8), low, high)
+    out = _codes(np.full(len(values), _TEXT, np.uint8), low, high)
+    out[missing] = _codes(np.array([_FLOAT], np.uint8), _float_bits(np.array([np.nan])))
+    return out
+
+
+def _is_missing(v: Any) -> bool:
+    if v is None or v is pd.NA or v is pd.NaT:
+        return True
+    return isinstance(v, (float, np.floating, np.datetime64, np.timedelta64)) and bool(pd.isna(v))
+
+
+def _full_repr(v: Any) -> str:
+    """Type and repr, with arrays (also nested in lists or dicts) printed in full and floats
+    to the last digit: numpy's default repr shortens both, hiding a changed element."""
+    with np.printoptions(threshold=sys.maxsize, floatmode="unique"):
+        return f"{type(v).__module__}.{type(v).__qualname__}:{v!r}"
+
+
+def _number_group(v: Any) -> tuple[str, Any]:
+    """Which exact coding a Python or numpy number takes, and the value to code."""
+    if isinstance(v, (bool, np.bool_)):
+        return "bool", v
+    if isinstance(v, (int, np.integer)):
+        if -_INT64_MAX - 1 <= v <= _INT64_MAX:
+            return "int", v
+        if 0 <= v <= _UINT64_MAX:
+            return "uint", v
+    try:
+        f = float(v)
+    except OverflowError:
+        return "object", _full_repr(v)
+    if f == v:  # exactly a float64: equal to that float wherever it appears
+        return "float", f
+    return "object", _full_repr(v)  # wider than float64 (np.longdouble, ints beyond 2**64)
 
 
 def _mixed_codes(values: np.ndarray, near: bool, bits: int) -> np.ndarray:
     """An object column that holds more than text (JSON, pickles, categories of numbers),
-    coded value by value: a number as that number, text as text, anything else by its type
-    and repr. Stringifying the column first would let 1 pass for "1"."""
+    coded value by value: a number as that number, text as text, a missing value (None, NaN,
+    NA, NaT) as missing, anything else by its type and full repr. Stringifying the column
+    first would let 1 pass for "1"."""
     groups: dict[str, list[int]] = {}
     items: dict[str, list] = {}
     for i, v in enumerate(values):
-        if isinstance(v, (bool, np.bool_)):
-            g = "bool"
-        elif isinstance(v, (int, np.integer)):
-            g = ("int" if -_INT64_MAX - 1 <= v <= _INT64_MAX else "uint" if 0 <= v <= _UINT64_MAX
-                 else "float" if float(v) == v else "object")
-        elif isinstance(v, (float, np.floating)):
-            g = "float"
-        elif isinstance(v, str):
-            g = "text"
-        elif v is None or v is pd.NA or v is pd.NaT:
+        if _is_missing(v):
             g = "missing"
+        elif isinstance(v, (np.datetime64, np.timedelta64)):  # numpy counts these as integers
+            g, v = "object", _full_repr(v)
+        elif isinstance(v, (int, float, np.integer, np.floating)):
+            g, v = _number_group(v)
+        elif isinstance(v, str):
+            g, v = "text", str(v)
         else:
-            g = "object"
-            v = f"{type(v).__module__}.{type(v).__qualname__}:{v!r}"
+            g, v = "object", _full_repr(v)
         groups.setdefault(g, []).append(i)
-        items.setdefault(g, []).append(float(v) if g == "float" else v)
+        items.setdefault(g, []).append(v)
     dtypes = {"bool": "bool", "int": "int64", "uint": "uint64", "float": "float64",
-              "text": "string", "object": "string"}
+              "text": "string", "object": "string", "missing": "float64"}
     out = np.zeros((len(values), _CODE), dtype=np.uint8)
     for g, idx in groups.items():
-        if g == "missing":
-            out[idx, 0] = _NO_TEXT
-            continue
-        out[idx] = canonical(pd.Series(items[g], dtype=dtypes[g]), near, bits)
+        vals = [np.nan] * len(idx) if g == "missing" else items[g]
+        out[idx] = canonical(pd.Series(vals, dtype=dtypes[g]), near, bits)
         if g == "object":
             out[idx, 0] = _OBJECT
     return out

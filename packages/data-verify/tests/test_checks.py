@@ -201,6 +201,12 @@ def test_conservation_sees_a_timestamp_moved_by_a_nanosecond(case, source):
     (pd.Series([b"a", 1], dtype=object), pd.Series(["a", 1], dtype=object)),
     (pd.Series([b"a", 1], dtype=object), pd.Series(["b'a'", 1], dtype=object)),
     (pd.Series([2**70 + 1, "a"], dtype=object), pd.Series([float(2**70), "a"], dtype=object)),
+    (pd.Series([np.longdouble("1.000000000000000001"), "a"], dtype=object),
+     pd.Series([np.longdouble("1.000000000000000002"), "a"], dtype=object)),
+    (pd.Series([np.timedelta64(5, "ns"), "a"], dtype=object), pd.Series([5, "a"], dtype=object)),
+    (pd.Series([10**400, "a"], dtype=object), pd.Series([10**400 + 1, "a"], dtype=object)),
+    (pd.Series([np.zeros(2000)]), pd.Series([np.where(np.arange(2000) == 1000, 1.0, 0.0)])),
+    (pd.Series([[np.array([1.000000001])]]), pd.Series([[np.array([1.000000002])]])),
 ])
 def test_row_hashes_keep_different_values_apart(a, b):
     from data_verify.core import row_hashes
@@ -236,6 +242,27 @@ def test_conservation_sees_a_value_written_as_another_type(tmp_path, source, alt
     assert check["status"] == "fail"
 
 
+def test_cross_split_sees_a_missing_value_written_as_none_in_one_split_and_nan_in_another(case):
+    frames = {"train": pd.DataFrame({"x": pd.Series([None, 1, "anchor"], dtype=object)}),
+              "test": pd.DataFrame({"x": pd.Series([np.nan, 2, "other"], dtype=object)})}
+    paths = {k: case.tmp / f"{k}.pkl" for k in frames}
+    for k, df in frames.items():
+        df.to_pickle(paths[k])
+    from data_verify.step import run
+    report = run({"allow_pickle": True}, paths, log=lambda *a: None, workdir=case.tmp)
+    check = next(c for c in report["checks"] if c["id"] == "duplicates.cross_split")
+    assert check["status"] == "fail"
+
+
+@pytest.mark.parametrize("value", [np.timedelta64(5, "ns"), 10**400, np.longdouble("1.1")],
+                         ids=["timedelta64", "huge-int", "longdouble"])
+def test_unusual_values_in_a_mixed_column_hash_without_error(value):
+    from data_verify.core import row_hashes
+    df = pd.DataFrame({"x": pd.Series([value, "anchor"], dtype=object)})
+    assert (row_hashes(df, ["x"]) == row_hashes(df.copy(), ["x"])).all()
+    assert len(set(row_hashes(df, ["x"], near=True))) == 2
+
+
 @pytest.mark.parametrize("source, altered", [([1, 2, "anchor"], ["1", 2, "anchor"]),
                                              ([1.5, 2, "anchor"], ["1.5", 2, "anchor"])])
 def test_conservation_sees_a_number_turned_into_text_in_a_mixed_json_column(tmp_path, source,
@@ -269,6 +296,10 @@ def test_conservation_sees_a_number_turned_into_text_in_a_mixed_json_column(tmp_
     (pd.Series([True, "a"], dtype=object), pd.Series([1.0, "a"], dtype=object)),
     (pd.Series([2**70, "a"], dtype=object), pd.Series([float(2**70), "a"], dtype=object)),
     (pd.Series(["a", 1], dtype=object), pd.Series(["a", 1.0], dtype=object)),
+    (pd.Series([None, 1], dtype=object), pd.Series([np.nan, 1], dtype=object)),
+    (pd.Series([pd.NA, 1], dtype=object), pd.Series([pd.NaT, 1], dtype=object)),
+    (pd.Series([None], dtype="string"), pd.Series([np.nan])),
+    (pd.Series([np.longdouble(1.5), "a"], dtype=object), pd.Series([1.5, "a"], dtype=object)),
     (pd.Series([pd.NaT], dtype="datetime64[ns]"), pd.Series([np.nan])),
     (pd.Series([pd.Timestamp("2023-05-01 02:00", tz="Europe/Berlin")]),
      pd.Series([pd.Timestamp("2023-05-01 00:00")])),

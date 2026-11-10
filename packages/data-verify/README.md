@@ -483,7 +483,10 @@ and `True == 1` match across CSV and parquet, while integers and timestamps keep
 so ids above 2**53 or times a nanosecond apart stay distinct. Rows are matched by a SipHash
 of each value's type and exact value, so an altered row can't be computed to pass for a
 source row. A date is not the integer of its nanoseconds, missing text is not any string,
-and in a column of mixed values (JSON, categories) `1` is a number, not the text `"1"`. By area:
+and in a column of mixed values (JSON, categories) `1` is a number, not the text `"1"`.
+Missing values match each other (`None`, `NaN`, `NA`, `NaT`). Other objects, such as
+lists, arrays and pickled values, match by type and full `repr`: exact for plain data,
+but an object whose `repr` hides its state or shows its address is not compared exactly. By area:
 
 **split**
 - Blocks: same `id` or `group` in two splits; repeated ids; split not matching
