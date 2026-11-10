@@ -189,6 +189,11 @@ def test_conservation_sees_a_timestamp_moved_by_a_nanosecond(case, source):
     # pandas hashes integers with an invertible mix, so with per-type tags XORed on top this
     # integer was computed to hash exactly like 1.5
     (pd.Series([1.5]), pd.Series([-4685937998608076249], dtype="int64")),
+    (pd.Series([None], dtype="string"), pd.Series(["\0<NA>"], dtype="string")),
+    (pd.Series([None], dtype=object), pd.Series([""])),
+    (pd.Series([pd.Timestamp("2023-01-01")]), pd.Series([1672531200000000000])),
+    (pd.Series([pd.Timedelta(5, "ns")]), pd.Series([5])),
+    (pd.Series([pd.Timedelta(5, "ns")]), pd.Series([pd.Timestamp(5, unit="ns")])),
 ])
 def test_row_hashes_keep_different_numbers_apart(a, b):
     from data_verify.core import row_hashes
@@ -208,6 +213,22 @@ def test_conservation_sees_an_integer_crafted_to_collide_with_a_float(tmp_path):
     assert check["details"]["splits"]["train"]["not_in_source"] == 1
 
 
+@pytest.mark.parametrize("source, altered", [
+    (pd.Series([None], dtype="string"), pd.Series(["\0<NA>"], dtype="string")),
+    (pd.Series([pd.Timestamp("2023-01-01")]), pd.Series([1672531200000000000])),
+])
+def test_conservation_sees_a_value_written_as_another_type(tmp_path, source, altered):
+    """Missing text is not any string, and a date is not the integer of its nanoseconds."""
+    from data_verify.step import run
+    src, train = tmp_path / "source.parquet", tmp_path / "train.parquet"
+    pd.DataFrame({"k": [1], "x": source}).to_parquet(src, index=False)
+    pd.DataFrame({"k": [1], "x": altered}).to_parquet(train, index=False)
+    report = run({"source": "source", "checks": {"split.conservation": {"exact": True}}},
+                 {"source": src, "train": train}, log=lambda *a: None, workdir=tmp_path)
+    check = next(c for c in report["checks"] if c["id"] == "split.conservation")
+    assert check["status"] == "fail"
+
+
 @pytest.mark.parametrize("a, b", [
     (pd.Series([3], dtype="int64"), pd.Series([3.0])),
     (pd.Series([2**60], dtype="int64"), pd.Series([float(2**60)])),
@@ -217,6 +238,8 @@ def test_conservation_sees_an_integer_crafted_to_collide_with_a_float(tmp_path):
     (pd.Series([0], dtype="int64"), pd.Series([-0.0])),
     (pd.Series([np.nan]), pd.Series([-np.nan])),
     (pd.Series([None], dtype="Int64"), pd.Series([np.nan])),
+    (pd.Series([None], dtype=object), pd.Series([None], dtype="string")),
+    (pd.Series(["a"], dtype=object), pd.Series(["a"], dtype="category")),
     (pd.Series([pd.NaT], dtype="datetime64[ns]"), pd.Series([np.nan])),
     (pd.Series([pd.Timestamp("2023-05-01 02:00", tz="Europe/Berlin")]),
      pd.Series([pd.Timestamp("2023-05-01 00:00")])),

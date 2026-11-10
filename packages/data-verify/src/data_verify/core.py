@@ -257,7 +257,8 @@ _NORMALIZE_RE = r"[\W_]+"
 
 # A value is coded as a type tag and 16 bytes that identify it within that type, so values
 # of different types can never be confused and equal values code alike whatever the dtype.
-_INT, _UINT, _FLOAT, _TEXT = 0, 1, 2, 3
+# Missing text has a tag of its own: any string used for it could be written as data.
+_INT, _UINT, _FLOAT, _TEXT, _NO_TEXT, _TIME, _SPAN = range(7)
 _CODE = 17
 _TEXT_KEYS = ("data-verify:text", "data-verify:txt2")  # two 64-bit SipHash keys: 128 bits
 _INT64_MAX = np.iinfo(np.int64).max
@@ -282,12 +283,14 @@ def _exact_number_codes(s: pd.Series, k: str) -> np.ndarray:
     """Numbers that are equal code alike whatever their dtype (3, 3.0 and True == 1 across
     CSV and parquet; -0.0 is 0), and numbers that differ code apart. Integers, dates and
     durations never pass through float64, which holds only 53 bits: 2**53 and 2**53 + 1, or
-    two timestamps a nanosecond apart, must stay apart. Missing values code as NaN, as they
-    compare in the statistics."""
+    two timestamps a nanosecond apart, must stay apart. A date is not the integer of its
+    nanoseconds, nor a duration. Missing values code as NaN, as they compare in the
+    statistics."""
     n = len(s)
     as_float = s.isna().to_numpy()  # missing, NaN, infinite or fractional
     ints, uints, floats = np.zeros(n, np.int64), np.zeros(n, np.uint64), np.full(n, np.nan)
     big = np.zeros(n, dtype=bool)
+    exact = _SPAN if pdt.is_timedelta64_dtype(s.dtype) else _TIME if k == "datetime" else _INT
     if k == "datetime":
         t = to_datetime(s)
         as_float = t.isna().to_numpy()
@@ -308,7 +311,7 @@ def _exact_number_codes(s: pd.Series, k: str) -> np.ndarray:
         as_float = ~small & ~big
         ints = np.where(small, floats, 0).astype("int64")
         uints = np.where(big, floats, 0).astype("uint64")
-    tags = np.where(as_float, _FLOAT, np.where(big, _UINT, _INT)).astype(np.uint8)
+    tags = np.where(as_float, _FLOAT, np.where(big, _UINT, exact)).astype(np.uint8)
     low = np.where(as_float, _float_bits(floats), np.where(big, uints, ints.view(np.uint64)))
     return _codes(tags, low)
 
@@ -334,9 +337,11 @@ def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
     if near:
         text = (text.str.casefold().str.replace(_NORMALIZE_RE, " ", regex=True)
                 .str.strip())
-    values = text.fillna("\0<NA>").to_numpy(dtype=object)
+    missing = text.isna().to_numpy()
+    values = text.fillna("").to_numpy(dtype=object)
     low, high = (pd.util.hash_array(values, hash_key=key, categorize=False) for key in _TEXT_KEYS)
-    return _codes(np.full(len(values), _TEXT, np.uint8), low, high)
+    low[missing] = high[missing] = 0
+    return _codes(np.where(missing, _NO_TEXT, _TEXT).astype(np.uint8), low, high)
 
 
 def row_hashes(df: pd.DataFrame, cols: list[str], near: bool = False, bits: int = 10) -> np.ndarray:
