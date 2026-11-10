@@ -113,7 +113,8 @@ def _expect(cond: bool, msg: str) -> None:
 def _str_map(value: Any, where: str) -> dict[str, str]:
     _expect(isinstance(value, dict), f"{where} must be a table of name = \"path\"")
     for k, v in value.items():
-        _expect(isinstance(v, str) and v, f"{where}.{k} must be a non-empty path string")
+        _expect(isinstance(v, str) and v and "\0" not in v,
+                f"{where}.{k} must be a non-empty path string")
     return dict(value)
 
 
@@ -123,6 +124,12 @@ def _str_list(value: Any, where: str) -> list[str]:
         f"{where} must be a list of strings",
     )
     return list(value)
+
+
+def _path_list(value: Any, where: str) -> list[str]:
+    paths = _str_list(value, where)
+    _expect(all("\0" not in v for v in paths), f"{where}: a path contains a NUL character")
+    return paths
 
 
 def _parse_step(raw: Any, idx: int) -> Step:
@@ -166,7 +173,7 @@ def _parse_step(raw: Any, idx: int) -> Step:
         depends_on=_str_list(raw.get("depends_on", []), f"{where}.depends_on"),
         critical=critical,
         timeout=float(timeout) if timeout is not None else None,
-        watch=_str_list(raw.get("watch", []), f"{where}.watch"),
+        watch=_path_list(raw.get("watch", []), f"{where}.watch"),
         env=_str_list(raw.get("env", []), f"{where}.env"),
         description=description,
         clean_outputs=clean_outputs,
@@ -256,10 +263,14 @@ def load(path: str | Path) -> Pipeline:
     unknown = set(data) - {"pipeline", "steps"}
     _expect(not unknown, f"unknown top-level key(s) {sorted(unknown)}")
 
+    for key in ("name", "workdir", "state_dir"):
+        _expect(isinstance(meta.get(key, ""), str), f"[pipeline].{key} must be a string")
+        _expect("\0" not in meta.get(key, ""), f"[pipeline].{key} contains a NUL character")
+
     base = path.parent
     workdir = (base / meta.get("workdir", ".")).resolve()
     _expect(workdir.is_dir(), f"workdir does not exist: {workdir}")
-    python_path = [(base / p).resolve() for p in _str_list(meta.get("python_path", ["."]),
+    python_path = [(base / p).resolve() for p in _path_list(meta.get("python_path", ["."]),
                                                             "[pipeline].python_path")]
     state_dir = (workdir / meta.get("state_dir", ".pipeline")).resolve()
 

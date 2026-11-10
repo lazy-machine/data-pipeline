@@ -8,7 +8,7 @@ import hashlib
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import bucket, time_split
+from conftest import bucket, group_split, time_split
 
 from data_verify import SpecError
 from data_verify.checks.poisoning import _agreement, _coded, _entity_se, _inconsistent
@@ -144,6 +144,70 @@ def test_conservation_dropped_rows(case, splits, source):
                  extra_inputs=src)
     assert r.failed("split.conservation")
     assert r.check("split.conservation")["details"]["dropped"] == 5
+
+
+def test_conservation_sees_an_id_changed_beyond_float_precision(case, source):
+    """Above 2**54 a float64 steps by 4, so id + 1 rounds back to id: comparing ids as floats
+    would find the altered rows in the source."""
+    source = source.assign(row_id=np.arange(len(source), dtype="int64") * 8 + 2**54)
+    splits = group_split(source)
+    src = case.write({"source": source})
+    params = {"source": "source", "checks": {"split.conservation": {"exact": True}}}
+    assert not case.run(splits, params, extra_inputs=src).failed("split.conservation")
+    splits["train"].loc[:9, "row_id"] += 1
+    r = case.run(splits, params, extra_inputs=src)
+    assert r.failed("split.conservation")
+    assert r.check("split.conservation")["details"]["splits"]["train"]["not_in_source"] == 10
+
+
+def test_conservation_sees_a_timestamp_moved_by_a_nanosecond(case, source):
+    """Nanoseconds since 1970 need 61 bits; as a float64 a 2022 date steps by 256 ns."""
+    source = source.assign(date=source["date"].astype("datetime64[ns]"))
+    splits = group_split(source)
+    src = case.write({"source": source})
+    params = {"source": "source", "id": None,
+              "checks": {"split.conservation": {"columns": ["row_id", "date"]}}}
+    assert not case.run(splits, params, extra_inputs=src).failed("split.conservation")
+    splits["train"].loc[:9, "date"] += pd.Timedelta(1, "ns")
+    r = case.run(splits, params, extra_inputs=src)
+    assert r.failed("split.conservation")
+    assert r.check("split.conservation")["details"]["splits"]["train"]["not_in_source"] == 10
+
+
+@pytest.mark.parametrize("a, b", [
+    (pd.Series([2**53], dtype="int64"), pd.Series([2**53 + 1], dtype="int64")),
+    (pd.Series([2**53], dtype="Int64"), pd.Series([2**53 + 1], dtype="Int64")),
+    (pd.Series([2**64 - 2], dtype="uint64"), pd.Series([2**64 - 1], dtype="uint64")),
+    (pd.Series([2**63], dtype="uint64"), pd.Series([0], dtype="uint64")),
+    (pd.Series([pd.Timestamp("2023-05-01")]),
+     pd.Series([pd.Timestamp("2023-05-01") + pd.Timedelta(1, "ns")])),
+    (pd.Series([pd.Timedelta(2**60, "ns")]), pd.Series([pd.Timedelta(2**60 + 1, "ns")])),
+    (pd.Series([1.5]), pd.Series([np.float64(1.5).view("int64")])),
+    (pd.Series([np.inf]), pd.Series([-np.inf])),
+    (pd.Series([np.nan]), pd.Series([0.0])),
+])
+def test_row_hashes_keep_different_numbers_apart(a, b):
+    from data_verify.core import row_hashes
+    assert row_hashes(pd.DataFrame({"x": a}), ["x"])[0] != row_hashes(pd.DataFrame({"x": b}), ["x"])[0]
+
+
+@pytest.mark.parametrize("a, b", [
+    (pd.Series([3], dtype="int64"), pd.Series([3.0])),
+    (pd.Series([2**60], dtype="int64"), pd.Series([float(2**60)])),
+    (pd.Series([2**63], dtype="uint64"), pd.Series([2.0**63])),
+    (pd.Series([7], dtype="uint64"), pd.Series([7], dtype="Int64")),
+    (pd.Series([1], dtype="int64"), pd.Series([True])),
+    (pd.Series([0], dtype="int64"), pd.Series([-0.0])),
+    (pd.Series([np.nan]), pd.Series([-np.nan])),
+    (pd.Series([None], dtype="Int64"), pd.Series([np.nan])),
+    (pd.Series([pd.NaT], dtype="datetime64[ns]"), pd.Series([np.nan])),
+    (pd.Series([pd.Timestamp("2023-05-01 02:00", tz="Europe/Berlin")]),
+     pd.Series([pd.Timestamp("2023-05-01 00:00")])),
+])
+def test_row_hashes_match_equal_numbers_across_types(a, b):
+    """A CSV turns an integer column with a gap into floats; the same rows must still match."""
+    from data_verify.core import row_hashes
+    assert row_hashes(pd.DataFrame({"x": a}), ["x"])[0] == row_hashes(pd.DataFrame({"x": b}), ["x"])[0]
 
 
 # -- temporal -----------------------------------------------------------------------------------------

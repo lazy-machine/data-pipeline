@@ -532,7 +532,12 @@ be recovered from `state.json`, so don't commit that file.
   next run reads every input again, which takes minutes for a dataset of tens of GB.
 
 Checkpoints are content hashes, not absolute paths, so copying or moving a project
-(state folder included) keeps everything cached.
+(state folder included) keeps everything cached. The copied files are read once to confirm
+their hashes: the hash cache is keyed by path, size, mtime, ctime and inode, so restoring an
+edited file's mtime does not hide the edit.
+
+Run one `data-pipeline` per project at a time. Two runs on the same workdir are not locked
+against each other and can overwrite each other's checkpoints and outputs.
 
 ---
 

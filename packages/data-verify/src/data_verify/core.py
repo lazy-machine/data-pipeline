@@ -255,27 +255,74 @@ def numeric_values(s: pd.Series) -> np.ndarray:
 _NORMALIZE_RE = r"[\W_]+"
 
 
-def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
-    """Values that hash the same when the data is the same, whatever the file format.
+# Each number is hashed as one of three types, and the three hash spaces are kept apart by
+# these tags: the same 64 bits read as int64, uint64 or float64 hash alike in pandas.
+_UINT_TAG = np.uint64(0x9E3779B97F4A7C15)
+_FLOAT_TAG = np.uint64(0xC2B2AE3D27D4EB4F)
+_INT64_MAX = np.iinfo(np.int64).max
 
-    Numbers become float64 (so 3 == 3.0 across CSV and parquet), -0.0 becomes 0.0, dates
-    become nanoseconds, everything else becomes text. `near` also rounds numbers to `bits`
+
+def _exact_number_hashes(s: pd.Series, k: str) -> np.ndarray:
+    """One uint64 per value: numbers that are equal hash alike whatever their dtype (3, 3.0
+    and True == 1 across CSV and parquet; -0.0 is 0), and numbers that differ never collide
+    by rounding. Integers, dates and durations never pass through float64, which holds only
+    53 bits: 2**53 and 2**53 + 1, or two timestamps a nanosecond apart, must stay apart.
+    Missing values hash like NaN, as they compare in the statistics."""
+    n = len(s)
+    as_float = s.isna().to_numpy()  # missing, NaN, infinite or fractional
+    ints, uints, floats = np.zeros(n, np.int64), np.zeros(n, np.uint64), np.full(n, np.nan)
+    big = np.zeros(n, dtype=bool)
+    if k == "datetime":
+        t = to_datetime(s)
+        as_float = t.isna().to_numpy()
+        ints = t.to_numpy().astype("datetime64[ns]").view("int64")
+    elif pdt.is_timedelta64_dtype(s.dtype):
+        ints = s.to_numpy().astype("timedelta64[ns]").view("int64")
+    elif k == "int" and pdt.is_unsigned_integer_dtype(s.dtype):
+        uints = s.to_numpy(dtype="uint64", na_value=0)
+        big = ~as_float & (uints > _INT64_MAX)
+        ints = np.where(big, 0, uints).astype("int64")
+    elif k == "int":
+        ints = s.to_numpy(dtype="int64", na_value=0)
+    else:  # float and bool: whole values join the integers they equal
+        floats = s.astype("float64").to_numpy(dtype="float64", na_value=np.nan)
+        whole = np.isfinite(floats) & (np.floor(floats) == floats)
+        big = whole & (floats >= 2.0**63) & (floats < 2.0**64)
+        small = whole & (floats >= -2.0**63) & (floats < 2.0**63)
+        as_float = ~small & ~big
+        ints = np.where(small, floats, 0).astype("int64")
+        uints = np.where(big, floats, 0).astype("uint64")
+    as_int = ~as_float & ~big
+    floats = np.where(np.isnan(floats), np.nan, floats)  # one NaN, whatever its sign or payload
+    out = np.empty(n, dtype=np.uint64)
+    out[as_int] = pd.util.hash_array(ints[as_int], categorize=False)
+    out[big] = pd.util.hash_array(uints[big], categorize=False) ^ _UINT_TAG
+    out[as_float] = pd.util.hash_array(floats[as_float], categorize=False) ^ _FLOAT_TAG
+    return out
+
+
+def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
+    """One uint64 per value that is the same when the data is the same, whatever the format.
+
+    Numbers compare exactly (3 == 3.0 across CSV and parquet, -0.0 == 0.0, dates as
+    nanoseconds); everything else becomes text. `near` instead rounds numbers to `bits`
     bits of mantissa (about 3 significant digits at 10) and normalises text (case,
     punctuation, whitespace).
     """
     k = kind(s)
     if k in ("int", "float", "bool", "datetime"):
+        if not near:
+            return _exact_number_hashes(s, k)
         x = numeric_values(s.astype("float64") if k == "bool" else s)
         x = np.where(x == 0, 0.0, x)
-        if near:
-            m, e = np.frexp(x)
-            x = np.ldexp(np.round(m * (1 << bits)) / (1 << bits), e)
-        return x
+        m, e = np.frexp(x)
+        x = np.ldexp(np.round(m * (1 << bits)) / (1 << bits), e)
+        return pd.util.hash_array(x, categorize=False)
     text = s.astype("string")
     if near:
         text = (text.str.casefold().str.replace(_NORMALIZE_RE, " ", regex=True)
                 .str.strip())
-    return text.fillna("\0<NA>").to_numpy(dtype=object)
+    return pd.util.hash_array(text.fillna("\0<NA>").to_numpy(dtype=object), categorize=False)
 
 
 def row_hashes(df: pd.DataFrame, cols: list[str], near: bool = False, bits: int = 10) -> np.ndarray:
@@ -284,7 +331,7 @@ def row_hashes(df: pd.DataFrame, cols: list[str], near: bool = False, bits: int 
     prime = np.uint64(1099511628211)
     with np.errstate(over="ignore"):
         for c in sorted(cols):
-            hc = pd.util.hash_array(canonical(df[c], near, bits), categorize=False)
+            hc = canonical(df[c], near, bits)
             h = (h * prime) ^ hc
     return h
 

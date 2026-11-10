@@ -13,7 +13,7 @@ The step fails (and blocks every step that depends on it) when a blocking check 
 Bump __version__ on every change: data-pipeline fingerprints this file, so the gate reruns.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 from .core import Verifier  # noqa: E402
 from .spec import SpecError  # noqa: E402

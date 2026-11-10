@@ -1390,3 +1390,165 @@ def test_clean_outputs_refuses_an_output_holding_a_steps_source(tmp_path):
     """))
     with pytest.raises(config.ConfigError, match="it contains .*steps"):
         config.load(cfg)
+
+
+# -- trust in the file-hash cache and the state file ---------------------------------------
+
+
+def _swap_keeping_size_and_mtime(path: Path, text: str) -> None:
+    st = path.stat()
+    assert len(text.encode()) == st.st_size
+    time.sleep(0.05)  # past the coarse tick of the kernel clock, so ctime moves
+    path.write_text(text)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert path.stat().st_mtime_ns == st.st_mtime_ns
+
+
+def test_hash_cache_sees_bytes_changed_under_the_same_size_and_mtime(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("safe")
+    state = checkpoint.State(tmp_path / ".pipeline")
+    before = state.hash_path(f)
+    _swap_keeping_size_and_mtime(f, "evil")
+    assert state.hash_path(f) != before
+
+
+def test_hash_cache_sees_a_file_replaced_by_one_with_the_same_size_and_mtime(tmp_path):
+    f, other = tmp_path / "f.txt", tmp_path / "other.txt"
+    f.write_text("safe")
+    other.write_text("evil")
+    state = checkpoint.State(tmp_path / ".pipeline")
+    before = state.hash_path(f)
+    st = f.stat()
+    os.utime(other, ns=(st.st_atime_ns, st.st_mtime_ns))
+    other.replace(f)
+    assert state.hash_path(f) != before
+
+
+def test_tampered_input_and_output_with_restored_mtime_rerun(tmp_path, monkeypatch):
+    monkeypatch.setattr(checkpoint, "_RACY_NS", 0)  # keep every hash, as an old file would be
+    cfg = make(tmp_path, CHAIN)
+    run(cfg)
+    assert str(tmp_path / "out" / "n.txt") in state_of(tmp_path)["files"]
+    _swap_keeping_size_and_mtime(tmp_path / "out" / "n.txt", "6")
+    r, _ = run(cfg)
+    assert r.outcomes["count"].reason == "output modified: n"
+
+    _swap_keeping_size_and_mtime(tmp_path / "in.txt", "jello")
+    r, _ = run(cfg)
+    assert r.outcomes["upper"].reason == "inputs changed: src"
+
+
+def test_hash_of_a_file_changed_just_before_hashing_is_not_kept(tmp_path, monkeypatch):
+    """Timestamps tick coarsely, so a change in the same tick as the hash would leave them
+    as they were: such a hash is used for this run only and the file is read again later."""
+    f = tmp_path / "f.txt"
+    f.write_text("fresh")
+    state = checkpoint.State(tmp_path / ".pipeline")
+    state.hash_path(f)
+    state.save()
+    assert str(f) not in state_of(tmp_path)["files"]
+
+    monkeypatch.setattr(checkpoint, "_RACY_NS", 10_000_000)
+    time.sleep(0.05)
+    state = checkpoint.State(tmp_path / ".pipeline")
+    state.hash_path(f)
+    state.save()
+    assert str(f) in state_of(tmp_path)["files"]
+
+
+def test_old_three_field_hash_entries_are_read_again(tmp_path, monkeypatch):
+    f = tmp_path / "f.txt"
+    f.write_text("evil")
+    st = f.stat()
+    (tmp_path / ".pipeline").mkdir()
+    (tmp_path / ".pipeline" / "state.json").write_text(json.dumps(
+        {"version": 1, "steps": {}, "files": {str(f): [st.st_size, st.st_mtime_ns, "0" * 64]}}))
+    state = checkpoint.State(tmp_path / ".pipeline")
+    assert state.hash_path(f) != "0" * 64
+    assert not state.problems
+
+
+@pytest.mark.parametrize("header, msg", [
+    ("workdir = 42", r"\[pipeline\].workdir must be a string"),
+    ("state_dir = []", r"\[pipeline\].state_dir must be a string"),
+    ('workdir = "a\\u0000b"', r"\[pipeline\].workdir contains a NUL character"),
+    ('state_dir = "s\\u0000"', r"\[pipeline\].state_dir contains a NUL character"),
+])
+def test_pipeline_metadata_types_are_validated(tmp_path, header, msg):
+    cfg = make(tmp_path, CHAIN, header)
+    with pytest.raises(config.ConfigError, match=msg):
+        config.load(cfg)
+
+
+@pytest.mark.parametrize("body, msg", [
+    ('[pipeline]\nname = 1\n', r"\[pipeline\].name must be a string"),
+    ('[pipeline]\npython_path = ["a\\u0000"]\n', r"python_path: a path contains a NUL"),
+])
+def test_pipeline_name_and_python_path_are_validated(tmp_path, body, msg):
+    cfg = tmp_path / "p.toml"
+    cfg.write_text(body + '[[steps]]\nname = "a"\nfunction = "m:f"\n')
+    with pytest.raises(config.ConfigError, match=msg):
+        config.load(cfg)
+
+
+@pytest.mark.parametrize("steps", [
+    '[[steps]]\nname = "a"\nfunction = "m:f"\nwatch = ["x\\u0000"]\n',
+    '[[steps]]\nname = "a"\nfunction = "m:f"\ninputs = { i = "x\\u0000" }\n',
+])
+def test_step_paths_with_a_nul_character_are_rejected(tmp_path, steps):
+    with pytest.raises(config.ConfigError, match="NUL|non-empty path string"):
+        config.load(make(tmp_path, steps))
+
+
+def test_cli_reports_invalid_pipeline_metadata_as_a_config_error(tmp_path, capsys):
+    cfg = make(tmp_path, CHAIN, "workdir = 42")
+    assert main([str(cfg), "--no-color"]) == 2
+    assert "config error: [pipeline].workdir must be a string" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("content, warning", [
+    ("[]", "not a version 1 state file"),
+    ('"state"', "not a version 1 state file"),
+    ('{"version": 99, "steps": {}}', "not a version 1 state file"),
+    ("{not json", "state.json is unreadable"),
+    ('{"version": 1, "steps": []}', "'steps' is not a table"),
+    ('{"version": 1, "steps": {"upper": [], "count": []}}', "checkpoint of 'upper' is malformed"),
+])
+def test_unusable_state_file_reruns_every_step_with_a_warning(tmp_path, content, warning):
+    cfg = make(tmp_path, CHAIN)
+    run(cfg)
+    (tmp_path / ".pipeline" / "state.json").write_text(content)
+    r, out = run(cfg)
+    assert r.ok and statuses(r) == {"upper": "ran", "count": "ran"}
+    assert warning in out and any(warning in w for w in r.warnings)
+    r, out = run(cfg)  # the run rewrote a valid state file
+    assert statuses(r) == {"upper": "cached", "count": "cached"} and not r.warnings
+
+
+@pytest.mark.parametrize("field, value", [
+    ("code", 1), ("config", None), ("inputs", []), ("outputs", "x"), ("imports", {"a": 1}),
+    ("packages", [1]), ("env", 0), ("summary", {}),
+])
+def test_malformed_checkpoint_reruns_only_its_step(tmp_path, field, value):
+    cfg = make(tmp_path, CHAIN)
+    run(cfg)
+    path = tmp_path / ".pipeline" / "state.json"
+    state = json.loads(path.read_text())
+    state["steps"]["count"][field] = value
+    path.write_text(json.dumps(state))
+    r, out = run(cfg)
+    assert statuses(r) == {"upper": "cached", "count": "ran"}
+    assert "checkpoint of 'count' is malformed" in out
+
+
+@pytest.mark.parametrize("files", ['[]', '{"x": "y"}', '{"x": [1, 2, 3, 4]}', '{"x": [1, 2, 3, true, "h"]}'])
+def test_malformed_hash_cache_is_dropped_silently(tmp_path, files):
+    cfg = make(tmp_path, CHAIN)
+    run(cfg)
+    path = tmp_path / ".pipeline" / "state.json"
+    state = json.loads(path.read_text())
+    state["files"] = json.loads(files)
+    path.write_text(json.dumps(state))
+    r, _ = run(cfg)
+    assert statuses(r) == {"upper": "cached", "count": "cached"} and not r.warnings

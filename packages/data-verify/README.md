@@ -159,7 +159,7 @@ previous run are deleted first, so a stale report never survives a failed run.
 
 ```jsonc
 {
-  "tool": "data-verify", "version": "0.4.0",
+  "tool": "data-verify", "version": "0.4.1",
   "passed": false,                       // false = the step failed
   "fail_on": "error",
   "blocking": ["split.group_overlap"],   // ids of the checks that blocked
@@ -477,7 +477,10 @@ pipeline after the split, since the gate can't confirm that from the data.
 ## What it checks
 
 55 built-in checks. `data-verify checks` lists them with their options, and
-[docs/CHECKS.md](docs/CHECKS.md) describes each one. By area:
+[docs/CHECKS.md](docs/CHECKS.md) describes each one. Checks that match rows exactly (ids,
+`source` conservation, identical rows across splits) compare numbers as numbers: `3`, `3.0`
+and `True == 1` match across CSV and parquet, while integers and timestamps keep every digit,
+so ids above 2**53 or times a nanosecond apart stay distinct. By area:
 
 **split**
 - Blocks: same `id` or `group` in two splits; repeated ids; split not matching

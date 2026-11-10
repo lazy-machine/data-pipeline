@@ -177,7 +177,17 @@ After a successful run, the fingerprint and the output hashes go into
 `<state_dir>/state.json`. The next run skips the step only if the fingerprint matches and
 every output still has the recorded hash. Hashes are content-based, so when an upstream
 step re-runs and writes byte-identical outputs, the steps after it stay cached. File hashes
-are cached by size and mtime, so large unchanged files are not re-read.
+are cached by size, mtime, ctime and inode, so large unchanged files are not re-read. Size
+and mtime can be put back after an edit (`os.utime`), but ctime cannot be set from user
+space and a replaced file gets a new inode, so either catches the edit. A file changed less
+than 2 s before it was hashed is read again on the next run, since its timestamps may not
+have ticked yet. What the cache still trusts is the system clock and a filesystem that
+updates ctime; to re-read every byte, run with `-f` or delete `state.json`.
+
+A `state.json` that isn't valid JSON, isn't a version 1 state file, or holds a malformed
+checkpoint is reported as a warning, and the steps it can't vouch for rerun. Run one
+`data-pipeline` per workdir at a time: there is no lock, so two runs can overwrite each
+other's checkpoints, outputs and logs.
 
 The status line says why a step ran: `no checkpoint`, `code changed`, `config changed`,
 `code changed: <files>`, `packages changed: <name> <old> → <new>`, `env changed: <names>`,
