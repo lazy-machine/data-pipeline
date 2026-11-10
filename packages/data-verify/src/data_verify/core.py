@@ -332,6 +332,8 @@ def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
         values = s.to_numpy(dtype=object)
         if pd.api.types.infer_dtype(values, skipna=True) not in ("string", "empty"):
             return _mixed_codes(values, near, bits)
+    if k == "float" and not near and s.dtype.kind == "f" and s.dtype.itemsize > 8:
+        return _mixed_codes(s.to_numpy(dtype=object), near, bits)  # wider than float64
     if k in ("int", "float", "bool", "datetime"):
         if not near:
             return _exact_number_codes(s, k)
@@ -357,10 +359,16 @@ def _is_missing(v: Any) -> bool:
     return isinstance(v, (float, np.floating, np.datetime64, np.timedelta64)) and bool(pd.isna(v))
 
 
+# Every numpy print option, fixed: a caller's settings must not change a value's code.
+_PRINT = {"precision": 8, "threshold": sys.maxsize, "edgeitems": 3, "linewidth": 75,
+          "suppress": False, "nanstr": "nan", "infstr": "inf", "formatter": None,
+          "sign": "-", "floatmode": "unique", "legacy": False}
+
+
 def _full_repr(v: Any) -> str:
     """Type and repr, with arrays (also nested in lists or dicts) printed in full and floats
     to the last digit: numpy's default repr shortens both, hiding a changed element."""
-    with np.printoptions(threshold=sys.maxsize, floatmode="unique"):
+    with np.printoptions(**_PRINT):
         return f"{type(v).__module__}.{type(v).__qualname__}:{v!r}"
 
 
@@ -394,7 +402,7 @@ def _mixed_codes(values: np.ndarray, near: bool, bits: int) -> np.ndarray:
             g = "missing"
         elif isinstance(v, (np.datetime64, np.timedelta64)):  # numpy counts these as integers
             g, v = "object", _full_repr(v)
-        elif isinstance(v, (int, float, np.integer, np.floating)):
+        elif isinstance(v, (bool, int, float, np.bool_, np.integer, np.floating)):
             g, v = _number_group(v)
         elif isinstance(v, str):
             g, v = "text", str(v)
