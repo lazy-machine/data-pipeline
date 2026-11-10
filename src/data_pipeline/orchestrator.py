@@ -244,6 +244,10 @@ class Orchestrator:
         start = time.perf_counter()
 
         self.report.header(p, len(steps), dry_run)
+        for text in self.state.problems:
+            result.warnings.append(text)
+            self.report.warning(text)
+        self.state.problems = []
         issues = preflight(p)
         blocking = {n: e for n, e in issues.items()
                     if p.step(n).critical and any(s.name == n for s in steps)}

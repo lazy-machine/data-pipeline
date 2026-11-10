@@ -4,11 +4,12 @@ right check; the clean data must pass."""
 from __future__ import annotations
 
 import hashlib
+import json
 
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import bucket, time_split
+from conftest import bucket, group_split, time_split
 
 from data_verify import SpecError
 from data_verify.checks.poisoning import _agreement, _coded, _entity_se, _inconsistent
@@ -144,6 +145,191 @@ def test_conservation_dropped_rows(case, splits, source):
                  extra_inputs=src)
     assert r.failed("split.conservation")
     assert r.check("split.conservation")["details"]["dropped"] == 5
+
+
+def test_conservation_sees_an_id_changed_beyond_float_precision(case, source):
+    """Above 2**54 a float64 steps by 4, so id + 1 rounds back to id: comparing ids as floats
+    would find the altered rows in the source."""
+    source = source.assign(row_id=np.arange(len(source), dtype="int64") * 8 + 2**54)
+    splits = group_split(source)
+    src = case.write({"source": source})
+    params = {"source": "source", "checks": {"split.conservation": {"exact": True}}}
+    assert not case.run(splits, params, extra_inputs=src).failed("split.conservation")
+    splits["train"].loc[:9, "row_id"] += 1
+    r = case.run(splits, params, extra_inputs=src)
+    assert r.failed("split.conservation")
+    assert r.check("split.conservation")["details"]["splits"]["train"]["not_in_source"] == 10
+
+
+def test_conservation_sees_a_timestamp_moved_by_a_nanosecond(case, source):
+    """Nanoseconds since 1970 need 61 bits; as a float64 a 2022 date steps by 256 ns."""
+    source = source.assign(date=source["date"].astype("datetime64[ns]"))
+    splits = group_split(source)
+    src = case.write({"source": source})
+    params = {"source": "source", "id": None,
+              "checks": {"split.conservation": {"columns": ["row_id", "date"]}}}
+    assert not case.run(splits, params, extra_inputs=src).failed("split.conservation")
+    splits["train"].loc[:9, "date"] += pd.Timedelta(1, "ns")
+    r = case.run(splits, params, extra_inputs=src)
+    assert r.failed("split.conservation")
+    assert r.check("split.conservation")["details"]["splits"]["train"]["not_in_source"] == 10
+
+
+@pytest.mark.parametrize("a, b", [
+    (pd.Series([2**53], dtype="int64"), pd.Series([2**53 + 1], dtype="int64")),
+    (pd.Series([2**53], dtype="Int64"), pd.Series([2**53 + 1], dtype="Int64")),
+    (pd.Series([2**64 - 2], dtype="uint64"), pd.Series([2**64 - 1], dtype="uint64")),
+    (pd.Series([2**63], dtype="uint64"), pd.Series([0], dtype="uint64")),
+    (pd.Series([pd.Timestamp("2023-05-01")]),
+     pd.Series([pd.Timestamp("2023-05-01") + pd.Timedelta(1, "ns")])),
+    (pd.Series([pd.Timedelta(2**60, "ns")]), pd.Series([pd.Timedelta(2**60 + 1, "ns")])),
+    (pd.Series([1.5]), pd.Series([np.float64(1.5).view("int64")])),
+    (pd.Series([np.inf]), pd.Series([-np.inf])),
+    (pd.Series([np.nan]), pd.Series([0.0])),
+    (pd.Series(["3"]), pd.Series([3])),
+    # pandas hashes integers with an invertible mix, so with per-type tags XORed on top this
+    # integer was computed to hash exactly like 1.5
+    (pd.Series([1.5]), pd.Series([-4685937998608076249], dtype="int64")),
+    (pd.Series([None], dtype="string"), pd.Series(["\0<NA>"], dtype="string")),
+    (pd.Series([None], dtype=object), pd.Series([""])),
+    (pd.Series([pd.Timestamp("2023-01-01")]), pd.Series([1672531200000000000])),
+    (pd.Series([pd.Timedelta(5, "ns")]), pd.Series([5])),
+    (pd.Series([pd.Timedelta(5, "ns")]), pd.Series([pd.Timestamp(5, unit="ns")])),
+    (pd.Series([1, "a"], dtype=object), pd.Series(["1", "a"], dtype=object)),
+    (pd.Series([1.5, "a"], dtype=object), pd.Series(["1.5", "a"], dtype=object)),
+    (pd.Series([None, 1], dtype=object), pd.Series(["None", 1], dtype=object)),
+    (pd.Series([b"a", 1], dtype=object), pd.Series(["a", 1], dtype=object)),
+    (pd.Series([b"a", 1], dtype=object), pd.Series(["b'a'", 1], dtype=object)),
+    (pd.Series([2**70 + 1, "a"], dtype=object), pd.Series([float(2**70), "a"], dtype=object)),
+    (pd.Series([np.longdouble("1.000000000000000001"), "a"], dtype=object),
+     pd.Series([np.longdouble("1.000000000000000002"), "a"], dtype=object)),
+    (pd.Series([np.timedelta64(5, "ns"), "a"], dtype=object), pd.Series([5, "a"], dtype=object)),
+    (pd.Series([10**400, "a"], dtype=object), pd.Series([10**400 + 1, "a"], dtype=object)),
+    (pd.Series([np.zeros(2000)]), pd.Series([np.where(np.arange(2000) == 1000, 1.0, 0.0)])),
+    (pd.Series([[np.array([1.000000001])]]), pd.Series([[np.array([1.000000002])]])),
+    (pd.Series([np.longdouble("1.000000000000000001")], dtype=np.longdouble),
+     pd.Series([np.longdouble("1.000000000000000002")], dtype=np.longdouble)),
+    (pd.Series([np.bool_(True), "a"], dtype=object), pd.Series([np.bool_(False), "a"], dtype=object)),
+])
+def test_row_hashes_keep_different_values_apart(a, b):
+    from data_verify.core import row_hashes
+    assert row_hashes(pd.DataFrame({"x": a}), ["x"])[0] != row_hashes(pd.DataFrame({"x": b}), ["x"])[0]
+
+
+def test_conservation_sees_an_integer_crafted_to_collide_with_a_float(tmp_path):
+    """An altered row computed to share the hash of a source row must not pass as that row."""
+    from data_verify.step import run
+    src, train = tmp_path / "source.parquet", tmp_path / "train.parquet"
+    pd.DataFrame({"x": [1.5]}).to_parquet(src, index=False)
+    pd.DataFrame({"x": pd.Series([-4685937998608076249], dtype="int64")}).to_parquet(train, index=False)
+    report = run({"source": "source", "id": "x", "checks": {"split.conservation": {"exact": True}}},
+                 {"source": src, "train": train}, log=lambda *a: None, workdir=tmp_path)
+    check = next(c for c in report["checks"] if c["id"] == "split.conservation")
+    assert check["status"] == "fail"
+    assert check["details"]["splits"]["train"]["not_in_source"] == 1
+
+
+@pytest.mark.parametrize("source, altered", [
+    (pd.Series([None], dtype="string"), pd.Series(["\0<NA>"], dtype="string")),
+    (pd.Series([pd.Timestamp("2023-01-01")]), pd.Series([1672531200000000000])),
+])
+def test_conservation_sees_a_value_written_as_another_type(tmp_path, source, altered):
+    """Missing text is not any string, and a date is not the integer of its nanoseconds."""
+    from data_verify.step import run
+    src, train = tmp_path / "source.parquet", tmp_path / "train.parquet"
+    pd.DataFrame({"k": [1], "x": source}).to_parquet(src, index=False)
+    pd.DataFrame({"k": [1], "x": altered}).to_parquet(train, index=False)
+    report = run({"source": "source", "checks": {"split.conservation": {"exact": True}}},
+                 {"source": src, "train": train}, log=lambda *a: None, workdir=tmp_path)
+    check = next(c for c in report["checks"] if c["id"] == "split.conservation")
+    assert check["status"] == "fail"
+
+
+def test_cross_split_sees_a_missing_value_written_as_none_in_one_split_and_nan_in_another(case):
+    frames = {"train": pd.DataFrame({"x": pd.Series([None, 1, "anchor"], dtype=object)}),
+              "test": pd.DataFrame({"x": pd.Series([np.nan, 2, "other"], dtype=object)})}
+    paths = {k: case.tmp / f"{k}.pkl" for k in frames}
+    for k, df in frames.items():
+        df.to_pickle(paths[k])
+    from data_verify.step import run
+    report = run({"allow_pickle": True}, paths, log=lambda *a: None, workdir=case.tmp)
+    check = next(c for c in report["checks"] if c["id"] == "duplicates.cross_split")
+    assert check["status"] == "fail"
+
+
+@pytest.mark.parametrize("near", [False, True])
+def test_numpy_and_python_bools_are_one_value_in_a_mixed_column(near):
+    from data_verify.core import row_hashes
+    a = pd.DataFrame({"x": pd.Series([np.bool_(True), 2, "anchor"], dtype=object)})
+    b = pd.DataFrame({"x": pd.Series([True, 3, "other"], dtype=object)})
+    assert row_hashes(a, ["x"], near)[0] == row_hashes(b, ["x"], near)[0]
+
+
+def test_array_codes_ignore_the_callers_numpy_print_options():
+    from data_verify.core import row_hashes
+    df = pd.DataFrame({"x": pd.Series([np.arange(25) / 7], dtype=object)})
+    before = row_hashes(df, ["x"])
+    with np.printoptions(linewidth=200, sign="+", precision=3, threshold=5, floatmode="fixed"):
+        assert (row_hashes(df, ["x"]) == before).all()
+
+
+@pytest.mark.parametrize("value", [np.timedelta64(5, "ns"), 10**400, np.longdouble("1.1")],
+                         ids=["timedelta64", "huge-int", "longdouble"])
+def test_unusual_values_in_a_mixed_column_hash_without_error(value):
+    from data_verify.core import row_hashes
+    df = pd.DataFrame({"x": pd.Series([value, "anchor"], dtype=object)})
+    assert (row_hashes(df, ["x"]) == row_hashes(df.copy(), ["x"])).all()
+    assert len(set(row_hashes(df, ["x"], near=True))) == 2
+
+
+@pytest.mark.parametrize("source, altered", [([1, 2, "anchor"], ["1", 2, "anchor"]),
+                                             ([1.5, 2, "anchor"], ["1.5", 2, "anchor"])])
+def test_conservation_sees_a_number_turned_into_text_in_a_mixed_json_column(tmp_path, source,
+                                                                            altered):
+    """JSON keeps a column's values with their own types; stringified, 1 would pass for "1"."""
+    from data_verify.step import run
+    src, train = tmp_path / "source.json", tmp_path / "train.json"
+    src.write_text(json.dumps([{"x": v} for v in source]))
+    train.write_text(json.dumps([{"x": v} for v in altered]))
+    report = run({"source": "source", "checks": {"split.conservation": {"exact": True}}},
+                 {"source": src, "train": train}, log=lambda *a: None, workdir=tmp_path)
+    check = next(c for c in report["checks"] if c["id"] == "split.conservation")
+    assert check["status"] == "fail"
+    assert check["details"]["splits"]["train"]["not_in_source"] == 1
+
+
+@pytest.mark.parametrize("a, b", [
+    (pd.Series([3], dtype="int64"), pd.Series([3.0])),
+    (pd.Series([2**60], dtype="int64"), pd.Series([float(2**60)])),
+    (pd.Series([2**63], dtype="uint64"), pd.Series([2.0**63])),
+    (pd.Series([7], dtype="uint64"), pd.Series([7], dtype="Int64")),
+    (pd.Series([1], dtype="int64"), pd.Series([True])),
+    (pd.Series([0], dtype="int64"), pd.Series([-0.0])),
+    (pd.Series([np.nan]), pd.Series([-np.nan])),
+    (pd.Series([None], dtype="Int64"), pd.Series([np.nan])),
+    (pd.Series([None], dtype=object), pd.Series([None], dtype="string")),
+    (pd.Series(["a"], dtype=object), pd.Series(["a"], dtype="category")),
+    (pd.Series([1, 2], dtype=object), pd.Series([1, 2], dtype="int64")),
+    (pd.Series([1, 2], dtype="category"), pd.Series([1, 2], dtype="int64")),
+    (pd.Series([np.int64(3), "a"], dtype=object), pd.Series([3, "a"], dtype=object)),
+    (pd.Series([True, "a"], dtype=object), pd.Series([1.0, "a"], dtype=object)),
+    (pd.Series([2**70, "a"], dtype=object), pd.Series([float(2**70), "a"], dtype=object)),
+    (pd.Series(["a", 1], dtype=object), pd.Series(["a", 1.0], dtype=object)),
+    (pd.Series([None, 1], dtype=object), pd.Series([np.nan, 1], dtype=object)),
+    (pd.Series([pd.NA, 1], dtype=object), pd.Series([pd.NaT, 1], dtype=object)),
+    (pd.Series([None], dtype="string"), pd.Series([np.nan])),
+    (pd.Series([np.longdouble(1.5), "a"], dtype=object), pd.Series([1.5, "a"], dtype=object)),
+    (pd.Series([np.longdouble(1.5)], dtype=np.longdouble), pd.Series([1.5])),
+    (pd.Series([np.bool_(True), "a"], dtype=object), pd.Series([True, "a"], dtype=object)),
+    (pd.Series([np.bool_(False), "a"], dtype=object), pd.Series([0, "a"], dtype=object)),
+    (pd.Series([pd.NaT], dtype="datetime64[ns]"), pd.Series([np.nan])),
+    (pd.Series([pd.Timestamp("2023-05-01 02:00", tz="Europe/Berlin")]),
+     pd.Series([pd.Timestamp("2023-05-01 00:00")])),
+])
+def test_row_hashes_match_equal_numbers_across_types(a, b):
+    """A CSV turns an integer column with a gap into floats; the same rows must still match."""
+    from data_verify.core import row_hashes
+    assert row_hashes(pd.DataFrame({"x": a}), ["x"])[0] == row_hashes(pd.DataFrame({"x": b}), ["x"])[0]
 
 
 # -- temporal -----------------------------------------------------------------------------------------

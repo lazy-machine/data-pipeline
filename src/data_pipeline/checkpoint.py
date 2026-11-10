@@ -3,7 +3,7 @@
 A step is up to date when its fingerprint (code, config, input contents, package versions
 and declared environment variables) matches the one recorded after its last successful
 run *and* every output still exists with the content it had then. File hashes are cached
-by (size, mtime) so unchanged large files are not re-read on every run.
+by (size, mtime, ctime, inode) so unchanged large files are not re-read on every run.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -26,6 +27,10 @@ from .config import Pipeline, Step
 
 _STATE_VERSION = 1
 _CHUNK = 1 << 20
+# A file changed within this long of being hashed can change again without moving its
+# timestamps (they tick coarsely), so its hash is never reused: it is read again.
+_RACY_NS = 2_000_000_000
+_RECORD_DICTS = ("inputs", "outputs", "imports", "packages", "env")
 
 
 @dataclass(frozen=True)
@@ -45,28 +50,61 @@ class State:
         self.path = state_dir / "state.json"
         self.steps: dict[str, dict[str, Any]] = {}
         self._files: dict[str, list] = {}
+        self._racy: set[str] = set()
+        self.problems: list[str] = []  # why saved checkpoints were dropped, for the report
         try:
             data = json.loads(self.path.read_text())
-            if data.get("version") == _STATE_VERSION:
-                self.steps = data.get("steps", {})
-                self._files = data.get("files", {})
-        except (FileNotFoundError, ValueError):
-            pass
+        except FileNotFoundError:
+            return
+        except (ValueError, OSError) as exc:
+            self.problems.append(f"{self.path.name} is unreadable ({exc}); every step reruns")
+            return
+        if not isinstance(data, dict) or type(data.get("version")) is not int \
+                or data["version"] != _STATE_VERSION:
+            self.problems.append(f"{self.path.name} is not a version {_STATE_VERSION} state "
+                                 "file; every step reruns")
+            return
+        steps = data.get("steps", {})
+        if not isinstance(steps, dict):
+            self.problems.append(f"{self.path.name}: 'steps' is not a table; every step reruns")
+            steps = {}
+        for name, rec in steps.items():
+            if _valid_record(rec):
+                self.steps[name] = rec
+            else:
+                self.problems.append(f"{self.path.name}: checkpoint of '{name}' is malformed; "
+                                     "it reruns")
+        files = data.get("files", {})
+        if isinstance(files, dict):  # a cache: a bad entry only means reading the file again
+            self._files = {k: v for k, v in files.items() if _valid_file_entry(v)}
 
     # -- hashing ------------------------------------------------------------------
 
     def hash_file(self, path: Path) -> str:
+        """A file's SHA-256, re-read only when its metadata moved.
+
+        Size and mtime alone can be put back (``os.utime``) after the bytes change; ctime
+        cannot be set from user space and the inode changes when a file is replaced, so all
+        four have to match. A cached hash still trusts the clock and the filesystem: a full
+        re-read needs a deleted state file.
+        """
+        now = time.time_ns()  # before stat: a change after it is what a racy hash would miss
         st = path.stat()
         key = str(path)
+        meta = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino]
         cached = self._files.get(key)
-        if cached and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
-            return cached[2]
+        if cached and cached[:4] == meta and key not in self._racy:
+            return cached[4]
         h = hashlib.sha256()
         with path.open("rb") as fh:
             while chunk := fh.read(_CHUNK):
                 h.update(chunk)
         digest = h.hexdigest()
-        self._files[key] = [st.st_size, st.st_mtime_ns, digest]
+        self._files[key] = [*meta, digest]
+        if now - max(st.st_mtime_ns, st.st_ctime_ns) < _RACY_NS:
+            self._racy.add(key)
+        else:
+            self._racy.discard(key)
         return digest
 
     def hash_path(self, path: Path) -> str | None:
@@ -97,7 +135,8 @@ class State:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        live = {k: v for k, v in self._files.items() if os.path.exists(k)}
+        live = {k: v for k, v in self._files.items()
+                if k not in self._racy and os.path.exists(k)}
         payload = json.dumps(
             {"version": _STATE_VERSION, "steps": self.steps, "files": live}, indent=1
         )
@@ -105,6 +144,24 @@ class State:
         with os.fdopen(fd, "w") as fh:
             fh.write(payload)
         os.replace(tmp, self.path)
+
+
+def _valid_file_entry(entry: Any) -> bool:
+    return (isinstance(entry, list) and len(entry) == 5
+            and all(type(v) is int for v in entry[:4]) and isinstance(entry[4], str))
+
+
+def _valid_record(rec: Any) -> bool:
+    """A checkpoint stale_reason can compare without crashing; anything else reruns."""
+    if not isinstance(rec, dict):
+        return False
+    if not all(isinstance(rec.get(k), str) for k in ("code", "config")):
+        return False
+    if not isinstance(rec.get("summary", ""), str):
+        return False
+    return all(k not in rec or (isinstance(rec[k], dict)
+                                and all(isinstance(v, str) for v in rec[k].values()))
+               for k in _RECORD_DICTS)
 
 
 def _local_module(pipeline: Pipeline, module: str) -> Path | None:

@@ -6,6 +6,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import math
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -255,37 +256,187 @@ def numeric_values(s: pd.Series) -> np.ndarray:
 _NORMALIZE_RE = r"[\W_]+"
 
 
-def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
-    """Values that hash the same when the data is the same, whatever the file format.
+# A value is coded as a type tag and 16 bytes that identify it within that type, so values
+# of different types can never be confused and equal values code alike whatever the dtype.
+# Missing text codes as a missing number (NaN), never as a string that data could hold.
+_INT, _UINT, _FLOAT, _TEXT, _TIME, _SPAN, _OBJECT = range(7)
+_CODE = 17
+_TEXT_KEYS = ("data-verify:text", "data-verify:txt2")  # two 64-bit SipHash keys: 128 bits
+_INT64_MAX = np.iinfo(np.int64).max
+_UINT64_MAX = np.iinfo(np.uint64).max
 
-    Numbers become float64 (so 3 == 3.0 across CSV and parquet), -0.0 becomes 0.0, dates
-    become nanoseconds, everything else becomes text. `near` also rounds numbers to `bits`
-    bits of mantissa (about 3 significant digits at 10) and normalises text (case,
-    punctuation, whitespace).
+
+def _codes(tags: np.ndarray, low: np.ndarray, high: np.ndarray | None = None) -> np.ndarray:
+    out = np.zeros((len(tags), _CODE), dtype=np.uint8)
+    out[:, 0] = tags
+    out[:, 1:9] = low.astype("<u8").view(np.uint8).reshape(-1, 8)
+    if high is not None:
+        out[:, 9:] = high.astype("<u8").view(np.uint8).reshape(-1, 8)
+    return out
+
+
+def _float_bits(x: np.ndarray) -> np.ndarray:
+    """float64 bits with one NaN (whatever its sign or payload) and one zero."""
+    x = np.where(np.isnan(x), np.nan, np.where(x == 0, 0.0, x))
+    return x.astype("<f8").view("<u8")
+
+
+def _exact_number_codes(s: pd.Series, k: str) -> np.ndarray:
+    """Numbers that are equal code alike whatever their dtype (3, 3.0 and True == 1 across
+    CSV and parquet; -0.0 is 0), and numbers that differ code apart. Integers, dates and
+    durations never pass through float64, which holds only 53 bits: 2**53 and 2**53 + 1, or
+    two timestamps a nanosecond apart, must stay apart. A date is not the integer of its
+    nanoseconds, nor a duration. Missing values code as NaN, as they compare in the
+    statistics."""
+    n = len(s)
+    as_float = s.isna().to_numpy()  # missing, NaN, infinite or fractional
+    ints, uints, floats = np.zeros(n, np.int64), np.zeros(n, np.uint64), np.full(n, np.nan)
+    big = np.zeros(n, dtype=bool)
+    exact = _SPAN if pdt.is_timedelta64_dtype(s.dtype) else _TIME if k == "datetime" else _INT
+    if k == "datetime":
+        t = to_datetime(s)
+        as_float = t.isna().to_numpy()
+        ints = t.to_numpy().astype("datetime64[ns]").view("int64")
+    elif pdt.is_timedelta64_dtype(s.dtype):
+        ints = s.to_numpy().astype("timedelta64[ns]").view("int64")
+    elif k == "int" and pdt.is_unsigned_integer_dtype(s.dtype):
+        uints = s.to_numpy(dtype="uint64", na_value=0)
+        big = ~as_float & (uints > _INT64_MAX)
+        ints = np.where(big, 0, uints).astype("int64")
+    elif k == "int":
+        ints = s.to_numpy(dtype="int64", na_value=0)
+    else:  # float and bool: whole values join the integers they equal
+        floats = s.astype("float64").to_numpy(dtype="float64", na_value=np.nan)
+        whole = np.isfinite(floats) & (np.floor(floats) == floats)
+        big = whole & (floats >= 2.0**63) & (floats < 2.0**64)
+        small = whole & (floats >= -2.0**63) & (floats < 2.0**63)
+        as_float = ~small & ~big
+        ints = np.where(small, floats, 0).astype("int64")
+        uints = np.where(big, floats, 0).astype("uint64")
+    tags = np.where(as_float, _FLOAT, np.where(big, _UINT, exact)).astype(np.uint8)
+    low = np.where(as_float, _float_bits(floats), np.where(big, uints, ints.view(np.uint64)))
+    return _codes(tags, low)
+
+
+def canonical(s: pd.Series, near: bool = False, bits: int = 10) -> np.ndarray:
+    """A (rows, 17) uint8 code per value that is the same when the data is the same,
+    whatever the format.
+
+    Numbers compare exactly (3 == 3.0 across CSV and parquet, -0.0 == 0.0, dates as
+    nanoseconds); everything else becomes text, coded by a 128-bit SipHash. `near` instead
+    rounds numbers to `bits` bits of mantissa (about 3 significant digits at 10) and
+    normalises text (case, punctuation, whitespace).
     """
     k = kind(s)
+    if k == "string" and (s.dtype == object or isinstance(s.dtype, pd.CategoricalDtype)):
+        values = s.to_numpy(dtype=object)
+        if pd.api.types.infer_dtype(values, skipna=True) not in ("string", "empty"):
+            return _mixed_codes(values, near, bits)
+    if k == "float" and not near and s.dtype.kind == "f" and s.dtype.itemsize > 8:
+        return _mixed_codes(s.to_numpy(dtype=object), near, bits)  # wider than float64
     if k in ("int", "float", "bool", "datetime"):
+        if not near:
+            return _exact_number_codes(s, k)
         x = numeric_values(s.astype("float64") if k == "bool" else s)
-        x = np.where(x == 0, 0.0, x)
-        if near:
-            m, e = np.frexp(x)
-            x = np.ldexp(np.round(m * (1 << bits)) / (1 << bits), e)
-        return x
+        m, e = np.frexp(x)
+        x = np.ldexp(np.round(m * (1 << bits)) / (1 << bits), e)
+        return _codes(np.full(len(x), _FLOAT, np.uint8), _float_bits(x))
     text = s.astype("string")
     if near:
         text = (text.str.casefold().str.replace(_NORMALIZE_RE, " ", regex=True)
                 .str.strip())
-    return text.fillna("\0<NA>").to_numpy(dtype=object)
+    missing = text.isna().to_numpy()
+    values = text.fillna("").to_numpy(dtype=object)
+    low, high = (pd.util.hash_array(values, hash_key=key, categorize=False) for key in _TEXT_KEYS)
+    out = _codes(np.full(len(values), _TEXT, np.uint8), low, high)
+    out[missing] = _codes(np.array([_FLOAT], np.uint8), _float_bits(np.array([np.nan])))
+    return out
+
+
+def _is_missing(v: Any) -> bool:
+    if v is None or v is pd.NA or v is pd.NaT:
+        return True
+    return isinstance(v, (float, np.floating, np.datetime64, np.timedelta64)) and bool(pd.isna(v))
+
+
+# Every numpy print option, fixed: a caller's settings must not change a value's code.
+_PRINT = {"precision": 8, "threshold": sys.maxsize, "edgeitems": 3, "linewidth": 75,
+          "suppress": False, "nanstr": "nan", "infstr": "inf", "formatter": None,
+          "sign": "-", "floatmode": "unique", "legacy": False}
+
+
+def _full_repr(v: Any) -> str:
+    """Type and repr, with arrays (also nested in lists or dicts) printed in full and floats
+    to the last digit: numpy's default repr shortens both, hiding a changed element."""
+    with np.printoptions(**_PRINT):
+        return f"{type(v).__module__}.{type(v).__qualname__}:{v!r}"
+
+
+def _number_group(v: Any) -> tuple[str, Any]:
+    """Which exact coding a Python or numpy number takes, and the value to code."""
+    if isinstance(v, (bool, np.bool_)):
+        return "bool", v
+    if isinstance(v, (int, np.integer)):
+        if -_INT64_MAX - 1 <= v <= _INT64_MAX:
+            return "int", v
+        if 0 <= v <= _UINT64_MAX:
+            return "uint", v
+    try:
+        f = float(v)
+    except OverflowError:
+        return "object", _full_repr(v)
+    if f == v:  # exactly a float64: equal to that float wherever it appears
+        return "float", f
+    return "object", _full_repr(v)  # wider than float64 (np.longdouble, ints beyond 2**64)
+
+
+def _mixed_codes(values: np.ndarray, near: bool, bits: int) -> np.ndarray:
+    """An object column that holds more than text (JSON, pickles, categories of numbers),
+    coded value by value: a number as that number, text as text, a missing value (None, NaN,
+    NA, NaT) as missing, anything else by its type and full repr. Stringifying the column
+    first would let 1 pass for "1"."""
+    groups: dict[str, list[int]] = {}
+    items: dict[str, list] = {}
+    for i, v in enumerate(values):
+        if _is_missing(v):
+            g = "missing"
+        elif isinstance(v, (np.datetime64, np.timedelta64)):  # numpy counts these as integers
+            g, v = "object", _full_repr(v)
+        elif isinstance(v, (bool, int, float, np.bool_, np.integer, np.floating)):
+            g, v = _number_group(v)
+        elif isinstance(v, str):
+            g, v = "text", str(v)
+        else:
+            g, v = "object", _full_repr(v)
+        groups.setdefault(g, []).append(i)
+        items.setdefault(g, []).append(v)
+    dtypes = {"bool": "bool", "int": "int64", "uint": "uint64", "float": "float64",
+              "text": "string", "object": "string", "missing": "float64"}
+    out = np.zeros((len(values), _CODE), dtype=np.uint8)
+    for g, idx in groups.items():
+        vals = [np.nan] * len(idx) if g == "missing" else items[g]
+        out[idx] = canonical(pd.Series(vals, dtype=dtypes[g]), near, bits)
+        if g == "object":
+            out[idx, 0] = _OBJECT
+    return out
 
 
 def row_hashes(df: pd.DataFrame, cols: list[str], near: bool = False, bits: int = 10) -> np.ndarray:
-    """One uint64 per row over `cols`, built column by column to keep memory flat."""
-    h = np.zeros(len(df), dtype=np.uint64)
-    prime = np.uint64(1099511628211)
-    with np.errstate(over="ignore"):
-        for c in sorted(cols):
-            hc = pd.util.hash_array(canonical(df[c], near, bits), categorize=False)
-            h = (h * prime) ^ hc
+    """One uint64 per row over `cols`: a SipHash chained over the columns' codes.
+
+    Rows that differ in any value get unrelated hashes. A collision with a given row takes
+    about 2**64 tries, not a crafted value: an invertible mix of each column (as pandas
+    hashes numbers) would let an injected row be computed to match a source row. Built
+    column by column to keep memory flat.
+    """
+    n = len(df)
+    h = np.zeros(n, dtype=np.uint64)
+    block = np.empty((n, 8 + _CODE), dtype=np.uint8)
+    for c in sorted(cols):
+        block[:, :8] = h.astype("<u8").view(np.uint8).reshape(-1, 8)
+        block[:, 8:] = canonical(df[c], near, bits)
+        items = block.view(np.dtype((np.void, 8 + _CODE))).ravel().astype(object)
+        h = pd.util.hash_array(items, categorize=False)
     return h
 
 

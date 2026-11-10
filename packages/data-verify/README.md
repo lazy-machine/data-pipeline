@@ -159,7 +159,7 @@ previous run are deleted first, so a stale report never survives a failed run.
 
 ```jsonc
 {
-  "tool": "data-verify", "version": "0.4.0",
+  "tool": "data-verify", "version": "0.4.1",
   "passed": false,                       // false = the step failed
   "fail_on": "error",
   "blocking": ["split.group_overlap"],   // ids of the checks that blocked
@@ -477,7 +477,16 @@ pipeline after the split, since the gate can't confirm that from the data.
 ## What it checks
 
 55 built-in checks. `data-verify checks` lists them with their options, and
-[docs/CHECKS.md](docs/CHECKS.md) describes each one. By area:
+[docs/CHECKS.md](docs/CHECKS.md) describes each one. Checks that match rows exactly (ids,
+`source` conservation, identical rows across splits) compare numbers as numbers: `3`, `3.0`
+and `True == 1` match across CSV and parquet, while integers and timestamps keep every digit,
+so ids above 2**53 or times a nanosecond apart stay distinct. Rows are matched by a SipHash
+of each value's type and exact value, so an altered row can't be computed to pass for a
+source row. A date is not the integer of its nanoseconds, missing text is not any string,
+and in a column of mixed values (JSON, categories) `1` is a number, not the text `"1"`.
+Missing values match each other (`None`, `NaN`, `NA`, `NaT`). Other objects, such as
+lists, arrays and pickled values, match by type and full `repr`: exact for plain data,
+but an object whose `repr` hides its state or shows its address is not compared exactly. By area:
 
 **split**
 - Blocks: same `id` or `group` in two splits; repeated ids; split not matching
