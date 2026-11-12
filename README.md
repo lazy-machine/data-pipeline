@@ -15,7 +15,7 @@ A thin orchestrator walks the steps one at a time. For every step it:
 Before any model runs, a **data gate** checks the splits. It halts the pipeline on the
 leaks it can prove, such as rows or entities shared between splits, and warns about signs
 of poisoning, which it can rarely prove. It only sees what you declare, and
-[some faults it can't see](packages/data-verify/README.md#what-it-cannot-see). The gate is an
+[some faults it can't see](packages/data-verify/docs/COVERAGE.md#what-it-cannot-see). The gate is an
 ordinary step,
 [data-verify](packages/data-verify/README.md) (`function = "data_verify:verify"`), shipped in
 this repository as a second package so that the runner itself stays dependency-free.
@@ -217,7 +217,7 @@ src/data_pipeline/
   cli.py           command line interface
 tests/             runner tests
 packages/data-verify/
-  src/data_verify/ the gate step and its checks (README.md is its contract)
+  src/data_verify/ the gate step and its checks (docs/CONTRACT.md is its contract)
   tests/           gate tests
 examples/iris/     end-to-end example: clean, split, verify, EDA, train, evaluate, report
 docs/GUIDE.md      usage guide

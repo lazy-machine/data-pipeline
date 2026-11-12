@@ -1,4 +1,4 @@
-"""The params reference, shown by `data-verify params` and copied into docs/REFERENCE.md."""
+"""The params reference, shown by `data-verify params` and copied into docs/PARAMS.md."""
 
 from __future__ import annotations
 

@@ -710,7 +710,7 @@ def test_scaled_data_is_still_recognised_at_any_size(rows, decimals):
 
 def test_scaled_values_stored_as_float32_are_still_recognised():
     """Only the storage. A scaler computing in float32 on a large offset can miss the bar,
-    which the README says."""
+    which docs/COVERAGE.md says."""
     x = _scaled(2_000_000).astype("float32").astype("float64")
     assert _standardized(len(x), x.sum(), (x**2).sum(), **LOOSE, margin=0.003,
                          step=_rounding_step(x))

@@ -4,7 +4,7 @@ The [README](../README.md) is the reference for every option and key. This guide
 to use them: how to set up a project that depends on the runner, how to build a pipeline,
 how to write steps that cache well, where the data gate goes, how to build reusable steps
 on top, and what to do when something goes wrong. The gate's own contract is in
-[packages/data-verify/README.md](../packages/data-verify/README.md).
+[packages/data-verify/docs/CONTRACT.md](../packages/data-verify/docs/CONTRACT.md).
 
 ---
 
@@ -407,8 +407,9 @@ enforces this.
   as `[[steps.params.assert]]` (pandas or SQL) or as a `custom` check module listed in
   `watch`, rather than in a separate validation step.
 
-The full list of params and checks is in the
-[gate's README](../packages/data-verify/README.md).
+The full list of params and checks is in the gate's
+[params](../packages/data-verify/docs/PARAMS.md) and
+[check reference](../packages/data-verify/docs/CHECKS.md).
 
 ### When it blocks
 
