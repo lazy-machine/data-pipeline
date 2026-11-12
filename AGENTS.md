@@ -9,8 +9,8 @@ data gate that runs before any model. Two packages in one uv workspace:
 | `data-verify` | `packages/data-verify/` | the gate step: `function = "data_verify:verify"` | pandas, numpy, pyarrow (duckdb for SQL assertions) |
 
 Docs: `README.md` is the runner reference, `docs/GUIDE.md` is how to use it (start there
-when building a project), `packages/data-verify/README.md` is the gate's overview, with its contract, params and
-every check under `packages/data-verify/docs/`.
+when building a project), `packages/data-verify/README.md` is the gate's overview, with its
+contract, params and every check under `packages/data-verify/docs/`.
 
 ## Principles
 
@@ -47,7 +47,8 @@ uv run data-verify checks                        # every gate check and its opti
   reporter).run(only=, force=, rerun=, dry_run=)`, the CLI flags, the TOML keys, and the
   gate's params, report format and `function = "data_verify:verify"`. Adding is fine.
 - Update the docs in the same commit as the behaviour: `README.md` and `docs/GUIDE.md` for
-  the runner, and `packages/data-verify/README.md` and `docs/` for the gate.
+  the runner, and `packages/data-verify/README.md` and `packages/data-verify/docs/` for the
+  gate.
 - Gate conventions (how to add a check, version bumps, regenerating `CHECKS.md`) are in
   `packages/data-verify/AGENTS.md`.
 - Match the style: `from __future__ import annotations`, type hints, short docstrings that
